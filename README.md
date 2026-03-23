@@ -10,7 +10,7 @@
 ## Highlights
 
 - Config-driven OpenCLIP fine-tuning across multiple datasets
-- Vision checkpoint merging with task arithmetic, TIES, TSV, and ISO-C
+- Vision checkpoint merging with `weighted_average`, `task_arithmetic`, `ties_merge`, `dare_merge`, `tsv_merge`, `isoc_merge`, `isocts_merge`, `cart_merge`, and `pcb`/`pcb_merge`
 - Zero-shot and merged evaluation on full benchmark test sets
 - Task-vector transport utilities under `merge_and_rebase.rebase`
 - GradFix-based rebasing for cross-base transfer in vision models
@@ -152,13 +152,18 @@ Checkpoint merging and evaluation code lives in `src/merge_and_rebase/merge` and
 
 Task-vector rebasing and transport code lives in `src/merge_and_rebase/rebase`.
 
-Supported methods:
-- zero-shot evaluation on vision benchmarks
-- merged evaluation on vision benchmarks
-- task arithmetic via add and subtract
-- TIES
-- TSV
-- ISO-C
+Built-in merge methods:
+- `weighted_average`: weighted checkpoint averaging relative to a base model
+- `task_arithmetic`: sum of task vectors relative to a base model
+- `ties_merge`: TIES-style sparse sign-resolved task-vector merge
+- `dare_merge`: DARE-style random sparsification with optional rescaling
+- `tsv_merge`: task-singular-vector merge for matrix-valued weights
+- `isoc_merge`: isotropic composition on matrix-valued deltas
+- `isocts_merge`: isotropic merge with common and task-specific subspaces
+- `cart_merge`: low-rank CART merge for 2D parameters
+- `pcb` and `pcb_merge`: PCB merge on flattened task vectors
+
+The functional API in `merge_and_rebase.merge.methods.functional` mirrors these methods through `merge_*` helpers for direct Python use.
 
 Supported evaluation features:
 - alpha search for merged evaluation with caching
