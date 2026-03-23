@@ -2,8 +2,11 @@
 
 ![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/pytorch-2.1%2B-EE4C2C?logo=pytorch&logoColor=white)
+![Transformers](https://img.shields.io/badge/llm-transformers-F9AB00?logo=huggingface&logoColor=white)
+![NLI](https://img.shields.io/badge/text-NLI%20merging-0A7F5A)
 ![OpenCLIP](https://img.shields.io/badge/backbone-OpenCLIP-1F6FEB)
 ![Status](https://img.shields.io/badge/status-research%20code-6F42C1)
+[![BibTex](https://img.shields.io/badge/citation-bibtex-4E9A06?logo=bibtex&logoColor=white)](#citation)
 
 `merge-and-rebase` is a research codebase for model merging, task-vector transport, and configurable fine-tuning across vision and text models. It is built for fast iteration on checkpoint merging, rebasing, and evaluation workflows.
 
@@ -304,3 +307,21 @@ Key config fields:
 | `alpha` | Fixed scaling factor when `alpha_search` is disabled | `1.0` |
 | `weights` | Per-task composition weights, with `null` meaning uniform weights | `null` |
 | `tuned_ckpts` | Mapping from task name to checkpoint path | — |
+
+---
+
+## Citation
+
+If you use this repository in your work, please cite it as:
+
+```bibtex
+@software{panariello2026merge_and_rebase,
+  author = {Panariello, Aniello and Rinaldi, Filippo},
+  title = {merge-and-rebase},
+  year = {2026},
+  url = {https://github.com/apanariello4/merge-and-rebase},
+  version = {0.1.0}
+}
+```
+
+GitHub citation metadata is also available in `CITATION.cff`.
