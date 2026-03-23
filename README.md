@@ -1,0 +1,301 @@
+# merge-and-rebase
+
+![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/pytorch-2.1%2B-EE4C2C?logo=pytorch&logoColor=white)
+![OpenCLIP](https://img.shields.io/badge/backbone-OpenCLIP-1F6FEB)
+![Status](https://img.shields.io/badge/status-research%20code-6F42C1)
+
+`merge-and-rebase` is a research codebase for model merging, task-vector transport, and configurable fine-tuning across vision and text models. It is built for fast iteration on checkpoint merging, rebasing, and evaluation workflows.
+
+## Highlights
+
+- Config-driven OpenCLIP fine-tuning across multiple datasets
+- Vision checkpoint merging with task arithmetic, TIES, TSV, and ISO-C
+- Zero-shot and merged evaluation on full benchmark test sets
+- Task-vector transport utilities under `merge_and_rebase.rebase`
+- GradFix-based rebasing for cross-base transfer in vision models
+- Text fine-tuning and merge evaluation for NLI-style LLM setups
+
+---
+
+## Setup
+
+Create an environment with `uv` and install the package in editable mode:
+
+```bash
+uv venv .venv
+source .venv/bin/activate
+```
+
+Minimal install:
+
+```bash
+uv pip install -e .
+```
+
+Install with dataset dependencies for fine-tuning and evaluation:
+
+```bash
+uv pip install -e ".[data]"
+```
+
+Install with development and test extras:
+
+```bash
+uv pip install -e ".[dev,data,test]"
+```
+
+---
+
+## Vision Fine-Tuning
+
+Vision fine-tuning is driven by config files. The CLI is used to choose the config and optionally restrict datasets.
+
+### Config
+
+Default vision config:
+
+`src/merge_and_rebase/finetune/configs/vision.yaml`
+
+This file defines:
+- model backbone and pretrained variant
+- training hyperparameters
+- strategy choice, such as `linear_probe` or `full`
+- dataset list and suite selection
+- per-dataset overrides
+
+### Running Fine-Tuning
+
+Run all datasets defined by the config:
+
+```bash
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config src/merge_and_rebase/finetune/configs/vision.yaml
+```
+
+Restrict to a subset of datasets:
+
+```bash
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config src/merge_and_rebase/finetune/configs/vision.yaml \
+  --datasets CIFAR10,CIFAR100,EuroSAT
+```
+
+Or run a named suite:
+
+```bash
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config src/merge_and_rebase/finetune/configs/vision.yaml \
+  --suite vision8
+```
+
+For linear-attention LoRA runs, use the preset config:
+
+```bash
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config src/merge_and_rebase/finetune/configs/vision-peft-linear.yaml \
+  --suite vision8
+```
+
+Outputs are saved to `src/checkpoints/finetune/<model>/<pretrained>/<task>/` by default.
+
+Each task produces:
+- `<strategy>.pt`: fine-tuned model checkpoint
+- `<strategy>.json`: training log with metrics and hyperparameters
+
+### Text Fine-Tuning
+
+Text fine-tuning follows the same `common` plus per-dataset override structure and supports:
+- `full`
+- `linear_probe`
+- `peft_lora`
+- task-wise head extraction into `heads.pt`
+- PEFT adapter export with `save_format: peft`
+
+Starter configs:
+- `src/merge_and_rebase/finetune/configs/text.yaml`
+- `src/merge_and_rebase/finetune/configs/text-peft.yaml`
+
+Run:
+
+```bash
+python -m merge_and_rebase.finetune.train_text \
+  --text-config src/merge_and_rebase/finetune/configs/text-peft.yaml \
+  --suite nli6
+```
+
+### Available Strategies
+
+Strategies live in `src/merge_and_rebase/finetune/strategies/`.
+
+Currently available:
+- `full`: full fine-tuning of all model parameters
+- `linear_probe`: train only a linear classification head on frozen features
+- `ntk`: first-order linearized fine-tuning via JVP around initialization
+- `peft_lora`: LoRA adapters on the image encoder
+
+### Extending Strategies
+
+To add a new strategy:
+
+1. Create a new file in `src/merge_and_rebase/finetune/strategies/`.
+2. Implement `configure(...)` to return the optimizer, info dict, and scheduler.
+3. Register the strategy in `registry.py`.
+
+Schedulers and optimizers are owned by the strategy implementation.
+
+---
+
+## Merge and Evaluate
+
+Checkpoint merging and evaluation code lives in `src/merge_and_rebase/merge` and `src/merge_and_rebase/eval`.
+
+Task-vector rebasing and transport code lives in `src/merge_and_rebase/rebase`.
+
+Supported methods:
+- zero-shot evaluation on vision benchmarks
+- merged evaluation on vision benchmarks
+- task arithmetic via add and subtract
+- TIES
+- TSV
+- ISO-C
+
+Supported evaluation features:
+- alpha search for merged evaluation with caching
+
+Evaluation is always performed on the full test set of each dataset.
+
+Typical evaluation entrypoint:
+
+```bash
+python -m merge_and_rebase.eval.vision_merge --config <config_file>
+```
+
+By default, vision merge checks each tuned checkpoint for `tuned_text_features` and uses them when present. If they are missing, it falls back to zero-shot templates.
+
+To override this behavior:
+
+```json
+{
+  "text_features_source": "zero_shot"
+}
+```
+
+Or force strict checkpoint-only text features:
+
+```json
+{
+  "text_features_source": "tuned_ckpt"
+}
+```
+
+Command-line parameters always override config values.
+
+For Llama-style causal LMs on NLI tasks such as SNLI, MNLI, SICK, QNLI, RTE, and SciTail:
+
+```bash
+python -m merge_and_rebase.eval.llm_merge \
+  --model-name-or-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --tasks snli,mnli,sick,qnli,rte,scitail \
+  --eval-mode head_logits \
+  --task-heads /path/to/heads.pt \
+  --tuned-ckpts /path/to/tuned_a.pt /path/to/tuned_b.pt \
+  --method task_arithmetic \
+  --alpha-search --alpha-min 0.0 --alpha-max 1.0 --alpha-step 0.1
+```
+
+Starter config:
+
+`configs/llm_merge_llama3_8b_knots_hf.json`
+
+---
+
+## Rebasin
+
+The `rebase` package transports a merged task vector from a source base model to a target base model.
+
+Core API:
+- `merge_task_vectors(...)`: computes `Δ_merge = Σ_i w_i (tuned_i - source_base)`
+- `transport_task_vector(...)`: transports `Δ_merge` from source to target coordinates
+- `rebase_merged_task_vectors(...)`: end-to-end helper that merges, transports, and applies the result
+
+Built-in transport methods:
+- `identity`: no-op transport where `Δ' = Δ`
+- `orthogonal_shift`: removes the component of `Δ` aligned with `(target_base - source_base)`
+
+Minimal Python usage:
+
+```python
+from merge_and_rebase.rebase import rebase_merged_task_vectors
+
+rebased_sd = rebase_merged_task_vectors(
+  source_base=source_base_sd,
+  target_base=target_base_sd,
+  tuned=[task1_sd, task2_sd],
+  weights=[0.5, 0.5],
+  alpha=1.0,
+  transport_method="orthogonal_shift",  # or "identity"
+)
+```
+
+To add a new transport rule, create a class in `src/merge_and_rebase/rebase/methods/` that implements `transport(...)`, then register it in that module.
+
+### GradFix Rebase
+
+GradFix masks each task vector before applying it to a different pretrained base in a cross-base A to B transport setting. For each parameter, the sign of its task-vector component is compared to the gradient sign obtained on B's training data. Mismatches are either zeroed out in `normal` mode or forced to the gradient sign in `force` mode.
+
+Pipeline:
+
+```text
+θ_A (source base)  +  tuned checkpoints  ->  task vectors Δ_i
+                                                    |
+gradient signs on B  -------------------->  GradFix mask
+                                                    |
+                                         masked_Δ_i per task
+                                                    |
+                                       Σ_i w_i · masked_Δ_i
+                                                    |
+                                    θ_B + α · composed_Δ  ->  eval
+```
+
+Multi-task run over all 8 datasets:
+
+```bash
+python -m merge_and_rebase.eval.vision_rebase \
+  --config configs/vision8_gradfix_rebase.json
+```
+
+`configs/vision8_gradfix_rebase.json` sets `"tasks": "all"`, includes all 8 tuned checkpoints, and sweeps alpha from 0.0 to 2.0.
+
+Single-task example, such as Cars:
+
+```bash
+python -m merge_and_rebase.eval.vision_rebase \
+  --config configs/vision_gradfix_single_task.json
+```
+
+`configs/vision_gradfix_single_task.json` sets `"tasks": "Cars"` and lists only the Cars checkpoint in `tuned_ckpts`.
+
+You can also select a subset of tasks:
+
+```bash
+python -m merge_and_rebase.eval.vision_rebase \
+  --config configs/vision8_gradfix_rebase.json \
+  --tasks Cars,DTD
+```
+
+CLI flags always override config values.
+
+Key config fields:
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `source_clip_model/pretrained` | Base model A, relative to which task vectors are defined | `ViT-B-32 / openai` |
+| `target_clip_model/pretrained` | Base model B, on which rebased vectors are applied | `ViT-B-32 / laion2b_s34b_b79k` |
+| `tasks` | `"all"` or comma-separated task names such as `"Cars"` or `"Cars,DTD"` | `"all"` |
+| `mask_mode` | `"normal"` to zero disagreeing signs, or `"force"` to override them | `"normal"` |
+| `vote` | Gradient sign voting mode: `"mean"` or `"max"` | `"mean"` |
+| `alpha_search` | Enable a linear alpha sweep | `false` |
+| `alpha` | Fixed scaling factor when `alpha_search` is disabled | `1.0` |
+| `weights` | Per-task composition weights, with `null` meaning uniform weights | `null` |
+| `tuned_ckpts` | Mapping from task name to checkpoint path | — |

@@ -1,0 +1,8 @@
+from .vision8_14_20 import SUITES, VISION8_TASKS, VISION14_TASKS, VISION20_TASKS
+
+__all__ = [
+    "VISION8_TASKS",
+    "VISION14_TASKS",
+    "VISION20_TASKS",
+    "SUITES",
+]

@@ -1,0 +1,461 @@
+import inspect
+import random
+from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from torch.utils.data import DataLoader, Subset
+from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict
+
+from merge_and_rebase.io.ckpt import load_ckpt, load_into_model
+from merge_and_rebase.io.peft_helpers import (
+    get_attn_patch_cfg,
+    get_patched_attn_flag,
+    is_peft_adapter_dir_ckpt,
+    normalize_attn_patch_cfg,
+    state_dict_looks_patched_attn,
+)
+from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
+
+from . import merge_utils as _merge_utils
+
+is_peft_checkpoint = _merge_utils.is_peft_checkpoint
+extract_peft_components = _merge_utils.extract_peft_components
+get_peft_cfg = _merge_utils.get_peft_cfg
+apply_delta = _merge_utils.apply_delta
+to_cpu_fp32 = _merge_utils.to_cpu_fp32
+ensure_peft_cfg_map = _merge_utils.ensure_peft_cfg_map
+build_merged_state_for_alpha = _merge_utils.build_merged_state_for_alpha
+compose_weighted_deltas = _merge_utils.compose_weighted_deltas
+
+
+def build_cpu_cfg(cfg: OpenClipBuildConfig) -> OpenClipBuildConfig:
+    return OpenClipBuildConfig(
+        model_name=cfg.model_name,
+        pretrained=cfg.pretrained,
+        device="cpu",
+        dtype="fp32",
+        normalize=cfg.normalize,
+        logit_scale=cfg.logit_scale,
+        prompt_template=cfg.prompt_template,
+        prompt_templates=cfg.prompt_templates,
+    )
+
+
+def build_lora_config(cfg_dict: dict[str, Any]):
+
+    cfg = dict(cfg_dict)
+    task_type = cfg.get("task_type", None)
+    if isinstance(task_type, str):
+        try:
+            cfg["task_type"] = TaskType[task_type]
+        except KeyError as exc:
+            raise ValueError(f"Unknown peft TaskType '{task_type}'.") from exc
+
+    # Filter to LoraConfig signature to avoid unexpected fields.
+    sig = inspect.signature(LoraConfig.__init__)
+    allowed = set(sig.parameters)
+    allowed.discard("self")
+    cfg = {k: v for k, v in cfg.items() if k in allowed}
+    return LoraConfig(**cfg)
+
+
+@dataclass(frozen=True)
+class TaskAttentionMeta:
+    patched_attn: bool = False
+    attn_patch_cfg: dict[str, Any] | None = None
+
+    @property
+    def linearized_attn(self) -> bool:
+        if not self.patched_attn or self.attn_patch_cfg is None:
+            return False
+        return str(self.attn_patch_cfg.get("attn_impl", "softmax")) == "linear"
+
+
+def humanize(s: str) -> str:
+    s = s.replace("_", " ").replace("-", " ")
+    return " ".join(s.split())
+
+
+class FirstNBatches:
+    """Wrapper that yields at most *n* batches from a dataloader."""
+
+    def __init__(self, loader: DataLoader, n: int):
+        self.loader = loader
+        self.n = int(n)
+
+    def __iter__(self):
+        import itertools
+
+        return itertools.islice(iter(self.loader), self.n)
+
+    def __len__(self):
+        try:
+            return min(self.n, len(self.loader))
+        except TypeError:
+            return self.n
+
+
+def balanced_sample_indices(
+    dataset: Any,
+    imgs_per_class: int,
+    seed: int = 42,
+) -> list[int]:
+    """Sample *imgs_per_class* indices per class (random, balanced)."""
+    class_indices: dict[int, list[int]] = defaultdict(list)
+    if hasattr(dataset, "split") and hasattr(dataset.split, "__getitem__"):
+        labels = dataset.split[dataset.label_key]
+        for idx, label in enumerate(labels):
+            class_indices[int(label)].append(idx)
+    else:
+        for idx in range(len(dataset)):
+            _, label = dataset[idx]
+            class_indices[int(label)].append(idx)
+
+    rng = random.Random(seed)
+    flat: list[int] = []
+    for cls in sorted(class_indices):
+        idxs = class_indices[cls]
+        if len(idxs) <= imgs_per_class:
+            flat.extend(idxs)
+        else:
+            flat.extend(rng.sample(idxs, imgs_per_class))
+    return flat
+
+
+def build_grad_dataloader(
+    train_loader: DataLoader,
+    train_dataset: Any,
+    *,
+    grad_batch_size: int | None = None,
+    grad_imgs_per_class: int | None = None,
+    grad_num_batches: int | None = None,
+    num_workers: int = 6,
+    seed: int = 42,
+) -> DataLoader | FirstNBatches:
+    """Build a smaller dataloader for gradient-sign computation when requested."""
+    if grad_imgs_per_class is not None and grad_num_batches is not None:
+        raise ValueError("grad_imgs_per_class and grad_num_batches are mutually exclusive; set only one of them.")
+
+    batch_size = grad_batch_size or train_loader.batch_size
+
+    if grad_imgs_per_class is not None:
+        indices = balanced_sample_indices(train_dataset, grad_imgs_per_class, seed=seed)
+        subset = Subset(train_dataset, indices)
+        return DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    if grad_batch_size is not None and grad_batch_size != train_loader.batch_size:
+        loader = DataLoader(
+            train_loader.dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+    else:
+        loader = train_loader
+
+    if grad_num_batches is not None:
+        return FirstNBatches(loader, grad_num_batches)
+
+    return loader
+
+
+def acc_cache_key(
+    clip_model: str,
+    clip_pretrained: str,
+    dataset: str,
+    chk_path: str,
+    baseline_mode: str,
+    forward_mode: str,
+    classnames_mode: str,
+    text_features_mode: str = "zero_shot",
+) -> str:
+    # Include baseline mode/checkpoint/forward/classname mode to avoid stale cache collisions.
+    return (
+        f"{clip_model}::{clip_pretrained}::{dataset}::{baseline_mode}::"
+        f"{chk_path}::{forward_mode}::{classnames_mode}::{text_features_mode}"
+    )
+
+
+def patch_base_for_attn(
+    *,
+    clf: OpenClipClassifier,
+    base_ckpt: str | None,
+    strict_load: bool,
+    attn_patch_cfg: dict[str, Any] | None = None,
+) -> dict[str, torch.Tensor]:
+    from merge_and_rebase.models.patch_openclip_attention import patch_openclip_vit_attn
+
+    patch_cfg = dict(attn_patch_cfg or {})
+    n = patch_openclip_vit_attn(
+        clf.model.visual,
+        proj_dropout=0.0,
+        attn_impl=str(patch_cfg.get("attn_impl", "softmax")),
+        kernel=str(patch_cfg.get("kernel", "elu_plus_one")),
+        eps=float(patch_cfg.get("eps", 1e-6)),
+        linear_rule=str(patch_cfg.get("linear_rule", "kernel")),
+        delta_eta=float(patch_cfg.get("delta_eta", 1.0)),
+        delta_exclude_cls_from_store=bool(patch_cfg.get("delta_exclude_cls_from_store", True)),
+        delta_cls_only_readout=bool(patch_cfg.get("delta_cls_only_readout", False)),
+        delta_learn_w0=bool(patch_cfg.get("delta_learn_w0", False)),
+        delta_w0_rank=int(patch_cfg.get("delta_w0_rank", 0)),
+    )
+    if n == 0:
+        raise RuntimeError("patched_attn=True but patch_openclip_vit_attn patched 0 blocks.")
+    print(f"Patched {n} attention blocks in base model.")
+
+    if base_ckpt is None:
+        return {k: v.detach().cpu() for k, v in clf.model.state_dict().items()}
+
+    sd0 = load_ckpt(str(base_ckpt))
+    load_into_model(clf.model, sd0, strict=strict_load)
+    return {k: v.detach().cpu() for k, v in clf.model.state_dict().items()}
+
+
+def extract_checkpoint_attn_patch_info(
+    *,
+    obj: Any,
+    ckpt_path: str,
+) -> TaskAttentionMeta:
+    if not isinstance(obj, dict):
+        return TaskAttentionMeta()
+
+    sd_obj = obj.get("state_dict", None)
+    sd_looks_patched = isinstance(sd_obj, dict) and state_dict_looks_patched_attn(sd_obj)
+    cfg_obj = obj.get("attn_patch_cfg", None)
+    cfg_norm = normalize_attn_patch_cfg(cfg_obj) if isinstance(cfg_obj, dict) else None
+
+    if is_peft_adapter_dir_ckpt(obj) or is_peft_checkpoint(obj):
+        patched_attn = get_patched_attn_flag(obj)
+        if not patched_attn:
+            return TaskAttentionMeta()
+        return TaskAttentionMeta(patched_attn=True, attn_patch_cfg=normalize_attn_patch_cfg(get_attn_patch_cfg(obj)))
+
+    if "patched_attn" in obj:
+        patched_attn = bool(obj["patched_attn"])
+        if not patched_attn:
+            if sd_looks_patched:
+                if cfg_norm is not None:
+                    return TaskAttentionMeta(patched_attn=True, attn_patch_cfg=cfg_norm)
+                raise ValueError(
+                    f"Checkpoint '{ckpt_path}' has patched_attn=False but state_dict uses q_proj/k_proj/v_proj keys. "
+                    "Add attn_patch_cfg metadata so vision merge can patch qkv before linearization."
+                )
+            return TaskAttentionMeta()
+        if cfg_norm is None:
+            raise ValueError(
+                f"Checkpoint '{ckpt_path}' has patched_attn=True but no attn_patch_cfg. "
+                "Cannot verify whether attention was linearized ('attn_impl=linear') for a reproducible vision merge."
+            )
+        return TaskAttentionMeta(patched_attn=True, attn_patch_cfg=cfg_norm)
+
+    if sd_looks_patched:
+        if cfg_norm is not None:
+            return TaskAttentionMeta(patched_attn=True, attn_patch_cfg=cfg_norm)
+        raise ValueError(
+            f"Checkpoint '{ckpt_path}' appears to use patched attention (q_proj/k_proj/v_proj) but lacks "
+            "patched_attn/attn_patch_cfg metadata. Cannot verify linearized-attention consistency in vision merge."
+        )
+    return TaskAttentionMeta()
+
+
+def assert_qkv_patched_before_linearizing(
+    *,
+    needs_linear_attention: bool,
+    base_patched_for_attn: bool,
+    model_state_dict: Mapping[str, torch.Tensor],
+) -> None:
+    if not needs_linear_attention:
+        return
+    if not base_patched_for_attn:
+        raise RuntimeError(
+            "Linear attention requested by checkpoints, but base attention was not patched first. "
+            "Ensure q/k/v patching runs before linearized attention evaluation."
+        )
+
+    keys = tuple(str(k) for k in model_state_dict.keys())
+    has_qkv = any(".attn.q_proj." in k or ".attn.k_proj." in k or ".attn.v_proj." in k for k in keys)
+    if not has_qkv:
+        raise RuntimeError(
+            "Linear attention requested, but model keyspace is not fully q/k/v patched "
+            "(expected q_proj/k_proj/v_proj and no in_proj_* keys)."
+        )
+
+
+def maybe_patch_base_for_task_attn(
+    *,
+    task_meta: TaskAttentionMeta,
+    base_patched_for_attn: bool,
+    clf: OpenClipClassifier,
+    base_ckpt: str | None,
+    strict_load: bool,
+    base_sd: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], bool]:
+    if base_patched_for_attn or not task_meta.patched_attn:
+        return base_sd, base_patched_for_attn
+    patched_sd = patch_base_for_attn(
+        clf=clf,
+        base_ckpt=base_ckpt,
+        strict_load=strict_load,
+        attn_patch_cfg=task_meta.attn_patch_cfg,
+    )
+    return patched_sd, True
+
+
+def eval_task_top1(
+    *,
+    clf: OpenClipClassifier,
+    loaders: Any,
+    classnames: list[str],
+    build_cfg_task: OpenClipBuildConfig,
+    device: str,
+    split: str,
+    text_features: torch.Tensor | None = None,
+) -> float:
+    if split == "val":
+        eval_loader = loaders.val
+    elif split == "test":
+        eval_loader = loaders.test
+    else:
+        raise ValueError(f"Unknown split '{split}'. Expected one of: val, test.")
+    if text_features is not None:
+        return float(
+            clf.top1_with_text_features(
+                eval_loader,
+                device=device,
+                text_features=text_features,
+                expected_num_classes=len(classnames),
+            )
+        )
+    clf.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache", force_rebuild=False)
+    return float(clf.top1(eval_loader, device=device))
+
+
+def eval_norm_accs_for_split(
+    *,
+    clf: OpenClipClassifier,
+    per_task: list[dict[str, Any]],
+    device: str,
+    split: str,
+    print_per_task: bool,
+    result_label: str = "merged",
+    baseline_label: str = "single",
+) -> tuple[list[float], list[float]]:
+    merged_accs: list[float] = []
+    norm_accs: list[float] = []
+    for item in per_task:
+        task = str(item["task"])
+        acc = eval_task_top1(
+            device=device,
+            clf=clf,
+            loaders=item["loaders"],
+            classnames=list(item["classnames"]),
+            build_cfg_task=item["build_cfg_task"],
+            split=split,
+            text_features=item.get("text_features", None),
+        )
+        single_acc = float(item["single_acc"])
+        norm = (acc / single_acc) if single_acc > 0 else 0.0
+        merged_accs.append(acc)
+        norm_accs.append(norm)
+        if print_per_task:
+            print(f"{task}: {result_label}={acc:.6f} {baseline_label}={single_acc:.6f} norm={norm:.6f}")
+    return merged_accs, norm_accs
+
+
+def materialize_peft_sd_from_adapter(
+    *,
+    peft_state: dict[str, torch.Tensor],
+    base_sd: dict[str, torch.Tensor],
+    build_cfg: OpenClipBuildConfig,
+    peft_cfg: dict[str, Any],
+    strict_load: bool,
+    patched_attn: bool,
+    attn_patch_cfg: dict[str, Any] | None = None,
+) -> dict[str, torch.Tensor]:
+    """
+    Rebuild a full OpenCLIP state_dict from:
+      - base_sd: base (pretrained or base checkpoint) state dict in the *correct keyspace*
+      - peft_state: adapter-only state dict (LoRA weights) as saved by PEFT
+      - peft_cfg_map: adapter config map (like {"default": {...}})
+
+    Returns:
+      full_sd: dict[str, Tensor] suitable for load_into_model(clf.model, full_sd)
+    """
+    # 1) Build base model
+    # Use a deterministic fp32 CPU build for adapter materialization so
+    # full-space and core-space paths operate in the same numeric regime.
+    clf = OpenClipClassifier.build(build_cpu_cfg(build_cfg))
+    model = clf.model
+
+    # 2) Patch attention if needed (must happen before loading base_sd)
+    if patched_attn:
+        from merge_and_rebase.models.patch_openclip_attention import patch_openclip_vit_attn
+
+        patch_cfg = dict(attn_patch_cfg or {})
+        n = patch_openclip_vit_attn(
+            model.visual,
+            proj_dropout=0.0,
+            attn_impl=str(patch_cfg.get("attn_impl", "softmax")),
+            kernel=str(patch_cfg.get("kernel", "elu_plus_one")),
+            eps=float(patch_cfg.get("eps", 1e-6)),
+            linear_rule=str(patch_cfg.get("linear_rule", "kernel")),
+            delta_eta=float(patch_cfg.get("delta_eta", 1.0)),
+            delta_exclude_cls_from_store=bool(patch_cfg.get("delta_exclude_cls_from_store", True)),
+            delta_cls_only_readout=bool(patch_cfg.get("delta_cls_only_readout", False)),
+            delta_learn_w0=bool(patch_cfg.get("delta_learn_w0", False)),
+            delta_w0_rank=int(patch_cfg.get("delta_w0_rank", 0)),
+        )
+        if n == 0:
+            raise RuntimeError("patched_attn=True but patch_openclip_vit_attn patched 0 blocks.")
+
+    # 3) Load base weights into the (possibly patched) base model
+    # base_sd must match this model's keys (patched keyspace if patched_attn=True)
+    load_into_model(model, base_sd, strict=strict_load)
+
+    if peft_cfg.get("target_modules", None) is None:
+        raise ValueError("peft_cfg_map must include target_modules to reconstruct the adapter.")
+
+    # 5) Wrap ONLY visual with PEFT
+    peft_visual = get_peft_model(model.visual, build_lora_config(peft_cfg))
+    model.visual = peft_visual
+
+    # 6) Load adapter weights
+    # Ensure tensors are on the same device/dtype as the PEFT module expects
+    dev = next(model.parameters()).device
+    peft_state = {k: v.to(device=dev) for k, v in peft_state.items()}
+
+    # Adapter-only state dict load. Missing base-model keys are expected here.
+    res = set_peft_model_state_dict(model.visual, peft_state, adapter_name="default")
+
+    # Some PEFT versions return None; others return _IncompatibleKeys / tuple.
+    if res is not None:
+        missing = getattr(res, "missing_keys", None)
+        unexpected = getattr(res, "unexpected_keys", None)
+        if missing is None or unexpected is None:
+            missing, unexpected = res
+        # Missing keys are expected when loading adapter-only weights into the wrapped module.
+        if unexpected:
+            msg = f"PEFT load: unexpected={len(unexpected)}, loaded {len(peft_state)} adapter params."
+            if strict_load:
+                raise RuntimeError(msg + f"\nunexpected[:20]={unexpected[:20]}")
+            print("[warn]", msg)
+
+    # Important: unwrap PEFT visual so state_dict keys match OpenCLIP base keyspace.
+    if hasattr(model.visual, "merge_and_unload"):
+        model.visual = model.visual.merge_and_unload()
+
+    # 7) Export full weights on CPU
+    full_sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    return full_sd
