@@ -42,6 +42,16 @@ common:
     save_last_epoch: false
     extract_heads: true
 
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: null
+    log_every_n_steps: 50
+    run_name: null
+
 datasets_order:
   - snli
   - mnli

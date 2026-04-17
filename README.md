@@ -106,6 +106,10 @@ Each task produces:
 - `<strategy>.pt`: fine-tuned model checkpoint
 - `<strategy>.json`: training log with metrics and hyperparameters
 
+Each CLI run also writes:
+- a structured run summary JSON
+- a sibling `*.events.jsonl` file with append-only metric events
+
 ### Text Fine-Tuning
 
 Text fine-tuning follows the same `common` plus per-dataset override structure and supports:
@@ -125,6 +129,44 @@ Run:
 python -m merge_and_rebase.finetune.train_text \
   --text-config src/merge_and_rebase/finetune/configs/text-peft.yaml \
   --suite nli6
+```
+
+### Logging
+
+All main CLI entrypoints support the same logging config block:
+
+```yaml
+logging:
+  use_wandb: false
+  project: null
+  entity: null
+  tags: []
+  mode: online
+  local_log_dir: null
+  log_every_n_steps: 50
+  run_name: null
+```
+
+By default, local structured logs are always written. If `local_log_dir` is unset, run summaries go to the entrypoint's natural output area when one exists, otherwise to `src/.cache/run_logs/<entrypoint>/`.
+
+All entrypoints also accept CLI overrides:
+- `--use-wandb` / `--no-use-wandb`
+- `--wandb-project`
+- `--wandb-entity`
+- `--wandb-tags tag1,tag2`
+- `--wandb-mode online|offline|disabled`
+- `--local-log-dir`
+- `--run-name`
+- `--log-every-n-steps`
+
+Example enabling W&B for vision fine-tuning:
+
+```bash
+python -m merge_and_rebase.finetune.train_vision \
+  --vision-config src/merge_and_rebase/finetune/configs/vision.yaml \
+  --use-wandb \
+  --wandb-project merge-and-rebase \
+  --wandb-tags vision,finetune
 ```
 
 ### Available Strategies
@@ -230,6 +272,8 @@ Core API:
 Built-in transport methods:
 - `identity`: no-op transport where `Δ' = Δ`
 - `orthogonal_shift`: removes the component of `Δ` aligned with `(target_base - source_base)`
+- `gradfix`: masks each task-vector component using gradient signs computed on the target model
+- `theseus`: transports matrix-shaped updates with activation-aligned orthogonal Procrustes maps
 
 Minimal Python usage:
 
@@ -242,7 +286,7 @@ rebased_sd = rebase_merged_task_vectors(
   tuned=[task1_sd, task2_sd],
   weights=[0.5, 0.5],
   alpha=1.0,
-  transport_method="orthogonal_shift",  # or "identity"
+  transport_method="theseus",  # or "identity", "orthogonal_shift", "gradfix"
 )
 ```
 
@@ -304,6 +348,7 @@ Key config fields:
 | `mask_mode` | `"normal"` to zero disagreeing signs, or `"force"` to override them | `"normal"` |
 | `vote` | Gradient sign voting mode: `"mean"` or `"max"` | `"mean"` |
 | `alpha_search` | Enable a linear alpha sweep | `false` |
+| `alpha_selection` | `"shared"` for one best alpha across tasks, or `"per_task"` for one best alpha per task | `"shared"` |
 | `alpha` | Fixed scaling factor when `alpha_search` is disabled | `1.0` |
 | `weights` | Per-task composition weights, with `null` meaning uniform weights | `null` |
 | `tuned_ckpts` | Mapping from task name to checkpoint path | — |

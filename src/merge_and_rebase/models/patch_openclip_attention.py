@@ -41,6 +41,15 @@ def normalize_linear_rule(name: str) -> str:
     raise ValueError(f"Unknown linear_rule '{name}'. Choose from: kernel, delta")
 
 
+def _module_device_dtype(module: nn.Module) -> tuple[torch.device | None, torch.dtype | None]:
+    tensor = next(module.parameters(), None)
+    if tensor is None:
+        tensor = next(module.buffers(), None)
+    if tensor is None:
+        return None, None
+    return tensor.device, tensor.dtype
+
+
 class DeltaMemory(nn.Module):
     """
     Learnable initial fast-weight memory W0 per head.
@@ -229,6 +238,39 @@ class LoRAableMHA(nn.Module):
 
         # OpenCLIP uses [0] only, weights not needed
         return y, None
+
+    def to_torch_mha(self) -> nn.MultiheadAttention:
+        """
+        Convert this module back to a fused nn.MultiheadAttention.
+        """
+        fused = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            dropout=self.attn_dropout,
+            bias=self.q_proj.bias is not None,
+            batch_first=self.batch_first,
+        )
+
+        ref_w = self.q_proj.weight
+        fused = fused.to(device=ref_w.device, dtype=ref_w.dtype)
+
+        with torch.no_grad():
+            fused.in_proj_weight.copy_(
+                torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
+            )
+
+            if fused.in_proj_bias is not None:
+                q_bias = self.q_proj.bias if self.q_proj.bias is not None else torch.zeros_like(self.q_proj.weight[:, 0])
+                k_bias = self.k_proj.bias if self.k_proj.bias is not None else torch.zeros_like(self.k_proj.weight[:, 0])
+                v_bias = self.v_proj.bias if self.v_proj.bias is not None else torch.zeros_like(self.v_proj.weight[:, 0])
+                fused.in_proj_bias.copy_(torch.cat([q_bias, k_bias, v_bias], dim=0))
+
+            fused.out_proj.weight.copy_(self.out_proj.weight)
+            if fused.out_proj.bias is not None and self.out_proj.bias is not None:
+                fused.out_proj.bias.copy_(self.out_proj.bias)
+
+        fused.train(self.training)
+        return fused
 
 
 class LoRAableLinearMHA(LoRAableMHA):
@@ -524,7 +566,7 @@ class LoRAableLinearMHA(LoRAableMHA):
         return y, None
 
 
-def patch_openclip_vit_attn(
+def split_openclip_vit_attn(
     visual: nn.Module,
     proj_dropout: float = 0.0,
     *,
@@ -615,10 +657,50 @@ def patch_openclip_vit_attn(
             )
 
         if replacement is not None:
+            device, dtype = _module_device_dtype(attn)
+            if device is not None or dtype is not None:
+                replacement = replacement.to(device=device, dtype=dtype)
+            replacement.train(attn.training)
             blk.attn = replacement
             n_patched += 1
 
     return n_patched
+
+
+def merge_openclip_vit_attn(visual: nn.Module) -> int:
+    """
+    Recompose LoRAable attention modules under visual.transformer.resblocks.*.attn
+    back into fused nn.MultiheadAttention modules.
+    """
+    n_unpatched = 0
+    transformer = getattr(visual, "transformer", None)
+    if transformer is None:
+        raise ValueError("visual has no .transformer; are you unpatching the right module?")
+    resblocks = getattr(transformer, "resblocks", None)
+    if resblocks is None:
+        raise ValueError("visual.transformer has no .resblocks; unexpected OpenCLIP structure")
+
+    for blk in resblocks:
+        attn = getattr(blk, "attn", None)
+        replacement: nn.Module | None = None
+
+        if isinstance(attn, LoRAableLinearMHA):
+            replacement = attn.to_softmax_mha().to_torch_mha()
+        elif isinstance(attn, LoRAableMHA):
+            replacement = attn.to_torch_mha()
+        elif isinstance(attn, nn.MultiheadAttention):
+            replacement = None
+        elif attn is not None:
+            raise TypeError(
+                f"Unsupported attention module type {type(attn)}. "
+                "Expected nn.MultiheadAttention, LoRAableMHA, or LoRAableLinearMHA."
+            )
+
+        if replacement is not None:
+            blk.attn = replacement
+            n_unpatched += 1
+
+    return n_unpatched
 
 
 def set_linear_attention_ramp_step(module: nn.Module, *, step: int) -> int:

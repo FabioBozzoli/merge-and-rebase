@@ -23,6 +23,28 @@ class OpenClipBuildConfig:
     prompt_templates: list[str] | None = None
 
 
+def _is_hf_hub_ref(value: str | None) -> bool:
+    return isinstance(value, str) and value.strip().startswith("hf-hub:")
+
+
+def _resolve_openclip_load_args(cfg: OpenClipBuildConfig) -> tuple[str, str | None, bool]:
+    """
+    Normalize OpenCLIP loading arguments.
+
+    OpenCLIP Hugging Face Hub integrations are loaded via a single `hf-hub:*`
+    model reference instead of the usual `(model_name, pretrained_tag)` pair.
+    """
+    model_name = str(cfg.model_name).strip()
+    pretrained = str(cfg.pretrained).strip()
+
+    if _is_hf_hub_ref(model_name):
+        return model_name, None, False
+    if _is_hf_hub_ref(pretrained):
+        return pretrained, None, False
+
+    return model_name, pretrained, (pretrained == "openai")
+
+
 def _template_id(t) -> str:
     """
     Turn a template into a stable-ish identifier for caching.
@@ -101,13 +123,14 @@ class OpenClipClassifier(nn.Module):
         except Exception as e:
             raise ImportError("open_clip support requires: pip install -e '.[openclip]'") from e
 
+        model_name, pretrained, quick_gelu = _resolve_openclip_load_args(cfg)
         model, _, preprocess = open_clip.create_model_and_transforms(
-            cfg.model_name,
-            pretrained=cfg.pretrained,
+            model_name,
+            pretrained=pretrained,
             device=cfg.device,
-            quick_gelu=(cfg.pretrained == "openai"),
+            quick_gelu=quick_gelu,
         )
-        tokenizer = open_clip.get_tokenizer(cfg.model_name)
+        tokenizer = open_clip.get_tokenizer(model_name)
 
         # dtype casting
         if cfg.dtype is not None:

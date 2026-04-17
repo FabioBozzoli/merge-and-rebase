@@ -5,6 +5,8 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from merge_and_rebase.utils.helpers import parse_csv
+
 
 def merge_non_none(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
@@ -125,6 +127,32 @@ def add_alpha_args(
     parser.add_argument("--alpha-max", type=float, default=alpha_max_default)
     parser.add_argument("--alpha-step", type=float, default=alpha_step_default)
     parser.add_argument("--alpha", type=float, default=alpha_default)
+
+
+def add_logging_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-mode", type=str, default=None, choices=["online", "offline", "disabled"])
+    parser.add_argument("--local-log-dir", type=str, default=None)
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--log-every-n-steps", type=int, default=None)
+
+
+def build_logging_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    tags_raw = getattr(args, "wandb_tags", None)
+    tags = parse_csv(tags_raw) if isinstance(tags_raw, str) and tags_raw.strip() else None
+    return {
+        "use_wandb": getattr(args, "use_wandb", None),
+        "project": getattr(args, "wandb_project", None),
+        "entity": getattr(args, "wandb_entity", None),
+        "tags": tags,
+        "mode": getattr(args, "wandb_mode", None),
+        "local_log_dir": getattr(args, "local_log_dir", None),
+        "run_name": getattr(args, "run_name", None),
+        "log_every_n_steps": getattr(args, "log_every_n_steps", None),
+    }
 
 
 def build_common_eval_overrides(args: argparse.Namespace) -> dict[str, Any]:

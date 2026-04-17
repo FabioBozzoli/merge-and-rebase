@@ -15,6 +15,8 @@ import torch.optim as optim
 import yaml  # type: ignore
 from tqdm import tqdm
 
+from merge_and_rebase.cli_args import add_logging_args, build_logging_overrides
+from merge_and_rebase.run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from merge_and_rebase.utils.helpers import parse_csv
 
 from ..data.text_loaders import (
@@ -517,6 +519,8 @@ def train_task(
     save_format: str,
     save_last_epoch: bool = False,
     task_cfg: dict[str, Any] | None = None,
+    log_every_n_steps: int = 50,
+    run_logger: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     if accumulate_grad_batches <= 0:
         raise ValueError("accumulate_grad_batches must be >= 1.")
@@ -551,6 +555,19 @@ def train_task(
 
     task_dir = out_dir / _safe_model_tag(build_cfg.model_name_or_path) / task
     _ensure_dir(task_dir)
+    if run_logger is not None:
+        run_logger.log_event(
+            "task_start",
+            metrics={},
+            context={
+                "task": task,
+                "strategy": strategy,
+                "epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "effective_batch_size": int(batch_size * accumulate_grad_batches),
+                "task_dir": str(task_dir),
+            },
+        )
 
     steps_per_epoch = math.ceil(len(train_loader.loader) / accumulate_grad_batches)
     total_steps = max(1, epochs * steps_per_epoch)
@@ -667,6 +684,7 @@ def train_task(
                 loss.backward()
 
                 window_batch_count += 1
+                should_step = window_batch_count == window_size
                 if window_batch_count == window_size:
                     if clip_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
@@ -683,6 +701,25 @@ def train_task(
                 train_loss = running_loss / max(1, n_seen)
                 pbar.update(1)
                 pbar.set_postfix({"loss": f"{train_loss:.4f}", "lr": f"{opt.param_groups[0]['lr']:.6f}"})
+                if (
+                    run_logger is not None
+                    and log_every_n_steps > 0
+                    and global_update_step > 0
+                    and global_update_step % log_every_n_steps == 0
+                    and should_step
+                ):
+                    run_logger.log_event(
+                        "train_step",
+                        metrics={
+                            f"train/{task}/loss": float(train_loss),
+                            f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
+                        },
+                        step=int(global_update_step),
+                        context={
+                            "task": task,
+                            "epoch": int(epoch),
+                        },
+                    )
 
         val_acc = _top1(model, val_loader.loader, str(dev))
         test_acc = _top1(model, test_loader.loader, str(dev))
@@ -712,6 +749,23 @@ def train_task(
             f"loss={train_loss:.4f}  val={val_acc:.4f}  test={test_acc:.4f} "
             f"patience={patience_left}/{early_stopping_patience}"
         )
+        if run_logger is not None:
+            run_logger.log_event(
+                "epoch_end",
+                metrics={
+                    f"train/{task}/loss": float(train_loss),
+                    f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
+                    f"val/{task}/top1": float(val_acc),
+                    f"test/{task}/top1": float(test_acc),
+                    f"train/{task}/seconds": float(time.time() - t_start),
+                },
+                step=int(epoch),
+                context={
+                    "task": task,
+                    "epoch": int(epoch),
+                    "patience_left": int(patience_left),
+                },
+            )
 
     seconds = time.time() - t_start
 
@@ -775,6 +829,19 @@ def train_task(
     print(f"[{task}] saved best: {best_ckpt_path}")
     if last_ckpt_path is not None:
         print(f"[{task}] saved last: {last_ckpt_path}")
+    if run_logger is not None:
+        run_logger.log_event(
+            "task_end",
+            metrics={
+                f"val/{task}/top1": float(summary["metrics"].get("val_top1", float("nan"))),
+                f"test/{task}/top1": float(summary["metrics"].get("test_top1", float("nan"))),
+                f"train/{task}/seconds": float(summary["seconds"]),
+            },
+            context={
+                "task": task,
+                "summary": summary,
+            },
+        )
 
     return summary, best_head_payload
 
@@ -791,6 +858,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("Runtime overrides (optional)")
     g.add_argument("--device", type=str, default=None, help="Override config device, e.g. cuda, cuda:0, cpu.")
+    add_logging_args(p)
 
     return p
 
@@ -807,175 +875,218 @@ def resolve_tasks(args, cfg_file: dict[str, Any]) -> list[str]:
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    run_logger = None
+    try:
+        parser = build_parser()
+        args = parser.parse_args()
 
-    cfg_file = _load_config(args.text_config)
-    common = _get_common_cfg(cfg_file)
+        cfg_file = _load_config(args.text_config)
+        common = _get_common_cfg(cfg_file)
 
-    tasks = resolve_tasks(args, cfg_file)
+        tasks = resolve_tasks(args, cfg_file)
 
-    global_cfg = deepcopy(common)
+        global_cfg = deepcopy(common)
 
-    backbone_name = str(_get(global_cfg, "backbone.name", "hf_text"))
-    if backbone_name != "hf_text":
-        raise ValueError(f"Unsupported backbone '{backbone_name}' (only hf_text is supported).")
+        backbone_name = str(_get(global_cfg, "backbone.name", "hf_text"))
+        if backbone_name != "hf_text":
+            raise ValueError(f"Unsupported backbone '{backbone_name}' (only hf_text is supported).")
 
-    model_name_or_path = _get(global_cfg, "backbone.model_name_or_path", None)
-    if not isinstance(model_name_or_path, str) or not model_name_or_path.strip():
-        raise ValueError("common.backbone.model_name_or_path is required.")
+        model_name_or_path = _get(global_cfg, "backbone.model_name_or_path", None)
+        if not isinstance(model_name_or_path, str) or not model_name_or_path.strip():
+            raise ValueError("common.backbone.model_name_or_path is required.")
 
-    model_arch = str(_get(global_cfg, "backbone.model_arch", "auto"))
-    model_kind = str(_get(global_cfg, "backbone.model_kind", "sequence_classification"))
-    if model_kind != "sequence_classification":
-        raise ValueError("train_text currently requires common.backbone.model_kind='sequence_classification'.")
+        model_arch = str(_get(global_cfg, "backbone.model_arch", "auto"))
+        model_kind = str(_get(global_cfg, "backbone.model_kind", "sequence_classification"))
+        if model_kind != "sequence_classification":
+            raise ValueError("train_text currently requires common.backbone.model_kind='sequence_classification'.")
 
-    trust_remote_code = bool(_get(global_cfg, "backbone.trust_remote_code", False))
-    use_fast_tokenizer = bool(_get(global_cfg, "backbone.use_fast_tokenizer", True))
+        trust_remote_code = bool(_get(global_cfg, "backbone.trust_remote_code", False))
+        use_fast_tokenizer = bool(_get(global_cfg, "backbone.use_fast_tokenizer", True))
 
-    device = str(args.device) if args.device is not None else str(_get(global_cfg, "device", "cuda"))
-    dtype = _get(global_cfg, "dtype", None)
-    deterministic = bool(_get(global_cfg, "deterministic", False))
+        device = str(args.device) if args.device is not None else str(_get(global_cfg, "device", "cuda"))
+        dtype = _get(global_cfg, "dtype", None)
+        deterministic = bool(_get(global_cfg, "deterministic", False))
 
-    out_dir = Path(_get(global_cfg, "output.out_dir", "src/checkpoints/finetune_text"))
-    save_format_default = str(_get(global_cfg, "output.save_format", "full"))
-    save_last_epoch_default = bool(_get(global_cfg, "output.save_last_epoch", False))
-    extract_heads_default = bool(_get(global_cfg, "output.extract_heads", False))
-    heads_path_default = _get(global_cfg, "output.heads_path", None)
+        out_dir = Path(_get(global_cfg, "output.out_dir", "src/checkpoints/finetune_text"))
+        save_format_default = str(_get(global_cfg, "output.save_format", "full"))
+        save_last_epoch_default = bool(_get(global_cfg, "output.save_last_epoch", False))
+        extract_heads_default = bool(_get(global_cfg, "output.extract_heads", False))
+        heads_path_default = _get(global_cfg, "output.heads_path", None)
+        logging_cfg = merge_logging_config(_get(global_cfg, "logging", {}), build_logging_overrides(args))
 
-    model_tag = _safe_model_tag(model_name_or_path)
+        model_tag = _safe_model_tag(model_name_or_path)
+        run_ts = int(time.time())
+        run_path = default_summary_path(
+            entrypoint="finetune.train_text",
+            logging_cfg=logging_cfg,
+            default_parent=out_dir / model_tag,
+            timestamp=run_ts,
+        )
 
-    all_summaries: dict[str, Any] = {
-        "config_path": args.text_config,
-        "common": common,
-        "cli": {"suite": args.suite, "tasks": args.tasks, "device": args.device},
-        "resolved": {
-            "tasks": tasks,
-            "build_cfg": {
-                "backbone": backbone_name,
-                "model_name_or_path": model_name_or_path,
-                "model_arch": model_arch,
-                "model_kind": model_kind,
-                "dtype": dtype,
-                "device": device,
+        all_summaries: dict[str, Any] = {
+            "config_path": args.text_config,
+            "common": common,
+            "cli": {
+                "suite": args.suite,
+                "tasks": args.tasks,
+                "device": args.device,
+                "logging": build_logging_overrides(args),
             },
-        },
-        "results": {},
-    }
+            "resolved": {
+                "tasks": tasks,
+                "build_cfg": {
+                    "backbone": backbone_name,
+                    "model_name_or_path": model_name_or_path,
+                    "model_arch": model_arch,
+                    "model_kind": model_kind,
+                    "dtype": dtype,
+                    "device": device,
+                },
+                "run_path": str(run_path),
+            },
+            "results": {},
+        }
+        run_logger = start_run(
+            entrypoint="finetune.train_text",
+            logging_cfg=logging_cfg,
+            summary_path=run_path,
+            metadata={
+                "config_path": args.text_config,
+                "cli": all_summaries["cli"],
+                "resolved": all_summaries["resolved"],
+                "logging": logging_cfg,
+            },
+        )
 
-    extracted_heads: dict[str, dict[str, torch.Tensor]] = {}
+        extracted_heads: dict[str, dict[str, torch.Tensor]] = {}
 
-    for task in tasks:
-        task = str(task).strip().lower()
-        if task not in NLI_TASKS:
-            raise ValueError(f"Unknown task '{task}'. Supported: {list(NLI_TASKS)}")
+        for task in tasks:
+            task = str(task).strip().lower()
+            if task not in NLI_TASKS:
+                raise ValueError(f"Unknown task '{task}'. Supported: {list(NLI_TASKS)}")
 
-        task_cfg = deepcopy(common)
-        _deep_update(task_cfg, _get_dataset_override(cfg_file, task))
+            task_cfg = deepcopy(common)
+            _deep_update(task_cfg, _get_dataset_override(cfg_file, task))
+            task_logging_cfg = merge_logging_config(_get(task_cfg, "logging", {}), build_logging_overrides(args))
 
-        epochs = _get(task_cfg, "train.epochs", None)
-        if epochs is None:
-            raise ValueError(f"[{task}] train.epochs missing. Set common.train.epochs or datasets.{task}.train.epochs.")
-        epochs = int(epochs)
+            epochs = _get(task_cfg, "train.epochs", None)
+            if epochs is None:
+                raise ValueError(f"[{task}] train.epochs missing. Set common.train.epochs or datasets.{task}.train.epochs.")
+            epochs = int(epochs)
 
-        strategy_cfg = _get(task_cfg, "strategy", {})
-        if not isinstance(strategy_cfg, dict):
-            raise ValueError(f"[{task}] strategy must be a dict.")
-        strategy = str(_get(task_cfg, "strategy.name", "full"))
-        if strategy not in {"full", "linear_probe", "peft_lora"}:
-            raise ValueError(f"[{task}] Unsupported strategy '{strategy}'. Use one of: full, linear_probe, peft_lora")
+            strategy_cfg = _get(task_cfg, "strategy", {})
+            if not isinstance(strategy_cfg, dict):
+                raise ValueError(f"[{task}] strategy must be a dict.")
+            strategy = str(_get(task_cfg, "strategy.name", "full"))
+            if strategy not in {"full", "linear_probe", "peft_lora"}:
+                raise ValueError(f"[{task}] Unsupported strategy '{strategy}'. Use one of: full, linear_probe, peft_lora")
 
-        optimizer_name = str(_get(task_cfg, "train.optimizer.name", "adamw"))
-        lr = float(_get(task_cfg, "train.lr", 1e-4))
-        weight_decay = float(_get(task_cfg, "train.weight_decay", 0.0))
-        warmup_length = int(_get(task_cfg, "train.lr_scheduler.warmup_steps", 500))
-        clip_grad_norm = float(_get(task_cfg, "train.grad_clip_norm", 1.0))
-        accumulate_grad_batches = int(_get(task_cfg, "train.accumulate_grad_batches", 1))
-        if accumulate_grad_batches <= 0:
-            raise ValueError(f"[{task}] train.accumulate_grad_batches must be >= 1.")
+            optimizer_name = str(_get(task_cfg, "train.optimizer.name", "adamw"))
+            lr = float(_get(task_cfg, "train.lr", 1e-4))
+            weight_decay = float(_get(task_cfg, "train.weight_decay", 0.0))
+            warmup_length = int(_get(task_cfg, "train.lr_scheduler.warmup_steps", 500))
+            clip_grad_norm = float(_get(task_cfg, "train.grad_clip_norm", 1.0))
+            accumulate_grad_batches = int(_get(task_cfg, "train.accumulate_grad_batches", 1))
+            if accumulate_grad_batches <= 0:
+                raise ValueError(f"[{task}] train.accumulate_grad_batches must be >= 1.")
 
-        batch_size = int(_get(task_cfg, "data.batch_size", 8))
-        num_workers = int(_get(task_cfg, "data.num_workers", 0))
-        max_length = int(_get(task_cfg, "data.max_length", 512))
-        # Enforce per-task head size to match the dataset label space (e.g., 3-way vs 2-way NLI tasks).
-        task_num_labels = int(len(build_nli_task_data(task=task, split="train", max_samples=1).labels))
-        cfg_head_num_labels = int(_get(task_cfg, "backbone.num_labels", _get(global_cfg, "backbone.num_labels", task_num_labels)))
-        if cfg_head_num_labels != task_num_labels:
-            print(
-                f"[{task}] overriding backbone.num_labels from {cfg_head_num_labels} "
-                f"to {task_num_labels} to match dataset labels."
+            batch_size = int(_get(task_cfg, "data.batch_size", 8))
+            num_workers = int(_get(task_cfg, "data.num_workers", 0))
+            max_length = int(_get(task_cfg, "data.max_length", 512))
+            task_num_labels = int(len(build_nli_task_data(task=task, split="train", max_samples=1).labels))
+            cfg_head_num_labels = int(
+                _get(task_cfg, "backbone.num_labels", _get(global_cfg, "backbone.num_labels", task_num_labels))
             )
-        head_num_labels = int(task_num_labels)
+            if cfg_head_num_labels != task_num_labels:
+                print(
+                    f"[{task}] overriding backbone.num_labels from {cfg_head_num_labels} "
+                    f"to {task_num_labels} to match dataset labels."
+                )
+            head_num_labels = int(task_num_labels)
 
-        seed = int(_get(task_cfg, "seed", 42))
-        early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
-        early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
+            seed = int(_get(task_cfg, "seed", 42))
+            early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
+            early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
 
-        task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
-        save_format = str(_get(task_cfg, "output.save_format", save_format_default))
-        save_last_epoch = bool(_get(task_cfg, "output.save_last_epoch", save_last_epoch_default))
-        extract_heads = bool(_get(task_cfg, "output.extract_heads", extract_heads_default))
+            task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
+            save_format = str(_get(task_cfg, "output.save_format", save_format_default))
+            save_last_epoch = bool(_get(task_cfg, "output.save_last_epoch", save_last_epoch_default))
+            extract_heads = bool(_get(task_cfg, "output.extract_heads", extract_heads_default))
 
-        if save_format not in {"full", "head", "peft"}:
-            raise ValueError(f"[{task}] output.save_format must be one of: full, head, peft")
-        if save_format == "peft" and strategy != "peft_lora":
-            raise ValueError(f"[{task}] save_format='peft' requires strategy.name='peft_lora'.")
+            if save_format not in {"full", "head", "peft"}:
+                raise ValueError(f"[{task}] output.save_format must be one of: full, head, peft")
+            if save_format == "peft" and strategy != "peft_lora":
+                raise ValueError(f"[{task}] save_format='peft' requires strategy.name='peft_lora'.")
 
-        build_cfg = TextBuildConfig(
-            model_name_or_path=str(model_name_or_path),
-            model_arch=str(_get(task_cfg, "backbone.model_arch", model_arch)),
-            device=str(device),
-            dtype=_get(task_cfg, "dtype", dtype),
-            model_kind=str(_get(task_cfg, "backbone.model_kind", model_kind)),
-            num_labels=int(head_num_labels),
-            trust_remote_code=bool(_get(task_cfg, "backbone.trust_remote_code", trust_remote_code)),
-            use_fast_tokenizer=bool(_get(task_cfg, "backbone.use_fast_tokenizer", use_fast_tokenizer)),
-        )
+            build_cfg = TextBuildConfig(
+                model_name_or_path=str(model_name_or_path),
+                model_arch=str(_get(task_cfg, "backbone.model_arch", model_arch)),
+                device=str(device),
+                dtype=_get(task_cfg, "dtype", dtype),
+                model_kind=str(_get(task_cfg, "backbone.model_kind", model_kind)),
+                num_labels=int(head_num_labels),
+                trust_remote_code=bool(_get(task_cfg, "backbone.trust_remote_code", trust_remote_code)),
+                use_fast_tokenizer=bool(_get(task_cfg, "backbone.use_fast_tokenizer", use_fast_tokenizer)),
+            )
 
-        summary, head_payload = train_task(
-            task=task,
-            build_cfg=build_cfg,
-            strategy=strategy,
-            strategy_cfg=strategy_cfg,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            warmup_length=warmup_length,
-            optimizer_name=optimizer_name,
-            clip_grad_norm=clip_grad_norm,
-            accumulate_grad_batches=accumulate_grad_batches,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            max_length=max_length,
-            head_num_labels=head_num_labels,
-            early_stopping=early_stopping,
-            early_stopping_patience=early_stopping_patience,
-            seed=seed,
-            deterministic=deterministic,
-            device=str(device),
-            out_dir=task_out_dir,
-            save_format=save_format,
-            save_last_epoch=save_last_epoch,
-            task_cfg=task_cfg,
-        )
+            summary, head_payload = train_task(
+                task=task,
+                build_cfg=build_cfg,
+                strategy=strategy,
+                strategy_cfg=strategy_cfg,
+                epochs=epochs,
+                lr=lr,
+                weight_decay=weight_decay,
+                warmup_length=warmup_length,
+                optimizer_name=optimizer_name,
+                clip_grad_norm=clip_grad_norm,
+                accumulate_grad_batches=accumulate_grad_batches,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                max_length=max_length,
+                head_num_labels=head_num_labels,
+                early_stopping=early_stopping,
+                early_stopping_patience=early_stopping_patience,
+                seed=seed,
+                deterministic=deterministic,
+                device=str(device),
+                out_dir=task_out_dir,
+                save_format=save_format,
+                save_last_epoch=save_last_epoch,
+                task_cfg=task_cfg,
+                log_every_n_steps=int(task_logging_cfg.get("log_every_n_steps", 50)),
+                run_logger=run_logger,
+            )
 
-        all_summaries["results"][task] = summary
-        if extract_heads:
-            extracted_heads[task] = head_payload
+            all_summaries["results"][task] = summary
+            if extract_heads:
+                extracted_heads[task] = head_payload
 
-    run_path = out_dir / model_tag / f"run_{int(time.time())}.json"
-    _save_json(run_path, all_summaries)
-    print(f"\nSaved run summary: {run_path}")
+        _save_json(run_path, all_summaries)
+        run_logger.log_summary(all_summaries)
+        print(f"\nSaved run summary: {run_path}")
 
-    if extracted_heads:
-        heads_path_raw = heads_path_default
-        if isinstance(heads_path_raw, str) and heads_path_raw.strip():
-            heads_path = Path(heads_path_raw)
-        else:
-            heads_path = out_dir / model_tag / "heads.pt"
-        _ensure_dir(heads_path.parent)
-        torch.save(extracted_heads, heads_path)
-        print(f"Saved extracted task heads: {heads_path}")
+        if extracted_heads:
+            heads_path_raw = heads_path_default
+            if isinstance(heads_path_raw, str) and heads_path_raw.strip():
+                heads_path = Path(heads_path_raw)
+            else:
+                heads_path = out_dir / model_tag / "heads.pt"
+            _ensure_dir(heads_path.parent)
+            torch.save(extracted_heads, heads_path)
+            print(f"Saved extracted task heads: {heads_path}")
+            run_logger.log_event(
+                "artifact_saved",
+                metrics={},
+                context={
+                    "artifact": "heads.pt",
+                    "path": str(heads_path),
+                },
+            )
+        run_logger.finish("success")
+    except Exception as exc:
+        finish_with_error(run_logger, exc)
+        raise
 
 
 if __name__ == "__main__":

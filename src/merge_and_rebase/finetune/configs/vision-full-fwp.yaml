@@ -59,7 +59,9 @@ common:
     entity: null
     tags: []
     mode: online              # online | offline | disabled
+    local_log_dir: null
     log_every_n_steps: 50
+    run_name: null
 
 # List of datasets you want to run, if you want the config to drive selection.
 # You can still override via CLI --suite/--datasets.

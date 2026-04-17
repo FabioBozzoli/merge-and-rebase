@@ -13,6 +13,20 @@ import torch
 
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
+from ..cli_args import (
+    add_alpha_args,
+    add_config_arg,
+    add_device_dtype_args,
+    add_logging_args,
+    add_merge_io_args,
+    add_suite_arg,
+    add_tasks_arg,
+    build_common_eval_overrides,
+    build_common_merge_overrides,
+    build_logging_overrides,
+    merge_non_none,
+    parse_json_object_arg,
+)
 from ..data.text_loaders import (
     NLI_TASKS,
     NLITaskData,
@@ -23,6 +37,7 @@ from ..data.text_loaders import (
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ..io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
+from ..merge import runtime as _merge_utils
 from ..merge import subspaces as _subspaces  # noqa: F401
 from ..merge.base import PreparedMergeMethod
 from ..merge.methods._common import default_weights, get_method_params
@@ -30,19 +45,7 @@ from ..merge.registry import get_method, list_methods
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..merge.task_vectors import default_key_filter
 from ..models.text_lm import TextBuildConfig, TextLM
-from . import merge_utils as _merge_utils
-from .cli_args import (
-    add_alpha_args,
-    add_config_arg,
-    add_device_dtype_args,
-    add_merge_io_args,
-    add_suite_arg,
-    add_tasks_arg,
-    build_common_eval_overrides,
-    build_common_merge_overrides,
-    merge_non_none,
-    parse_json_object_arg,
-)
+from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .print_utils import pretty_print_task_accuracies
 
 _build_merged_state_for_alpha = _merge_utils.build_merged_state_for_alpha
@@ -57,6 +60,7 @@ _to_cpu_fp32 = _merge_utils.to_cpu_fp32
 NLI_SUITES: dict[str, tuple[str, ...]] = {
     "nli6": tuple(NLI_TASKS),
 }
+
 
 def _resolve_tuned_ckpts(tuned_cfg: Any, *, tasks: list[str] | None = None) -> list[str]:
     if isinstance(tuned_cfg, dict):
@@ -138,6 +142,7 @@ def _tensor_dict_stats(sd: dict[str, torch.Tensor]) -> tuple[float, float]:
             max_abs = max(max_abs, float(vf.abs().max().item()))
     return math.sqrt(max(0.0, sq)), max_abs
 
+
 def _load_peft_components_from_adapter_ref(adapter_ref: str) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     try:
         from peft import PeftConfig
@@ -154,6 +159,7 @@ def _load_peft_components_from_adapter_ref(adapter_ref: str) -> tuple[dict[str, 
     if not state:
         raise ValueError(f"Invalid PEFT adapter '{adapter_ref}': adapter state has no tensors.")
     return state, {"default": cfg_dict}
+
 
 def _load_peft_components_for_subspace(
     *,
@@ -181,6 +187,7 @@ def _load_peft_components_for_subspace(
         return state, cfg_map, resolved_ref
 
     raise ValueError(f"peft_subspace requires PEFT adapter references or PEFT checkpoints. Got: {ckpt_ref}")
+
 
 @dataclass(frozen=True)
 class _AlphaMergeContext:
@@ -216,6 +223,7 @@ def _build_merged_state_from_context(ctx: _AlphaMergeContext, *, alpha: float) -
         tasks=ctx.tasks,
         merge_base_sd=ctx.merge_base_sd,
     )
+
 
 @dataclass(frozen=True)
 class _LoRAFactors:
@@ -1110,6 +1118,7 @@ def _prepare_task_arithmetic_streaming(
         )
     return base_sd, direction
 
+
 def _build_hf_model_for_materialization(
     *,
     build_cfg: TextBuildConfig,
@@ -1190,6 +1199,7 @@ def _materialize_adapter_state_dict(
 
 
 def main() -> None:
+    run_logger = None
     p = argparse.ArgumentParser("Merge text-model checkpoints and evaluate on NLI benchmarks.")
     add_config_arg(p)
     add_suite_arg(p, choices=sorted(NLI_SUITES.keys()), default=None)
@@ -1298,7 +1308,6 @@ def main() -> None:
         weights_help="Optional merge weights.",
         strict_mode="bool_optional",
     )
-
     # Alpha
     add_alpha_args(
         p,
@@ -1308,6 +1317,7 @@ def main() -> None:
         alpha_step_default=None,
         alpha_search_default=None,
     )
+    add_logging_args(p)
 
     args = p.parse_args()
 
@@ -1353,12 +1363,14 @@ def main() -> None:
         build_common_merge_overrides(args=args, method_params=method_params_cli, strict_as_bool=False),
     )
     cfg = merge_non_none(cfg, cli_overrides)
+    logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
+    cfg["logging"] = logging_cfg
 
     model_name_or_path = cfg.get("model_name_or_path", None)
     if not isinstance(model_name_or_path, str) or not model_name_or_path.strip():
         raise ValueError("You must provide --model-name-or-path (or config['model_name_or_path']).")
 
-    method_params = get_method_params({"method_params": cfg.get("method_params", {})})
+    method_params = dict(get_method_params({"method_params": cfg.get("method_params", {})}))
 
     strict_load = bool(cfg.get("strict_load", False))
     merge_weights = cfg.get("weights", None)
@@ -1379,6 +1391,11 @@ def main() -> None:
         alphas = torch.arange(a_min, a_max + 1e-9, a_step).tolist()
     else:
         alphas = [float(cfg.get("alpha", 1.0))]
+    run_summary_path = default_summary_path(
+        entrypoint="eval.llm_merge",
+        logging_cfg=logging_cfg,
+        default_parent=(Path(str(cfg["save_merged"])).parent if cfg.get("save_merged") else None),
+    )
 
     cfg_model_kind = cfg.get("model_kind", None)
     if cfg_model_kind is None:
@@ -1396,6 +1413,16 @@ def main() -> None:
         num_labels=num_labels,
         trust_remote_code=bool(cfg.get("trust_remote_code", False)),
         use_fast_tokenizer=bool(cfg.get("use_fast_tokenizer", True)),
+    )
+    run_logger = start_run(
+        entrypoint="eval.llm_merge",
+        logging_cfg=logging_cfg,
+        summary_path=run_summary_path,
+        metadata={
+            "config_path": args.config,
+            "resolved_config": cfg,
+            "summary_path": str(run_summary_path),
+        },
     )
     llm = TextLM.build(build_cfg)
     print(f"Using eval mode: {eval_mode}")
@@ -1570,6 +1597,33 @@ def main() -> None:
     if external_ref_acc is not None:
         print(f"External reference accs: {external_ref_acc}")
 
+    merge_context = {
+        "kind": "llm",
+        "cfg": cfg,
+        "model": llm.model,
+        "llm": llm,
+        "build_cfg": build_cfg,
+        "base_sd": base_sd,
+        "tuned_ckpts": tuned_ckpts,
+        "task_data": task_data,
+        "eval_mode": eval_mode,
+        "task_heads": task_heads,
+        "head_key_pattern": head_key_pattern,
+        "task_mask_class": task_mask_class,
+        "num_labels": num_labels,
+        "strict_load": strict_load,
+        "peft_subspace": peft_subspace,
+        "subspace_prepared": subspace_prepared,
+        "peft_state_by_task": peft_state_by_task,
+        "suite_name": suite_name,
+        "batch_size": int(cfg.get("batch_size", 8)),
+        "num_workers": int(cfg.get("num_workers", 0)),
+        "max_length": int(cfg.get("max_length", 512)),
+        "load_aligned_tuned": _load_aligned_tuned_from_ref,
+        "inject_task_head": _inject_task_head,
+        "head_class_ids_for_task": _head_class_ids_for_task,
+    }
+
     if (not zero_shot_only) and prepared is None and isinstance(method, PreparedMergeMethod):
         print(f"\nPreparing merge directions with method: {method.name}")
         prepared = method.prepare(
@@ -1577,6 +1631,7 @@ def main() -> None:
             tuned=tuned_sds_list,
             weights=merge_weights,
             strict=strict_load,
+            merge_context=merge_context,
             method_params=method_params,
         )
     prepared_base_direction = _prepared_base_direction(prepared)
@@ -1724,6 +1779,16 @@ def main() -> None:
                 norm_ratio,
                 single_accs=single_accs,
             )
+        if run_logger is not None:
+            run_logger.log_summary(
+                {
+                    "mode": "zero_shot_only",
+                    "tasks": [td.task for td in task_data],
+                    "per_task_acc": {td.task: float(base_accs[i]) for i, td in enumerate(task_data)},
+                    "avg_acc": float(sum(base_accs) / len(base_accs)),
+                }
+            )
+            run_logger.finish("success")
         return
 
     alpha_to_task_accs: dict[float, list[float]] = {}
@@ -1754,9 +1819,7 @@ def main() -> None:
         merged_sd = None
         # Any method that prepared (base, direction) can be applied in-place.
         can_use_inplace = (
-            peft_subspace == "full"
-            and use_inplace_task_arithmetic
-            and prepared_base_direction is not None
+            peft_subspace == "full" and use_inplace_task_arithmetic and prepared_base_direction is not None
         )
         if can_use_inplace:
             if prepared_base_direction is None:
@@ -1816,6 +1879,21 @@ def main() -> None:
         score = avg_norm_acc if norm_accs else avg_acc
         alpha_to_task_accs[float(alpha)] = accs
         alpha_to_task_norm_accs[float(alpha)] = norm_accs
+        if run_logger is not None:
+            run_logger.log_event(
+                "alpha_eval_end",
+                metrics={
+                    "alpha/value": float(alpha),
+                    "alpha/avg_acc": float(avg_acc),
+                    "alpha/avg_norm_acc": float(avg_norm_acc),
+                },
+                context={
+                    "per_task_acc": {td.task: float(accs[i]) for i, td in enumerate(task_data)},
+                    "per_task_norm_acc": {
+                        td.task: float(norm_accs[i]) for i, td in enumerate(task_data[: len(norm_accs)])
+                    },
+                },
+            )
         if norm_accs:
             print(
                 f"alpha={float(alpha):.3f}  avg_acc={avg_acc:.6f}  avg_norm_acc={avg_norm_acc:.3f}  "
@@ -1909,6 +1987,25 @@ def main() -> None:
         outp.parent.mkdir(parents=True, exist_ok=True)
         torch.save(merged_best_sd, str(outp))
         print(f"Saved best-alpha merged state_dict to {outp}")
+    if run_logger is not None:
+        run_logger.log_summary(
+            {
+                "tasks": [td.task for td in task_data],
+                "method": method.name,
+                "peft_subspace": peft_subspace,
+                "best_alpha": float(best_alpha),
+                "alpha_to_task_accs": {str(k): [float(v) for v in vals] for k, vals in alpha_to_task_accs.items()},
+                "alpha_to_task_norm_accs": {
+                    str(k): [float(v) for v in vals] for k, vals in alpha_to_task_norm_accs.items()
+                },
+                "best_per_task_acc": {td.task: float(best_vals[i]) for i, td in enumerate(task_data)},
+                "best_per_task_norm_acc": {
+                    td.task: float(best_norm_vals[i]) for i, td in enumerate(task_data[: len(best_norm_vals)])
+                },
+                "saved_merged_path": cfg.get("save_merged"),
+            }
+        )
+        run_logger.finish("success")
 
 
 if __name__ == "__main__":

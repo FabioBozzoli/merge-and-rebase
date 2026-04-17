@@ -6,6 +6,7 @@ from merge_and_rebase.eval.vision_merge import (
     _acc_cache_key,
     _assert_qkv_patched_before_linearizing,
     _extract_checkpoint_attn_patch_info,
+    _resolve_zero_shot_only,
 )
 
 
@@ -139,3 +140,12 @@ def test_acc_cache_key_differs_by_text_features_mode() -> None:
         text_features_mode="tuned_ckpt",
     )
     assert zs_key != tuned_key
+
+
+def test_resolve_zero_shot_only_defaults_true_without_tuned_ckpts() -> None:
+    assert _resolve_zero_shot_only({"tuned_ckpts": None}) is True
+
+
+def test_resolve_zero_shot_only_respects_explicit_and_checkpoint_cases() -> None:
+    assert _resolve_zero_shot_only({"zero_shot_only": True, "tuned_ckpts": {"Cars": "cars.pt"}}) is True
+    assert _resolve_zero_shot_only({"zero_shot_only": False, "tuned_ckpts": {"Cars": "cars.pt"}}) is False

@@ -8,13 +8,24 @@ from typing import Any
 
 import torch
 
-from merge_and_rebase.io.peft_helpers import (
-    is_peft_adapter_dir_ckpt,
-    load_peft_adapter_dir_components,
-)
+from merge_and_rebase.io.peft_helpers import is_peft_adapter_dir_ckpt, load_peft_adapter_dir_components
 from merge_and_rebase.io.utils import atomic_write_json, read_json_silent
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
+from ..cli_args import (
+    add_alpha_args,
+    add_config_arg,
+    add_device_dtype_args,
+    add_logging_args,
+    add_merge_io_args,
+    add_suite_arg,
+    add_tasks_arg,
+    build_common_eval_overrides,
+    build_common_merge_overrides,
+    build_logging_overrides,
+    merge_non_none,
+    parse_json_object_arg,
+)
 from ..data.templates import get_templates
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.utils import (
@@ -41,18 +52,7 @@ from ..merge.registry import get_method, list_methods  # methods are registered 
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..models.forward_modes import get_forward_mode, list_forward_modes
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from .cli_args import (
-    add_alpha_args,
-    add_config_arg,
-    add_device_dtype_args,
-    add_merge_io_args,
-    add_suite_arg,
-    add_tasks_arg,
-    build_common_eval_overrides,
-    build_common_merge_overrides,
-    merge_non_none,
-    parse_json_object_arg,
-)
+from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies, print_latex_task_rows
 
@@ -62,12 +62,62 @@ _assert_qkv_patched_before_linearizing = assert_qkv_patched_before_linearizing
 _extract_checkpoint_attn_patch_info = extract_checkpoint_attn_patch_info
 
 
+def _resolve_zero_shot_only(cfg: dict[str, Any]) -> bool:
+    return bool(cfg.get("zero_shot_only", False)) or (cfg.get("tuned_ckpts", None) is None)
+
+
+def _read_cached_top1(
+    cache: dict[str, Any],
+    *,
+    key: str,
+    label: str,
+    task: str,
+) -> float | None:
+    if key not in cache:
+        return None
+    try:
+        value = float(cache[key]["top1"])
+    except Exception:
+        return None
+    print(f"{task}: [cache] {label}: {value:.6f}")
+    return value
+
+
+def _write_cached_top1(
+    cache: dict[str, Any],
+    *,
+    cache_path: str,
+    key: str,
+    top1: float,
+    model_name: str,
+    pretrained: str,
+    task: str,
+    baseline_mode: str,
+    checkpoint: str,
+    seconds: float,
+    label: str,
+) -> None:
+    cache[key] = {
+        "top1": float(top1),
+        "model": model_name,
+        "pretrained": pretrained,
+        "dataset": task,
+        "baseline_mode": baseline_mode,
+        "baseline_checkpoint": checkpoint,
+        "ts": int(time.time()),
+        "seconds": float(seconds),
+    }
+    atomic_write_json(cache_path, cache)
+    print(f"{task}: [computed] {label}: {top1:.6f} (saved to {cache_path})")
+
+
 # ---------------------------
 # Main
 # ---------------------------
 
 
 def main() -> None:
+    run_logger = None
     p = argparse.ArgumentParser("Merge checkpoints with selectable method and evaluate on a vision suite (open_clip)")
 
     add_config_arg(p)
@@ -99,7 +149,6 @@ def main() -> None:
         weights_help="Weights for tuned checkpoints.",
         strict_mode="store_true",
     )
-
     # Method knobs
     p.add_argument("--keep-ratio", type=float, default=None, help="Keep top |Δ| ratio (task arithmetic)")
 
@@ -132,6 +181,12 @@ def main() -> None:
             "'zero_shot', or 'tuned_ckpt' (strict)."
         ),
     )
+    p.add_argument(
+        "--zero-shot-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Skip all merge/tuned-checkpoint logic and run only base-model zero-shot evaluation.",
+    )
 
     # Alpha search
     add_alpha_args(
@@ -150,6 +205,7 @@ def main() -> None:
         default="auto",
         help="Inference forward mode. 'auto' uses linearized_ntk when all tuned checkpoints have strategy='ntk'.",
     )
+    add_logging_args(p)
 
     args = p.parse_args()
     method_params_cli = parse_json_object_arg(args.method_params, arg_name="--method-params")
@@ -171,6 +227,7 @@ def main() -> None:
         "recompute_single_acc": bool(args.recompute_single_acc),
         "single_acc_zero_shot": args.single_acc_zero_shot,
         "text_features_source": args.text_features_source,
+        "zero_shot_only": args.zero_shot_only,
         "forward_mode": args.forward_mode,
     }
     cli_overrides = merge_non_none(cli_overrides, build_common_eval_overrides(args))
@@ -179,6 +236,8 @@ def main() -> None:
         build_common_merge_overrides(args=args, method_params=method_params_cli, strict_as_bool=True),
     )
     cfg = merge_non_none(cfg, cli_overrides)
+    logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
+    cfg["logging"] = logging_cfg
 
     alpha_search = bool(cfg.get("alpha_search", False))
     if alpha_search:
@@ -203,15 +262,39 @@ def main() -> None:
         bad = [t for t in tasks if t not in allowed]
         if bad:
             raise ValueError(f"Unknown tasks for suite '{suite_name}': {bad}. Allowed: {sorted(allowed)}")
+    run_summary_path = default_summary_path(
+        entrypoint="eval.vision_merge",
+        logging_cfg=logging_cfg,
+        default_parent=(Path(str(cfg["save_merged"])).parent if cfg.get("save_merged") else None),
+    )
+    run_logger = start_run(
+        entrypoint="eval.vision_merge",
+        logging_cfg=logging_cfg,
+        summary_path=run_summary_path,
+        metadata={
+            "config_path": args.config,
+            "resolved_config": cfg,
+            "suite": suite_name,
+            "tasks": tasks,
+            "summary_path": str(run_summary_path),
+        },
+    )
 
     tuned_by_task = cfg.get("tuned_ckpts", None)
-    if not tuned_by_task:
+    zero_shot_only = _resolve_zero_shot_only(cfg)
+    if zero_shot_only:
+        if tuned_by_task is not None:
+            print("zero_shot_only=True: ignoring tuned_ckpts and merge method.")
+        else:
+            print("No tuned_ckpts provided; running zero-shot-only evaluation.")
+    elif not tuned_by_task:
         raise ValueError("You must provide tuned checkpoints via --tuned-ckpts or config 'tuned_ckpts'.")
     method_params = cfg.get("method_params", {})
     if method_params is None:
         method_params = {}
     if not isinstance(method_params, dict):
         raise ValueError("config['method_params'] must be a dict when provided.")
+    method_params = dict(method_params)
     strict_load = bool(cfg.get("strict_load", False))
     merge_weights = cfg.get("weights", None)
 
@@ -242,151 +325,152 @@ def main() -> None:
     strategy_by_task: dict[str, str | None] = {}
     tuned_text_features_by_task: dict[str, torch.Tensor | None] = {}
     peft_cfg_map: dict[str, Any] | None = None
+    peft_cfg: dict[str, Any] | None = None
+    subspace = None
+    subspace_prepared = None
     base_patched_for_attn = False
+    tuned_sds_list: list[dict[str, torch.Tensor]] = []
+    base_sd_for_merge = to_cpu_fp32(base_sd)
+    merge_base_sd = to_cpu_fp32(base_sd)
 
-    for t in tasks:
-        ckpt_path = str(tuned_by_task[t])
-        obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        print(f"Loaded checkpoint for task '{t}' from {ckpt_path}")
-        strategy_by_task[t] = obj.get("strategy", None) if isinstance(obj, dict) else None
-        attn_meta_by_task[t] = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=ckpt_path)
-        # Merge/eval stays stage-agnostic: it only consumes final tuned_text_features.
-        # Stage-specific artifacts (e.g. tuned_prompt_context) are ignored here.
-        tuned_text_features_by_task[t] = OpenClipClassifier.extract_tuned_text_features_from_checkpoint(
-            obj=obj,
-            ckpt_path=ckpt_path,
-        )
+    if not zero_shot_only:
+        for t in tasks:
+            ckpt_path = str(tuned_by_task[t])
+            obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            print(f"Loaded checkpoint for task '{t}' from {ckpt_path}")
+            strategy_by_task[t] = obj.get("strategy", None) if isinstance(obj, dict) else None
+            attn_meta_by_task[t] = extract_checkpoint_attn_patch_info(obj=obj, ckpt_path=ckpt_path)
+            # Merge/eval stays stage-agnostic: it only consumes final tuned_text_features.
+            # Stage-specific artifacts (e.g. tuned_prompt_context) are ignored here.
+            tuned_text_features_by_task[t] = OpenClipClassifier.extract_tuned_text_features_from_checkpoint(
+                obj=obj,
+                ckpt_path=ckpt_path,
+            )
 
-        is_peft = False
-        state: dict[str, torch.Tensor] | None = None
-        cfg_map: dict[str, Any] | None = None
+            is_peft = False
+            state: dict[str, torch.Tensor] | None = None
+            cfg_map: dict[str, Any] | None = None
 
-        if is_peft_adapter_dir_ckpt(obj):
-            state, cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"])
-            is_peft = True
-        elif is_peft_checkpoint(obj) and isinstance(obj, dict):
-            state, cfg_map = extract_peft_components(obj)
-            is_peft = True
+            if is_peft_adapter_dir_ckpt(obj):
+                state, cfg_map = load_peft_adapter_dir_components(obj["peft_adapter_dir"])
+                is_peft = True
+            elif is_peft_checkpoint(obj) and isinstance(obj, dict):
+                state, cfg_map = extract_peft_components(obj)
+                is_peft = True
 
-        if peft_subspace != "full":
-            if not is_peft:
-                raise ValueError(f"peft_subspace='{peft_subspace}' requires PEFT checkpoints. Got: {ckpt_path}")
-            assert state is not None and cfg_map is not None
-            peft_cfg_map = ensure_peft_cfg_map(peft_cfg_map, cfg_map)
-            peft_state_by_task[t] = state
-        else:
+            if peft_subspace != "full":
+                if not is_peft:
+                    raise ValueError(f"peft_subspace='{peft_subspace}' requires PEFT checkpoints. Got: {ckpt_path}")
+                assert state is not None and cfg_map is not None
+                peft_cfg_map = ensure_peft_cfg_map(peft_cfg_map, cfg_map)
+                peft_state_by_task[t] = state
+            else:
+                base_sd, base_patched_for_attn = maybe_patch_base_for_task_attn(
+                    task_meta=attn_meta_by_task[t],
+                    base_patched_for_attn=base_patched_for_attn,
+                    clf=clf,
+                    base_ckpt=base_ckpt,
+                    strict_load=strict_load,
+                    base_sd=base_sd,
+                )
+                if is_peft:
+                    assert state is not None and cfg_map is not None
+                    peft_cfg_map = ensure_peft_cfg_map(peft_cfg_map, cfg_map)
+
+                    # if checkpoint is PEFT but we want full, we construct full weights now
+                    sd = materialize_peft_sd_from_adapter(
+                        peft_state=state,
+                        base_sd=base_sd,
+                        build_cfg=build_cfg,
+                        peft_cfg=get_peft_cfg(cfg_map),
+                        strict_load=strict_load,
+                        patched_attn=attn_meta_by_task[t].patched_attn,
+                        attn_patch_cfg=attn_meta_by_task[t].attn_patch_cfg,
+                    )
+                else:
+                    sd = load_ckpt(ckpt_path)
+                aligned = align_to_base_keys(sd, base_sd)
+                if not aligned:
+                    raise ValueError(
+                        f"No tensors from tuned checkpoint aligned to base keys for task '{t}': {ckpt_path}. "
+                        "Check checkpoint key prefixes and model compatibility."
+                    )
+                tuned_sds_by_task[t] = to_cpu_fp32(aligned)
+
+        # Attention mode (patched + linearized-vs-softmax) must be consistent across tuned checkpoints.
+        attn_meta_tasks = [t for t in tasks if t in attn_meta_by_task]
+        if attn_meta_tasks:
+            flag0 = attn_meta_by_task[attn_meta_tasks[0]].patched_attn
+            if any(attn_meta_by_task[t].patched_attn != flag0 for t in attn_meta_tasks):
+                raise ValueError("Inconsistent patched_attn flags across tuned checkpoints.")
+            patch_tasks = [t for t in attn_meta_tasks if attn_meta_by_task[t].patched_attn]
+            if patch_tasks:
+                patch_cfg0 = attn_meta_by_task[patch_tasks[0]].attn_patch_cfg or {}
+                for t in patch_tasks[1:]:
+                    patch_cfgt = attn_meta_by_task[t].attn_patch_cfg or {}
+                    if patch_cfgt != patch_cfg0:
+                        raise ValueError("Inconsistent attn_patch_cfg across tuned checkpoints.")
+                if patch_cfg0:
+                    print(f"Using checkpoint attention mode: {patch_cfg0.get('attn_impl', 'softmax')}")
+            # In subspace mode we still need patched attention keyspace in the base model/state dict
+            # because lifted deltas target q_proj/k_proj/v_proj keys.
             base_sd, base_patched_for_attn = maybe_patch_base_for_task_attn(
-                task_meta=attn_meta_by_task[t],
+                task_meta=attn_meta_by_task[attn_meta_tasks[0]],
                 base_patched_for_attn=base_patched_for_attn,
                 clf=clf,
                 base_ckpt=base_ckpt,
                 strict_load=strict_load,
                 base_sd=base_sd,
             )
-            if is_peft:
-                assert state is not None and cfg_map is not None
-                peft_cfg_map = ensure_peft_cfg_map(peft_cfg_map, cfg_map)
 
-                # if checkpoint is PEFT but we want full, we construct full weights now
-                sd = materialize_peft_sd_from_adapter(
-                    peft_state=state,
+        if peft_subspace != "full":
+            if peft_cfg_map is None:
+                raise ValueError(f"peft_subspace='{peft_subspace}' requires peft_config in checkpoints.")
+            peft_cfg = get_peft_cfg(peft_cfg_map)
+            subspace = get_subspace(peft_subspace)
+            subspace_prepared = subspace.prepare(lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
+            projected_by_task = subspace.project(subspace_prepared, lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
+            if not projected_by_task:
+                raise ValueError("Subspace projection returned empty projected_by_task.")
+            tuned_sds_list = [projected_by_task[t] for t in tasks]
+            base_sd_for_merge = {k: torch.zeros_like(v) for k, v in tuned_sds_list[0].items()}
+
+            # Build full-space tuned checkpoints once for single-task baseline eval.
+            for t in tasks:
+                tuned_sd = materialize_peft_sd_from_adapter(
+                    peft_state=peft_state_by_task[t],
                     base_sd=base_sd,
                     build_cfg=build_cfg,
-                    peft_cfg=get_peft_cfg(cfg_map),
+                    peft_cfg=peft_cfg,
                     strict_load=strict_load,
                     patched_attn=attn_meta_by_task[t].patched_attn,
                     attn_patch_cfg=attn_meta_by_task[t].attn_patch_cfg,
                 )
-            else:
-                sd = load_ckpt(ckpt_path)
-            aligned = align_to_base_keys(sd, base_sd)
-            if not aligned:
-                raise ValueError(
-                    f"No tensors from tuned checkpoint aligned to base keys for task '{t}': {ckpt_path}. "
-                    "Check checkpoint key prefixes and model compatibility."
-                )
-            tuned_sds_by_task[t] = to_cpu_fp32(aligned)
+                aligned = align_to_base_keys(tuned_sd, base_sd)
+                if not aligned:
+                    raise ValueError(
+                        f"No tensors from tuned checkpoint aligned to base keys for task '{t}'. "
+                        "Check checkpoint key prefixes and model compatibility."
+                    )
+                tuned_sds_by_task[t] = to_cpu_fp32(aligned)
+            base_sd_for_merge = to_cpu_fp32(base_sd_for_merge)
+        else:
+            tuned_sds_list = [tuned_sds_by_task[t] for t in tasks]
+            base_sd_for_merge = to_cpu_fp32(base_sd)
 
-    # Also keep a list for merge methods that expect a list
-    peft_cfg: dict[str, Any] | None = None
-    subspace = None
-    subspace_prepared = None
-    # Attention mode (patched + linearized-vs-softmax) must be consistent across tuned checkpoints.
-    attn_meta_tasks = [t for t in tasks if t in attn_meta_by_task]
-    if attn_meta_tasks:
-        flag0 = attn_meta_by_task[attn_meta_tasks[0]].patched_attn
-        if any(attn_meta_by_task[t].patched_attn != flag0 for t in attn_meta_tasks):
-            raise ValueError("Inconsistent patched_attn flags across tuned checkpoints.")
-        patch_tasks = [t for t in attn_meta_tasks if attn_meta_by_task[t].patched_attn]
-        if patch_tasks:
-            patch_cfg0 = attn_meta_by_task[patch_tasks[0]].attn_patch_cfg or {}
-            for t in patch_tasks[1:]:
-                patch_cfgt = attn_meta_by_task[t].attn_patch_cfg or {}
-                if patch_cfgt != patch_cfg0:
-                    raise ValueError("Inconsistent attn_patch_cfg across tuned checkpoints.")
-            if patch_cfg0:
-                print(f"Using checkpoint attention mode: {patch_cfg0.get('attn_impl', 'softmax')}")
-        # In subspace mode we still need patched attention keyspace in the base model/state dict
-        # because lifted deltas target q_proj/k_proj/v_proj keys.
-        base_sd, base_patched_for_attn = maybe_patch_base_for_task_attn(
-            task_meta=attn_meta_by_task[attn_meta_tasks[0]],
+        merge_base_sd = to_cpu_fp32(base_sd)
+        needs_linear_attention = any(attn_meta_by_task[t].linearized_attn for t in tasks)
+        assert_qkv_patched_before_linearizing(
+            needs_linear_attention=needs_linear_attention,
             base_patched_for_attn=base_patched_for_attn,
-            clf=clf,
-            base_ckpt=base_ckpt,
-            strict_load=strict_load,
-            base_sd=base_sd,
+            model_state_dict=clf.model.state_dict(),
         )
-
-    if peft_subspace != "full":
-        if peft_cfg_map is None:
-            raise ValueError(f"peft_subspace='{peft_subspace}' requires peft_config in checkpoints.")
-        peft_cfg = get_peft_cfg(peft_cfg_map)
-        subspace = get_subspace(peft_subspace)
-        subspace_prepared = subspace.prepare(lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
-        projected_by_task = subspace.project(subspace_prepared, lora_by_task=peft_state_by_task, peft_cfg=peft_cfg)
-        if not projected_by_task:
-            raise ValueError("Subspace projection returned empty projected_by_task.")
-        tuned_sds_list = [projected_by_task[t] for t in tasks]
-        base_sd_for_merge = {k: torch.zeros_like(v) for k, v in tuned_sds_list[0].items()}
-
-        # Build full-space tuned checkpoints once for single-task baseline eval.
-        for t in tasks:
-            tuned_sd = materialize_peft_sd_from_adapter(
-                peft_state=peft_state_by_task[t],
-                base_sd=base_sd,
-                build_cfg=build_cfg,
-                peft_cfg=peft_cfg,
-                strict_load=strict_load,
-                patched_attn=attn_meta_by_task[t].patched_attn,
-                attn_patch_cfg=attn_meta_by_task[t].attn_patch_cfg,
-            )
-            aligned = align_to_base_keys(tuned_sd, base_sd)
-            if not aligned:
-                raise ValueError(
-                    f"No tensors from tuned checkpoint aligned to base keys for task '{t}'. "
-                    "Check checkpoint key prefixes and model compatibility."
-                )
-            tuned_sds_by_task[t] = to_cpu_fp32(aligned)
-    else:
-        tuned_sds_list = [tuned_sds_by_task[t] for t in tasks]
-        base_sd_for_merge = to_cpu_fp32(base_sd)
-
-    if peft_subspace != "full":
-        base_sd_for_merge = to_cpu_fp32(base_sd_for_merge)
-    merge_base_sd = to_cpu_fp32(base_sd)
-
-    needs_linear_attention = any(attn_meta_by_task[t].linearized_attn for t in tasks)
-    assert_qkv_patched_before_linearizing(
-        needs_linear_attention=needs_linear_attention,
-        base_patched_for_attn=base_patched_for_attn,
-        model_state_dict=clf.model.state_dict(),
-    )
-    if needs_linear_attention:
-        print("Verified q/k/v attention patch is active before linearized attention evaluation.")
+        if needs_linear_attention:
+            print("Verified q/k/v attention patch is active before linearized attention evaluation.")
 
     requested_forward_mode = str(cfg.get("forward_mode", "auto"))
     if requested_forward_mode == "auto":
-        all_ntk = bool(tasks) and all(strategy_by_task.get(t) == "ntk" for t in tasks)
+        all_ntk = (not zero_shot_only) and bool(tasks) and all(strategy_by_task.get(t) == "ntk" for t in tasks)
         resolved_forward_mode = "linearized_ntk" if all_ntk else "standard"
     else:
         resolved_forward_mode = requested_forward_mode
@@ -399,14 +483,18 @@ def main() -> None:
     )
     print(f"Using forward mode: {resolved_forward_mode}")
 
-    print("base keys:", len(base_sd_for_merge))
-    print("example tuned aligned keys:", len(tuned_sds_list[0]))
-    print("example intersection:", len(set(base_sd_for_merge).intersection(tuned_sds_list[0])))
+    if not zero_shot_only:
+        print("base keys:", len(base_sd_for_merge))
+        print("example tuned aligned keys:", len(tuned_sds_list[0]))
+        print("example intersection:", len(set(base_sd_for_merge).intersection(tuned_sds_list[0])))
 
     device = str(cfg.get("device", "cuda"))
     text_features_source = str(cfg.get("text_features_source", "auto")).strip().lower()
     if text_features_source not in {"auto", "zero_shot", "tuned_ckpt"}:
         raise ValueError("text_features_source must be one of: auto, zero_shot, tuned_ckpt")
+    if zero_shot_only and text_features_source != "zero_shot":
+        print("zero_shot_only=True: forcing text_features_source='zero_shot'.")
+        text_features_source = "zero_shot"
     print(f"Text features source: {text_features_source}")
     use_humanized_classnames = not bool(cfg.get("no_humanize", True))
     classnames_mode = "humanized" if use_humanized_classnames else "raw"
@@ -416,8 +504,11 @@ def main() -> None:
     single_cache_path = str(cfg.get("single_acc_cache", "src/.cache/single_task_acc.json"))
     single_cache = read_json_silent(single_cache_path)
     recompute_single = bool(cfg.get("recompute_single_acc", False))
-    compute_zero_shot_acc = bool(cfg.get("single_acc_zero_shot", False))
-    print("Single-accuracy baseline mode: single-task tuned (used for normalization)")
+    compute_zero_shot_acc = True if zero_shot_only else bool(cfg.get("single_acc_zero_shot", False))
+    if zero_shot_only:
+        print("Single-accuracy baseline mode: zero-shot only (no tuned checkpoints)")
+    else:
+        print("Single-accuracy baseline mode: single-task tuned (used for normalization)")
     if compute_zero_shot_acc:
         print("Zero-shot base-model accuracies will also be computed (not used for normalization).")
 
@@ -455,67 +546,75 @@ def main() -> None:
             prompt_templates=templates,
         )
 
-        # Single-task baseline (used for normalization) always comes from the tuned checkpoint.
-        task_text_features, task_text_features_mode = clf.resolve_eval_text_features(
-            text_features_source=text_features_source,
-            classnames=classnames,
-            build_cfg=build_cfg_task,
-            tuned_text_features=tuned_text_features_by_task.get(task, None),
-            cache_dir="src/.cache/zs_cache",
-            force_rebuild_zeroshot=False,
-            task_name=task,
-            ckpt_path=str(tuned_by_task[task]),
-            verbose=True,
-        )
-
-        k = acc_cache_key(
-            build_cfg.model_name,
-            build_cfg.pretrained,
-            task,
-            chk_path=str(tuned_by_task[task]),
-            baseline_mode="tuned",
-            forward_mode=resolved_forward_mode,
-            classnames_mode=classnames_mode,
-            text_features_mode=task_text_features_mode,
-        )
+        task_text_features = None
+        task_text_features_mode: str | None = None
         single_acc: float | None = None
-        if (not recompute_single) and k in single_cache:
-            try:
-                single_acc = float(single_cache[k]["top1"])
-                print(f"{task}: [cache] single-task tuned acc: {single_acc:.6f}")
-            except Exception:
-                single_acc = None
-
-        if single_acc is None:
-            # Load tuned weights into the single model instance, evaluate, then overwrite later during merge eval.
-            tuned_sd = tuned_sds_by_task[task]
-            load_into_model(clf.model, tuned_sd, strict=strict_load)
-            t0 = time.time()
-            single_acc = eval_task_top1(
-                clf=clf,
-                loaders=loaders,
-                classnames=classnames,
-                build_cfg_task=build_cfg_task,
-                device=device,
-                split="test",
-                text_features=task_text_features,
-            )
-            dt = time.time() - t0
-
-            single_cache[k] = {
-                "top1": float(single_acc),
-                "model": build_cfg.model_name,
-                "pretrained": build_cfg.pretrained,
-                "dataset": task,
-                "baseline_mode": "tuned",
-                "baseline_checkpoint": str(tuned_by_task[task]),
-                "ts": int(time.time()),
-                "seconds": float(dt),
-            }
-            atomic_write_json(single_cache_path, single_cache)
-            print(f"{task}: [computed] single-task tuned acc: {single_acc:.6f} (saved to {single_cache_path})")
-
         zero_shot_acc: float | None = None
+
+        if not zero_shot_only:
+            # Single-task baseline (used for normalization) always comes from the tuned checkpoint.
+            task_text_features, task_text_features_mode = clf.resolve_eval_text_features(
+                text_features_source=text_features_source,
+                classnames=classnames,
+                build_cfg=build_cfg_task,
+                tuned_text_features=tuned_text_features_by_task.get(task, None),
+                cache_dir="src/.cache/zs_cache",
+                force_rebuild_zeroshot=False,
+                task_name=task,
+                ckpt_path=str(tuned_by_task[task]),
+                verbose=True,
+            )
+
+            k = acc_cache_key(
+                build_cfg.model_name,
+                build_cfg.pretrained,
+                task,
+                chk_path=str(tuned_by_task[task]),
+                baseline_mode="tuned",
+                forward_mode=resolved_forward_mode,
+                classnames_mode=classnames_mode,
+                text_features_mode=task_text_features_mode,
+            )
+            if not recompute_single:
+                single_acc = _read_cached_top1(
+                    single_cache,
+                    key=k,
+                    label="single-task tuned acc",
+                    task=task,
+                )
+
+            if single_acc is None:
+                # Load tuned weights into the single model instance, evaluate, then overwrite later during merge eval.
+                tuned_sd = tuned_sds_by_task[task]
+                load_into_model(clf.model, tuned_sd, strict=strict_load)
+                t0 = time.time()
+                single_acc = eval_task_top1(
+                    clf=clf,
+                    loaders=loaders,
+                    classnames=classnames,
+                    build_cfg_task=build_cfg_task,
+                    device=device,
+                    split="test",
+                    text_features=task_text_features,
+                )
+                dt = time.time() - t0
+
+                _write_cached_top1(
+                    single_cache,
+                    cache_path=single_cache_path,
+                    key=k,
+                    top1=float(single_acc),
+                    model_name=build_cfg.model_name,
+                    pretrained=build_cfg.pretrained,
+                    task=task,
+                    baseline_mode="tuned",
+                    checkpoint=str(tuned_by_task[task]),
+                    seconds=float(dt),
+                    label="single-task tuned acc",
+                )
+        else:
+            task_text_features_mode = "zero_shot"
+
         if compute_zero_shot_acc:
             k_zs = acc_cache_key(
                 build_cfg.model_name,
@@ -527,12 +626,13 @@ def main() -> None:
                 classnames_mode=classnames_mode,
                 text_features_mode="zero_shot",
             )
-            if (not recompute_single) and k_zs in single_cache:
-                try:
-                    zero_shot_acc = float(single_cache[k_zs]["top1"])
-                    print(f"{task}: [cache] zero-shot acc: {zero_shot_acc:.6f}")
-                except Exception:
-                    zero_shot_acc = None
+            if not recompute_single:
+                zero_shot_acc = _read_cached_top1(
+                    single_cache,
+                    key=k_zs,
+                    label="zero-shot acc",
+                    task=task,
+                )
 
             if zero_shot_acc is None:
                 load_into_model(clf.model, merge_base_sd, strict=strict_load)
@@ -547,18 +647,24 @@ def main() -> None:
                     text_features=None,
                 )
                 dt = time.time() - t0
-                single_cache[k_zs] = {
-                    "top1": float(zero_shot_acc),
-                    "model": build_cfg.model_name,
-                    "pretrained": build_cfg.pretrained,
-                    "dataset": task,
-                    "baseline_mode": "zero_shot",
-                    "baseline_checkpoint": str(base_ckpt) if base_ckpt is not None else "open_clip_pretrained",
-                    "ts": int(time.time()),
-                    "seconds": float(dt),
-                }
-                atomic_write_json(single_cache_path, single_cache)
-                print(f"{task}: [computed] zero-shot acc: {zero_shot_acc:.6f} (saved to {single_cache_path})")
+                _write_cached_top1(
+                    single_cache,
+                    cache_path=single_cache_path,
+                    key=k_zs,
+                    top1=float(zero_shot_acc),
+                    model_name=build_cfg.model_name,
+                    pretrained=build_cfg.pretrained,
+                    task=task,
+                    baseline_mode="zero_shot",
+                    checkpoint=(str(base_ckpt) if base_ckpt is not None else "open_clip_pretrained"),
+                    seconds=float(dt),
+                    label="zero-shot acc",
+                )
+
+        if zero_shot_only:
+            if zero_shot_acc is None:
+                raise RuntimeError(f"Zero-shot-only mode failed to compute zero-shot accuracy for task '{task}'.")
+            single_acc = float(zero_shot_acc)
 
         per_task.append(
             {
@@ -572,6 +678,34 @@ def main() -> None:
             }
         )
 
+    if zero_shot_only:
+        zs_accs = [float(item["single_acc"]) for item in per_task]
+        print(f"Average zero-shot acc across {len(zs_accs)} tasks: {sum(zs_accs) / len(zs_accs):.6f}")
+        pretty_print_task_accuracies(
+            suite_name,
+            "zero_shot",
+            peft_subspace,
+            per_task,
+            zs_accs,
+            [1.0] * len(zs_accs),
+            single_accs=zs_accs,
+            baseline_label="zero_shot",
+            result_label="top1",
+        )
+        print_latex_task_rows(per_task, zs_accs, [1.0] * len(zs_accs))
+        if run_logger is not None:
+            run_logger.log_summary(
+                {
+                    "mode": "zero_shot_only",
+                    "suite": suite_name,
+                    "tasks": tasks,
+                    "per_task_acc": {item["task"]: float(item["single_acc"]) for item in per_task},
+                    "avg_acc": float(sum(zs_accs) / len(zs_accs)),
+                }
+            )
+            run_logger.finish("success")
+        return
+
     print(
         f"Average single-task tuned acc across {len(per_task)} tasks: {sum(item['single_acc'] for item in per_task) / len(per_task):.6f}"
     )
@@ -582,6 +716,23 @@ def main() -> None:
 
     # Merge method
     method = get_method(str(cfg.get("method", "task_arithmetic")))
+    merge_context = {
+        "kind": "vision",
+        "cfg": cfg,
+        "model": clf.model,
+        "classifier": clf,
+        "device": device,
+        "strict_load": strict_load,
+        "tasks": tasks,
+        "per_task": per_task,
+        "tuned_state_by_task": tuned_sds_by_task,
+        "num_workers": int(cfg.get("num_workers", 6)),
+        "seed": int(cfg.get("seed", 42)),
+        "peft_subspace": peft_subspace,
+        "subspace_prepared": subspace_prepared,
+        "peft_state_by_task": peft_state_by_task,
+        "suite_name": suite_name,
+    }
     prepared = None
     if isinstance(method, PreparedMergeMethod):
         print(f"\n🛠️ Preparing merge directions with method: {method.name}")
@@ -591,6 +742,7 @@ def main() -> None:
             weights=merge_weights,
             strict=strict_load,
             tasks=tasks,
+            merge_context=merge_context,
             method_params=method_params,
         )
     if prepared is not None:
@@ -655,6 +807,19 @@ def main() -> None:
         avg_norm = sum(alpha_results_norm[float(alpha)]) / len(tasks)
         avg_abs = sum(alpha_results[float(alpha)]) / len(tasks)
         print(f"alpha={alpha:.3f}  avg_abs={avg_abs:.6f} avg_norm={avg_norm:.6f}")
+        if run_logger is not None:
+            run_logger.log_event(
+                "alpha_eval_end",
+                metrics={
+                    "alpha/value": float(alpha),
+                    "alpha/avg_acc": float(avg_abs),
+                    "alpha/avg_norm_acc": float(avg_norm),
+                },
+                context={
+                    "per_task_acc": {item["task"]: float(accs[idx]) for idx, item in enumerate(per_task)},
+                    "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
+                },
+            )
 
         if avg_norm > max_avg_norm:
             max_avg_norm = avg_norm
@@ -669,17 +834,17 @@ def main() -> None:
     print("\n=== Alpha search summary ===")
     for a in sorted(avg_norm_per_alpha):
         print(
-            f"alpha={a:.3f}  avg_abs={sum(alpha_results_norm[float(a)]) / len(tasks):.6f} avg_norm={avg_norm_per_alpha[a]:.6f}"
+            f"alpha={a:.3f}  avg_abs={sum(alpha_results[float(a)]) / len(tasks):.6f} avg_norm={avg_norm_per_alpha[a]:.6f}"
         )
     print(
-        f"\nBest alpha: {best_alpha:.3f} -> avg_abs={sum(alpha_results_norm[float(best_alpha)]) / len(tasks):.6f} avg_norm={avg_norm_per_alpha[best_alpha]:.6f}"
+        f"\nBest alpha: {best_alpha:.3f} -> avg_abs={sum(alpha_results[float(best_alpha)]) / len(tasks):.6f} avg_norm={avg_norm_per_alpha[best_alpha]:.6f}"
     )
 
     print("\nBest alpha per task:")
     for t in tasks:
         if t in best_alpha_per_task:
             print(
-                f"{t}: alpha={best_alpha_per_task[t]:.3f} avg_abs={sum(alpha_results_norm[float(best_alpha_per_task[t])]) / len(tasks):.6f} avg_norm={best_norm_per_task[t]:.6f}"
+                f"{t}: alpha={best_alpha_per_task[t]:.3f} avg_abs={sum(alpha_results[float(best_alpha_per_task[t])]) / len(tasks):.6f} avg_norm={best_norm_per_task[t]:.6f}"
             )
 
     # Re-run best alpha once to report avg_top1 / avg_norm
@@ -723,6 +888,28 @@ def main() -> None:
     )
 
     print_latex_task_rows(per_task, merged_accs, norm_accs)
+    if run_logger is not None:
+        run_logger.log_summary(
+            {
+                "suite": suite_name,
+                "tasks": tasks,
+                "method": method.name,
+                "peft_subspace": peft_subspace,
+                "best_alpha": float(best_alpha),
+                "alpha_results": {str(k): [float(v) for v in vals] for k, vals in alpha_results.items()},
+                "alpha_results_norm": {str(k): [float(v) for v in vals] for k, vals in alpha_results_norm.items()},
+                "best_alpha_per_task": {k: float(v) for k, v in best_alpha_per_task.items()},
+                "best_norm_per_task": {k: float(v) for k, v in best_norm_per_task.items()},
+                "test_results": {
+                    "per_task_acc": {item["task"]: float(merged_accs[idx]) for idx, item in enumerate(per_task)},
+                    "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
+                    "avg_acc": float(sum(merged_accs) / len(merged_accs)),
+                    "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
+                },
+                "saved_merged_path": cfg.get("save_merged"),
+            }
+        )
+        run_logger.finish("success")
 
 
 if __name__ == "__main__":

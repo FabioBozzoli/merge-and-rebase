@@ -84,6 +84,42 @@ def align_to_base_keys(sd: Mapping[str, torch.Tensor], base: Mapping[str, torch.
         out[new_k] = v
         return True
 
+    def try_split_qkv(old_k: str, prefix_k: str, v: torch.Tensor) -> bool:
+        if prefix_k.endswith(".attn.in_proj_weight"):
+            stem = prefix_k[: -len(".in_proj_weight")]
+            q_key = f"{stem}.q_proj.weight"
+            k_key = f"{stem}.k_proj.weight"
+            v_key = f"{stem}.v_proj.weight"
+            if not all(key in base_shapes for key in (q_key, k_key, v_key)):
+                return False
+            if v.ndim != 2 or v.shape[0] % 3 != 0:
+                return False
+            q_chunk, k_chunk, v_chunk = torch.chunk(v, 3, dim=0)
+            chunks = ((q_key, q_chunk), (k_key, k_chunk), (v_key, v_chunk))
+        elif prefix_k.endswith(".attn.in_proj_bias"):
+            stem = prefix_k[: -len(".in_proj_bias")]
+            q_key = f"{stem}.q_proj.bias"
+            k_key = f"{stem}.k_proj.bias"
+            v_key = f"{stem}.v_proj.bias"
+            if not all(key in base_shapes for key in (q_key, k_key, v_key)):
+                return False
+            if v.ndim != 1 or v.shape[0] % 3 != 0:
+                return False
+            q_chunk, k_chunk, v_chunk = torch.chunk(v, 3, dim=0)
+            chunks = ((q_key, q_chunk), (k_key, k_chunk), (v_key, v_chunk))
+        else:
+            return False
+
+        for new_k, chunk in chunks:
+            if tuple(chunk.shape) != base_shapes[new_k]:
+                return False
+            if new_k in out:
+                collisions[new_k] = old_k
+                return False
+        for new_k, chunk in chunks:
+            out[new_k] = chunk
+        return True
+
     for k, v in sd.items():
         if not isinstance(v, torch.Tensor):
             continue
@@ -114,6 +150,24 @@ def align_to_base_keys(sd: Mapping[str, torch.Tensor], base: Mapping[str, torch.
             cand = "visual.transformer." + k[len("transformer.") :]
             if try_add(k, cand, v):
                 continue
+
+        # 5) old fused attention -> patched q/k/v split when base is qkv-patched
+        split_candidates = [k]
+        if k.startswith("model."):
+            split_candidates.append(k[len("model.") :])
+        if k.startswith("module."):
+            split_candidates.append(k[len("module.") :])
+        if k.startswith("clip_model.model."):
+            split_candidates.append(k[len("clip_model.model.") :])
+        if k.startswith("clip_model."):
+            split_candidates.append(k[len("clip_model.") :])
+        if k.startswith("visual.transformer."):
+            split_candidates.append("transformer." + k[len("visual.transformer.") :])
+        if k.startswith("transformer."):
+            split_candidates.append("visual.transformer." + k[len("transformer.") :])
+
+        if any(try_split_qkv(k, cand, v) for cand in dict.fromkeys(split_candidates)):
+            continue
 
         # otherwise ignore unmatched keys (base stays base for those)
         # if you want, you can store them somewhere for debugging

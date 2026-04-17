@@ -17,7 +17,6 @@ from merge_and_rebase.rebase.methods.gradfix import (
 )
 from merge_and_rebase.rebase.registry import get_method, list_methods
 
-
 # ---- Registry -----------------------------------------------------------
 
 def test_gradfix_registered() -> None:

@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from ..base import TensorDict
 from ..registry import register
@@ -59,7 +60,7 @@ def compute_gradient_signs(
     vote_mode = "majority" if vote == "max" else vote
 
     model.eval()
-    model.zero_grad()
+    model.zero_grad(set_to_none=True)
     model.to(device)
 
     total_steps = max(1, len(dataloader))
@@ -67,17 +68,19 @@ def compute_gradient_signs(
 
     # We discover trainable_params on the first batch and reuse the list.
     trainable_params: list[tuple[str, nn.Parameter]] | None = None
+    params_only: list[nn.Parameter] | None = None
 
     sign_sums: dict[str, torch.Tensor] | None = None
     if vote_mode == "majority":
         sign_sums = {}
 
-    for batch in dataloader:
+    for batch in tqdm(dataloader, desc="Computing gradient signs"):
         loss, named_params = recipe(model, batch)
 
         # First-batch initialisation
         if trainable_params is None:
             trainable_params = named_params
+            params_only = [p for _, p in trainable_params]
             if vote_mode == "majority":
                 sign_sums = {name: torch.zeros_like(p, device=device) for name, p in trainable_params}
 
@@ -92,20 +95,20 @@ def compute_gradient_signs(
             # to full-batch backward when recipe returns a scalar.
             if loss.dim() == 0:
                 # Scalar loss — use as a single "vote"
-                params_only = [p for _, p in trainable_params]
+                assert params_only is not None
                 grads = torch.autograd.grad(
                     loss * scale,
                     params_only,
                     retain_graph=False,
                     create_graph=False,
                 )
-                for (name, _), g in zip(trainable_params, grads):
+                for (name, _), g in zip(trainable_params, grads, strict=True):
                     if g is not None:
                         sign_sums[name] += torch.sign(-g.detach())
             else:
                 # Unreduced loss [B] — per-sample vote
                 losses = loss * scale
-                params_only = [p for _, p in trainable_params]
+                assert params_only is not None
                 for i in range(losses.size(0)):
                     grads = torch.autograd.grad(
                         losses[i],
@@ -113,11 +116,11 @@ def compute_gradient_signs(
                         retain_graph=(i < losses.size(0) - 1),
                         create_graph=False,
                     )
-                    for (name, _), g in zip(trainable_params, grads, strict=False):
+                    for (name, _), g in zip(trainable_params, grads, strict=True):
                         if g is not None:
                             sign_sums[name] += torch.sign(-g.detach())
             # majority mode uses autograd.grad (not .backward), safe to zero.
-            model.zero_grad()
+            model.zero_grad(set_to_none=True)
 
     # Collect signs
     gradient_signs: TensorDict = {}
@@ -132,7 +135,7 @@ def compute_gradient_signs(
         assert sign_sums is not None
         gradient_signs = {name: torch.sign(acc).cpu() for name, acc in sign_sums.items()}
 
-    model.zero_grad()
+    model.zero_grad(set_to_none=True)
     return gradient_signs
 
 

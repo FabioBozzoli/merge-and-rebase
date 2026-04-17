@@ -53,6 +53,7 @@ class TaskVector:
     """
     Represents a task vector Δ over parameters.
     """
+
     delta: TensorDict
 
     @staticmethod
@@ -73,8 +74,8 @@ class TaskVector:
             if missing_in_tuned or missing_in_base:
                 raise KeyError(
                     "Checkpoint keys mismatch.\n"
-                    f"Missing in tuned: {missing_in_tuned[:10]}{' ...' if len(missing_in_tuned)>10 else ''}\n"
-                    f"Missing in base: {missing_in_base[:10]}{' ...' if len(missing_in_base)>10 else ''}"
+                    f"Missing in tuned: {missing_in_tuned[:10]}{' ...' if len(missing_in_tuned) > 10 else ''}\n"
+                    f"Missing in base: {missing_in_base[:10]}{' ...' if len(missing_in_base) > 10 else ''}"
                 )
 
         assert_compatible(b, t, keys)
@@ -216,7 +217,7 @@ class TaskVector:
         s = 0.0
         for v in self.delta.values():
             s += float((v.float() ** 2).sum().item())
-        return float(s ** 0.5)
+        return float(s**0.5)
 
     def normalized(self, eps: float = 1e-12) -> TaskVector:
         n = self.l2_norm()
@@ -336,7 +337,7 @@ def compose_task_vectors(
     # apply composition
     for k in keys:
         acc = base_f[k]
-        for w, tv in zip(weights, vectors):
+        for w, tv in zip(weights, vectors, strict=False):
             acc = acc + float(w) * tv.delta[k].to(dtype=acc.dtype, device=acc.device)
         out[k] = acc
 

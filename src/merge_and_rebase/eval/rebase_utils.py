@@ -42,8 +42,10 @@ def transport_vision_task_vector(
     target_base: dict[str, torch.Tensor],
     delta: dict[str, torch.Tensor],
     clf_target: OpenClipClassifier,
+    clf_source: OpenClipClassifier | None,
     task_name: str,
     loaders: Any,
+    source_loaders: Any | None,
     classnames: list[str],
     build_cfg_task: OpenClipBuildConfig,
     device: str,
@@ -55,13 +57,33 @@ def transport_vision_task_vector(
     num_workers: int,
     seed: int,
 ) -> TensorDict:
-    if getattr(method, "name", None) != "gradfix":
+    method_name = getattr(method, "name", None)
+
+    if method_name != "gradfix":
+        method_kwargs = dict(method_params)
+        extra_kwargs: dict[str, Any] = {}
+
+        if method_name == "theseus":
+            if clf_source is None or source_loaders is None:
+                raise ValueError(
+                    f"Method '{method_name}' requires source model and source dataloader, but they were not provided."
+                )
+            extra_kwargs = {
+                "source_model": clf_source.model,
+                "target_model": clf_target.model,
+                "source_dataloader": source_loaders.train,
+                "target_dataloader": loaders.train,
+            }
+            method_kwargs.setdefault("device", device)
+            method_kwargs.setdefault("seed", int(seed))
+
         return method.transport(
             source_base=source_base,
             target_base=target_base,
             delta=delta,
             strict=strict,
-            **method_params,
+            **extra_kwargs,
+            **method_kwargs,
         )
 
     vote = str(method_params.get("vote", "mean"))

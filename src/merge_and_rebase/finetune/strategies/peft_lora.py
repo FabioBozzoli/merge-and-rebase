@@ -10,7 +10,7 @@ import torch.optim as optim
 from peft import LoraConfig, get_peft_model
 
 from merge_and_rebase.finetune.strategies.full import cosine_lr
-from merge_and_rebase.models.patch_openclip_attention import patch_openclip_vit_attn
+from merge_and_rebase.models.patch_openclip_attention import split_openclip_vit_attn
 
 from .registry import register
 
@@ -173,7 +173,7 @@ class PeftLoraVision:
             assert attn_patch_cfg is not None
             ramp_steps = int(round(float(attn_patch_cfg.get("ramp_fraction", 0.0)) * max(1, int(steps))))
             attn_patch_cfg["ramp_steps"] = int(ramp_steps)
-            n = patch_openclip_vit_attn(
+            n = split_openclip_vit_attn(
                 visual,
                 proj_dropout=0.0,
                 attn_impl=attn_patch_cfg["attn_impl"],

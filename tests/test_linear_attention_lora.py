@@ -6,8 +6,9 @@ from peft import LoraConfig, get_peft_model
 
 from merge_and_rebase.models.patch_openclip_attention import (
     LoRAableLinearMHA,
-    patch_openclip_vit_attn,
+    merge_openclip_vit_attn,
     set_linear_attention_ramp_step,
+    split_openclip_vit_attn,
 )
 
 
@@ -34,13 +35,49 @@ def test_linear_attention_forward_shape_matches_original() -> None:
             self.transformer = _Transformer(_Block(attn))
 
     visual = _Visual(mha)
-    n = patch_openclip_vit_attn(visual, proj_dropout=0.0, attn_impl="linear", kernel="elu_plus_one", eps=1e-6)
+    n = split_openclip_vit_attn(visual, proj_dropout=0.0, attn_impl="linear", kernel="elu_plus_one", eps=1e-6)
     assert n == 1
 
     lin_attn = visual.transformer.resblocks[0].attn
     assert isinstance(lin_attn, LoRAableLinearMHA)
     out, _ = lin_attn(x, x, x, need_weights=False)
     assert tuple(out.shape) == tuple(ref_y.shape)
+
+
+def test_patch_openclip_vit_attn_preserves_device_and_dtype() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    mha = nn.MultiheadAttention(embed_dim=16, num_heads=4, batch_first=True).to(device=device, dtype=dtype)
+
+    class _Block(nn.Module):
+        def __init__(self, attn: nn.Module) -> None:
+            super().__init__()
+            self.attn = attn
+
+    class _Transformer(nn.Module):
+        def __init__(self, blk: nn.Module) -> None:
+            super().__init__()
+            self.resblocks = nn.ModuleList([blk])
+
+    class _Visual(nn.Module):
+        def __init__(self, attn: nn.Module) -> None:
+            super().__init__()
+            self.transformer = _Transformer(_Block(attn))
+
+    visual = _Visual(mha).to(device=device, dtype=dtype)
+    n = patch_openclip_vit_attn(visual, proj_dropout=0.0, attn_impl="softmax")
+    assert n == 1
+
+    patched_attn = visual.transformer.resblocks[0].attn
+    param = next(patched_attn.parameters())
+    assert param.device == device
+    assert param.dtype == dtype
+
+    x = torch.randn(2, 7, 16, device=device, dtype=dtype)
+    out, _ = patched_attn(x, x, x, need_weights=False)
+    assert out.device == device
+    assert out.dtype == dtype
 
 
 class _TinyBlock(nn.Module):
@@ -76,7 +113,7 @@ class _TinyVisual(nn.Module):
 def test_linear_attention_allows_lora_grad_flow() -> None:
     torch.manual_seed(0)
     visual = _TinyVisual()
-    n = patch_openclip_vit_attn(visual, proj_dropout=0.0, attn_impl="linear", kernel="elu_plus_one", eps=1e-6)
+    n = split_openclip_vit_attn(visual, proj_dropout=0.0, attn_impl="linear", kernel="elu_plus_one", eps=1e-6)
     assert n == 2
 
     for p in visual.parameters():
@@ -121,7 +158,7 @@ def test_softmax_to_linear_ramp_progresses() -> None:
             self.transformer = _Transformer()
 
     visual = _Visual()
-    n = patch_openclip_vit_attn(
+    n = split_openclip_vit_attn(
         visual,
         proj_dropout=0.0,
         attn_impl="linear",
@@ -170,7 +207,7 @@ def test_delta_rule_linear_attention_path_runs() -> None:
             self.transformer = _Transformer()
 
     visual = _Visual()
-    n = patch_openclip_vit_attn(
+    n = split_openclip_vit_attn(
         visual,
         proj_dropout=0.0,
         attn_impl="linear",
@@ -196,3 +233,37 @@ def test_delta_rule_linear_attention_path_runs() -> None:
     y, _ = blk0(x, x, x)
     assert tuple(y.shape) == (2, 5, 8)
     assert torch.isfinite(y).all()
+
+
+def test_unpatch_recomposes_to_fused_mha() -> None:
+    torch.manual_seed(0)
+
+    class _Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attn = nn.MultiheadAttention(embed_dim=8, num_heads=2, batch_first=True)
+
+    class _Transformer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resblocks = nn.ModuleList([_Block(), _Block()])
+
+    class _Visual(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer = _Transformer()
+
+    visual = _Visual()
+    n = split_openclip_vit_attn(visual, proj_dropout=0.0, attn_impl="softmax")
+    assert n == 2
+    patched_keys = set(visual.state_dict().keys())
+    assert any(k.endswith("attn.q_proj.weight") for k in patched_keys)
+
+    m = merge_openclip_vit_attn(visual)
+    assert m == 2
+    for blk in visual.transformer.resblocks:
+        assert isinstance(blk.attn, nn.MultiheadAttention)
+
+    sd_keys = set(visual.state_dict().keys())
+    assert any(k.endswith("attn.in_proj_weight") for k in sd_keys)
+    assert not any(k.endswith("attn.q_proj.weight") for k in sd_keys)

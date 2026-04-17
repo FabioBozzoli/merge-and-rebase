@@ -14,14 +14,16 @@ import torch.nn as nn
 import yaml  # type: ignore
 from tqdm import tqdm
 
+from merge_and_rebase.cli_args import add_logging_args, build_logging_overrides
 from merge_and_rebase.data.templates import get_templates
 from merge_and_rebase.io.peft_helpers import state_dict_looks_patched_attn
+from merge_and_rebase.run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from merge_and_rebase.utils.helpers import parse_csv
 
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.datasets.vision8_14_20 import SUITES, VISION20_TASKS, _vision_spec
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from ..models.patch_openclip_attention import patch_openclip_vit_attn, set_linear_attention_ramp_step
+from ..models.patch_openclip_attention import set_linear_attention_ramp_step, split_openclip_vit_attn
 from .regularizers.registry import get_regularizer, list_regularizers
 from .strategies.registry import get_strategy, list_strategies
 from .text_prestages import (
@@ -282,6 +284,8 @@ def train_task(
     peft_cfg: dict[str, Any] | None = None,
     strategy_cfg: dict[str, Any] | None = None,
     regularization_cfg: dict[str, Any] | None = None,
+    log_every_n_steps: int = 50,
+    run_logger: Any | None = None,
 ) -> dict[str, Any]:
     dev = _device(device)
     _set_seed(seed)
@@ -309,6 +313,20 @@ def train_task(
 
     task_dir = out_dir / build_cfg.model_name / build_cfg.pretrained / task
     _ensure_dir(task_dir)
+
+    if run_logger is not None:
+        run_logger.log_event(
+            "task_start",
+            metrics={},
+            context={
+                "task": task,
+                "strategy": strategy,
+                "epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "effective_batch_size": int(batch_size * accumulate_grad_batches),
+                "task_dir": str(task_dir),
+            },
+        )
 
     # model = encoder + head
     model = ImageEncoder(clf).to(dev)
@@ -352,6 +370,16 @@ def train_task(
             device=dev,
             cfg=text_prompt_ft_cfg,
         )
+        if run_logger is not None:
+            run_logger.log_event(
+                "text_prestage_end",
+                metrics={},
+                context={
+                    "task": task,
+                    "stage": "text_prompt_tuning",
+                    "summary": text_prompt_ft_summary,
+                },
+            )
     elif text_emb_ft_cfg is not None:
         print(
             f"[{task}] Running text-embedding pre-stage "
@@ -364,6 +392,16 @@ def train_task(
             device=dev,
             cfg=text_emb_ft_cfg,
         )
+        if run_logger is not None:
+            run_logger.log_event(
+                "text_prestage_end",
+                metrics={},
+                context={
+                    "task": task,
+                    "stage": "text_embeddings_finetune",
+                    "summary": text_emb_ft_summary,
+                },
+            )
 
     loss_fn = nn.CrossEntropyLoss()
     steps_per_epoch = math.ceil(len(loaders.train) / accumulate_grad_batches)
@@ -374,7 +412,7 @@ def train_task(
     if strategy != "peft_lora":
         attn_patch_cfg = _resolve_attention_patch_cfg(strategy_cfg, total_steps=total_steps)
         if attn_patch_cfg is not None:
-            patched = patch_openclip_vit_attn(
+            patched = split_openclip_vit_attn(
                 model.clip_model.model.visual,
                 proj_dropout=0.0,
                 attn_impl=str(attn_patch_cfg.get("attn_impl", "softmax")),
@@ -574,6 +612,26 @@ def train_task(
                 n_seen += bs
 
                 train_loss = running_loss / max(1, n_seen)
+                if (
+                    run_logger is not None
+                    and should_step
+                    and log_every_n_steps > 0
+                    and global_update_step > 0
+                    and global_update_step % log_every_n_steps == 0
+                ):
+                    run_logger.log_event(
+                        "train_step",
+                        metrics={
+                            f"train/{task}/loss": float(train_loss),
+                            f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
+                            f"train/{task}/reg_loss": float(reg_loss.item()) if regularizer_fns else 0.0,
+                        },
+                        step=int(global_update_step),
+                        context={
+                            "task": task,
+                            "epoch": int(epoch),
+                        },
+                    )
                 pbar.update(1)
                 postfix = {"loss": f"{train_loss:.4f}", "lr": f"{opt.param_groups[0]['lr']:.6f}"}
                 if regularizer_fns:
@@ -610,6 +668,23 @@ def train_task(
         print(
             f"[{task}] epoch {epoch:03d}/{epochs}  loss={train_loss:.4f}  val={val_acc:.4f}  test={test_acc:.4f} patience={early_stopping_patience_current}/{early_stopping_patience}"
         )
+        if run_logger is not None:
+            run_logger.log_event(
+                "epoch_end",
+                metrics={
+                    f"train/{task}/loss": float(train_loss),
+                    f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
+                    f"val/{task}/top1": float(val_acc),
+                    f"test/{task}/top1": float(test_acc),
+                    f"train/{task}/seconds": float(time.time() - t_start),
+                },
+                step=int(epoch),
+                context={
+                    "task": task,
+                    "epoch": int(epoch),
+                    "patience_left": int(early_stopping_patience_current),
+                },
+            )
 
     seconds = time.time() - t_start
 
@@ -677,6 +752,19 @@ def train_task(
     print(f"[{task}] saved best: {best_ckpt_path}")
     if last_ckpt_path is not None:
         print(f"[{task}] saved last: {last_ckpt_path}")
+    if run_logger is not None:
+        run_logger.log_event(
+            "task_end",
+            metrics={
+                f"val/{task}/top1": float(summary["metrics"].get("val_top1", float("nan"))),
+                f"test/{task}/top1": float(summary["metrics"].get("test_top1", float("nan"))),
+                f"train/{task}/seconds": float(summary["seconds"]),
+            },
+            context={
+                "task": task,
+                "summary": summary,
+            },
+        )
     return summary
 
 
@@ -697,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("Runtime overrides (optional)")
     g.add_argument("--device", type=str, default=None, help="Override config device, e.g. cuda, cuda:0, cpu, mps.")
+    add_logging_args(p)
 
     return p
 
@@ -722,136 +811,170 @@ def _get(d: dict[str, Any], path: str, default: Any = None) -> Any:
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    run_logger = None
+    try:
+        parser = build_parser()
+        args = parser.parse_args()
 
-    cfg_file = _load_config(args.vision_config)
-    common = _get_common_cfg(cfg_file)
+        cfg_file = _load_config(args.vision_config)
+        common = _get_common_cfg(cfg_file)
 
-    # Resolve tasks (datasets/suite override config order)
-    tasks = resolve_tasks(args, cfg_file)
+        # Resolve tasks (datasets/suite override config order)
+        tasks = resolve_tasks(args, cfg_file)
 
-    # Global cfg is common with selected CLI overrides.
-    global_cfg = deepcopy(common)
+        # Global cfg is common with selected CLI overrides.
+        global_cfg = deepcopy(common)
 
-    backbone_name = _get(global_cfg, "backbone.name", "openclip")
-    if backbone_name != "openclip":
-        raise ValueError(f"Unsupported backbone '{backbone_name}' (only openclip for now).")
+        backbone_name = _get(global_cfg, "backbone.name", "openclip")
+        if backbone_name != "openclip":
+            raise ValueError(f"Unsupported backbone '{backbone_name}' (only openclip for now).")
 
-    clip_model = _get(global_cfg, "backbone.clip_model", "ViT-B-32")
-    clip_pretrained = _get(global_cfg, "backbone.clip_pretrained", "openai")
-    device = str(args.device) if args.device is not None else _get(global_cfg, "device", "cuda")
-    dtype = _get(global_cfg, "dtype", None)
+        clip_model = _get(global_cfg, "backbone.clip_model", "ViT-B-32")
+        clip_pretrained = _get(global_cfg, "backbone.clip_pretrained", "openai")
+        device = str(args.device) if args.device is not None else _get(global_cfg, "device", "cuda")
+        dtype = _get(global_cfg, "dtype", None)
 
-    out_dir = Path(_get(global_cfg, "output.out_dir", "src/checkpoints/finetune"))
-    save_format_default = str(_get(global_cfg, "output.save_format", "full"))
-    save_last_epoch_default = bool(_get(global_cfg, "output.save_last_epoch", False))
+        out_dir = Path(_get(global_cfg, "output.out_dir", "src/checkpoints/finetune"))
+        save_format_default = str(_get(global_cfg, "output.save_format", "full"))
+        save_last_epoch_default = bool(_get(global_cfg, "output.save_last_epoch", False))
+        logging_cfg = merge_logging_config(_get(global_cfg, "logging", {}), build_logging_overrides(args))
+        run_ts = int(time.time())
+        run_path = default_summary_path(
+            entrypoint="finetune.train_vision",
+            logging_cfg=logging_cfg,
+            default_parent=out_dir / str(clip_model) / str(clip_pretrained),
+            timestamp=run_ts,
+        )
 
-    all_summaries: dict[str, Any] = {
-        "config_path": args.vision_config,
-        "common": common,
-        "cli": {"suite": args.suite, "datasets": args.datasets, "device": args.device},
-        "resolved": {
-            "tasks": tasks,
-            "build_cfg": {
-                "backbone": backbone_name,
-                "clip_model": clip_model,
-                "clip_pretrained": clip_pretrained,
-                "dtype": dtype,
-                "device": device,
+        all_summaries: dict[str, Any] = {
+            "config_path": args.vision_config,
+            "common": common,
+            "cli": {
+                "suite": args.suite,
+                "datasets": args.datasets,
+                "device": args.device,
+                "logging": build_logging_overrides(args),
             },
-        },
-        "results": {},
-    }
-
-    for task in tasks:
-        if task not in VISION20_TASKS:
-            raise ValueError(f"Unknown task '{task}'. Supported: {VISION20_TASKS}")
-
-        # task_cfg = common -> per-dataset override
-        task_cfg = deepcopy(common)
-        _deep_update(task_cfg, _get_dataset_override(cfg_file, task))
-
-        epochs = _get(task_cfg, "train.epochs", None)
-        if epochs is None:
-            raise ValueError(f"[{task}] train.epochs missing. Set common.train.epochs or datasets.{task}.train.epochs.")
-        epochs = int(epochs)
-
-        strategy = str(_get(task_cfg, "strategy.name", "full"))
-        if strategy not in list_strategies():
-            raise ValueError(f"[{task}] Unknown strategy '{strategy}'. Available: {list_strategies()}")
-        strategy_cfg = _get(task_cfg, "strategy", {})
-        if not isinstance(strategy_cfg, dict):
-            raise ValueError(f"[{task}] strategy must be a dict.")
-        regularization_cfg = _get(task_cfg, "regularization", {})
-        if regularization_cfg is None:
-            regularization_cfg = {}
-        if not isinstance(regularization_cfg, dict):
-            raise ValueError(f"[{task}] regularization must be a dict when provided.")
-        regularization_name = str(regularization_cfg.get("name", "")).strip()
-        if regularization_name and regularization_name not in list_regularizers():
-            raise ValueError(f"[{task}] Unknown regularizer '{regularization_name}'. Available: {list_regularizers()}")
-
-        lr = float(_get(task_cfg, "train.lr", 1e-4))
-        weight_decay = float(_get(task_cfg, "train.weight_decay", 0.0))
-        clip_grad_norm = float(_get(task_cfg, "train.grad_clip_norm", 1.0))
-        accumulate_grad_batches = int(_get(task_cfg, "train.accumulate_grad_batches", 1))
-        if accumulate_grad_batches <= 0:
-            raise ValueError(f"[{task}] train.accumulate_grad_batches must be >= 1.")
-
-        batch_size = int(_get(task_cfg, "data.batch_size", 64))
-        num_workers = int(_get(task_cfg, "data.num_workers", 6))
-        val_fraction = float(_get(task_cfg, "data.val_fraction", 0.1))
-        seed = int(_get(task_cfg, "seed", 42))
-        early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
-        early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
-
-        task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
-        save_format = str(_get(task_cfg, "output.save_format", save_format_default))
-        save_last_epoch = bool(_get(task_cfg, "output.save_last_epoch", save_last_epoch_default))
-
-        hf_path, hf_config, split_map = _vision_spec(task)
-
-        build_cfg = OpenClipBuildConfig(
-            model_name=str(clip_model),
-            pretrained=str(clip_pretrained),
-            device=str(device),
-            dtype=dtype,
-            prompt_templates=get_templates(task),
+            "resolved": {
+                "tasks": tasks,
+                "build_cfg": {
+                    "backbone": backbone_name,
+                    "clip_model": clip_model,
+                    "clip_pretrained": clip_pretrained,
+                    "dtype": dtype,
+                    "device": device,
+                },
+                "run_path": str(run_path),
+            },
+            "results": {},
+        }
+        run_logger = start_run(
+            entrypoint="finetune.train_vision",
+            logging_cfg=logging_cfg,
+            summary_path=run_path,
+            metadata={
+                "config_path": args.vision_config,
+                "cli": all_summaries["cli"],
+                "resolved": all_summaries["resolved"],
+                "logging": logging_cfg,
+            },
         )
 
-        summary = train_task(
-            task=task,
-            hf_path=hf_path,
-            hf_config=hf_config,
-            split_map=split_map,
-            build_cfg=build_cfg,
-            strategy=strategy,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            warmup_length=int(_get(task_cfg, "train.lr_scheduler.warmup_steps", 500)),
-            clip_grad_norm=clip_grad_norm,
-            accumulate_grad_batches=accumulate_grad_batches,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            val_fraction=val_fraction,
-            seed=seed,
-            early_stopping=early_stopping,
-            early_stopping_patience=early_stopping_patience,
-            device=str(device),
-            out_dir=task_out_dir,
-            save_format=save_format,
-            save_last_epoch=save_last_epoch,
-            peft_cfg=strategy_cfg.get("peft") if strategy_cfg else None,
-            strategy_cfg=strategy_cfg,
-            regularization_cfg=regularization_cfg,
-        )
-        all_summaries["results"][task] = summary
+        for task in tasks:
+            if task not in VISION20_TASKS:
+                raise ValueError(f"Unknown task '{task}'. Supported: {VISION20_TASKS}")
 
-    run_path = out_dir / build_cfg.model_name / build_cfg.pretrained / f"run_{int(time.time())}.json"
-    _save_json(run_path, all_summaries)
-    print(f"\nSaved run summary: {run_path}")
+            # task_cfg = common -> per-dataset override
+            task_cfg = deepcopy(common)
+            _deep_update(task_cfg, _get_dataset_override(cfg_file, task))
+            task_logging_cfg = merge_logging_config(_get(task_cfg, "logging", {}), build_logging_overrides(args))
+
+            epochs = _get(task_cfg, "train.epochs", None)
+            if epochs is None:
+                raise ValueError(f"[{task}] train.epochs missing. Set common.train.epochs or datasets.{task}.train.epochs.")
+            epochs = int(epochs)
+
+            strategy = str(_get(task_cfg, "strategy.name", "full"))
+            if strategy not in list_strategies():
+                raise ValueError(f"[{task}] Unknown strategy '{strategy}'. Available: {list_strategies()}")
+            strategy_cfg = _get(task_cfg, "strategy", {})
+            if not isinstance(strategy_cfg, dict):
+                raise ValueError(f"[{task}] strategy must be a dict.")
+            regularization_cfg = _get(task_cfg, "regularization", {})
+            if regularization_cfg is None:
+                regularization_cfg = {}
+            if not isinstance(regularization_cfg, dict):
+                raise ValueError(f"[{task}] regularization must be a dict when provided.")
+            regularization_name = str(regularization_cfg.get("name", "")).strip()
+            if regularization_name and regularization_name not in list_regularizers():
+                raise ValueError(f"[{task}] Unknown regularizer '{regularization_name}'. Available: {list_regularizers()}")
+
+            lr = float(_get(task_cfg, "train.lr", 1e-4))
+            weight_decay = float(_get(task_cfg, "train.weight_decay", 0.0))
+            clip_grad_norm = float(_get(task_cfg, "train.grad_clip_norm", 1.0))
+            accumulate_grad_batches = int(_get(task_cfg, "train.accumulate_grad_batches", 1))
+            if accumulate_grad_batches <= 0:
+                raise ValueError(f"[{task}] train.accumulate_grad_batches must be >= 1.")
+
+            batch_size = int(_get(task_cfg, "data.batch_size", 64))
+            num_workers = int(_get(task_cfg, "data.num_workers", 6))
+            val_fraction = float(_get(task_cfg, "data.val_fraction", 0.1))
+            seed = int(_get(task_cfg, "seed", 42))
+            early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
+            early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
+
+            task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
+            save_format = str(_get(task_cfg, "output.save_format", save_format_default))
+            save_last_epoch = bool(_get(task_cfg, "output.save_last_epoch", save_last_epoch_default))
+
+            hf_path, hf_config, split_map = _vision_spec(task)
+
+            build_cfg = OpenClipBuildConfig(
+                model_name=str(clip_model),
+                pretrained=str(clip_pretrained),
+                device=str(device),
+                dtype=dtype,
+                prompt_templates=get_templates(task),
+            )
+
+            summary = train_task(
+                task=task,
+                hf_path=hf_path,
+                hf_config=hf_config,
+                split_map=split_map,
+                build_cfg=build_cfg,
+                strategy=strategy,
+                epochs=epochs,
+                lr=lr,
+                weight_decay=weight_decay,
+                warmup_length=int(_get(task_cfg, "train.lr_scheduler.warmup_steps", 500)),
+                clip_grad_norm=clip_grad_norm,
+                accumulate_grad_batches=accumulate_grad_batches,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                val_fraction=val_fraction,
+                seed=seed,
+                early_stopping=early_stopping,
+                early_stopping_patience=early_stopping_patience,
+                device=str(device),
+                out_dir=task_out_dir,
+                save_format=save_format,
+                save_last_epoch=save_last_epoch,
+                peft_cfg=strategy_cfg.get("peft") if strategy_cfg else None,
+                strategy_cfg=strategy_cfg,
+                regularization_cfg=regularization_cfg,
+                log_every_n_steps=int(task_logging_cfg.get("log_every_n_steps", 50)),
+                run_logger=run_logger,
+            )
+            all_summaries["results"][task] = summary
+
+        _save_json(run_path, all_summaries)
+        run_logger.log_summary(all_summaries)
+        run_logger.finish("success")
+        print(f"\nSaved run summary: {run_path}")
+    except Exception as exc:
+        finish_with_error(run_logger, exc)
+        raise
 
 
 if __name__ == "__main__":

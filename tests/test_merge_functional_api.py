@@ -104,7 +104,6 @@ def test_vector_methods_accept_1d() -> None:
         )
         assert merged.shape == mats[0].shape
 
-
 def test_matrix_only_methods_reject_1d() -> None:
     mats = _toy_matrices_1d()
     for name in ["tsv_merge", "isoc_merge", "isocts_merge", "cart_merge"]:

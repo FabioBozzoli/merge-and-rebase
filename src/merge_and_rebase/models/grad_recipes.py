@@ -18,7 +18,7 @@ Usage
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -45,6 +45,7 @@ def clip_contrastive_recipe(
     classnames: list[str],
     cfg: Any,
     *,
+    text_features: torch.Tensor | None = None,
     device: str = "cuda",
     loss_fn: nn.Module | None = None,
     reduction: str = "mean",
@@ -85,22 +86,32 @@ def clip_contrastive_recipe(
 
     def _recipe(model: nn.Module, batch: Any) -> tuple[torch.Tensor, NamedParams]:
         images, labels = batch
-        images = images.to(device)
-        labels = labels.to(device).long()
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).long()
 
         # Lazy text feature build (done once, then reused).
         if "text_feats" not in _cache:
-            prompt_classnames = [c.lower() for c in classnames] if lowercase_classnames else classnames
-            _cache["text_feats"] = classifier._compute_zeroshot_text_features(
-                prompt_classnames, cfg,
-            )
+            if text_features is not None:
+                feats = text_features.detach().to(device)
+                if normalize:
+                    feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-12)
+                _cache["text_feats"] = feats
+            else:
+                prompt_classnames = [c.lower() for c in classnames] if lowercase_classnames else classnames
+                _cache["text_feats"] = classifier._compute_zeroshot_text_features(
+                    prompt_classnames, cfg,
+                )
         text_feats = _cache["text_feats"]
 
-        trainable = [
-            (f"visual.{name}", p)
-            for name, p in model.visual.named_parameters()
-            if p.requires_grad
-        ]
+        if "trainable" not in _cache:
+            _cache["trainable"] = [
+                (f"visual.{name}", p)
+                for name, p in model.visual.named_parameters()
+                if p.requires_grad
+            ]
+            if getattr(model, "logit_scale", None) is not None and model.logit_scale.requires_grad:
+                _cache["trainable"].append(("logit_scale", model.logit_scale))
+        trainable = _cache["trainable"]
 
         image_features = model.encode_image(images)
         if normalize:
@@ -183,6 +194,7 @@ def seq_classification_recipe(
     device: str = "cuda",
     mask_class: list[int] | None = None,
     loss_fn: nn.Module | None = None,
+    reduction: str = "mean",
 ) -> GradRecipe:
     """
     Build a gradient recipe for **HuggingFace sequence-classification** models.
@@ -196,8 +208,10 @@ def seq_classification_recipe(
     mask_class : Optional subset of output classes to evaluate.
     loss_fn : Override loss (default ``CrossEntropyLoss``).
     """
+    if reduction not in {"mean", "none"}:
+        raise ValueError("reduction must be one of {'mean', 'none'}")
     if loss_fn is None:
-        loss_fn = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss(reduction=reduction)
 
     def _recipe(model: nn.Module, batch: Any) -> tuple[torch.Tensor, NamedParams]:
         if not isinstance(batch, dict):

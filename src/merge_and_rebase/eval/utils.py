@@ -1,4 +1,5 @@
 import inspect
+import math
 import random
 from collections import defaultdict
 from collections.abc import Mapping
@@ -7,7 +8,15 @@ from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Subset
-from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict
+from tqdm import tqdm
+
+try:
+    from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict
+except ImportError:
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
+    set_peft_model_state_dict = None
 
 from merge_and_rebase.io.ckpt import load_ckpt, load_into_model
 from merge_and_rebase.io.peft_helpers import (
@@ -19,7 +28,7 @@ from merge_and_rebase.io.peft_helpers import (
 )
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 
-from . import merge_utils as _merge_utils
+from ..merge import runtime as _merge_utils
 
 is_peft_checkpoint = _merge_utils.is_peft_checkpoint
 extract_peft_components = _merge_utils.extract_peft_components
@@ -29,6 +38,11 @@ to_cpu_fp32 = _merge_utils.to_cpu_fp32
 ensure_peft_cfg_map = _merge_utils.ensure_peft_cfg_map
 build_merged_state_for_alpha = _merge_utils.build_merged_state_for_alpha
 compose_weighted_deltas = _merge_utils.compose_weighted_deltas
+
+
+def _require_peft() -> None:
+    if LoraConfig is None or TaskType is None or get_peft_model is None or set_peft_model_state_dict is None:
+        raise ImportError("PEFT-dependent evaluation paths require `peft` with its runtime dependencies installed.")
 
 
 def build_cpu_cfg(cfg: OpenClipBuildConfig) -> OpenClipBuildConfig:
@@ -45,6 +59,7 @@ def build_cpu_cfg(cfg: OpenClipBuildConfig) -> OpenClipBuildConfig:
 
 
 def build_lora_config(cfg_dict: dict[str, Any]):
+    _require_peft()
 
     cfg = dict(cfg_dict)
     task_type = cfg.get("task_type", None)
@@ -125,45 +140,168 @@ def balanced_sample_indices(
     return flat
 
 
+def extract_dataset_labels(dataset: Any) -> list[int]:
+    if isinstance(dataset, Subset):
+        parent_labels = extract_dataset_labels(dataset.dataset)
+        return [int(parent_labels[i]) for i in dataset.indices]
+
+    if hasattr(dataset, "labels"):
+        labels = dataset.labels
+        return [int(y) for y in labels]
+
+    if hasattr(dataset, "targets"):
+        labels = dataset.targets
+        return [int(y) for y in labels]
+
+    if hasattr(dataset, "split") and hasattr(dataset.split, "__getitem__") and hasattr(dataset, "label_key"):
+        labels = dataset.split[dataset.label_key]
+        return [int(y) for y in labels]
+
+    out: list[int] = []
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        if isinstance(item, dict) and "labels" in item:
+            out.append(int(item["labels"]))
+            continue
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            out.append(int(item[1]))
+            continue
+        raise ValueError(
+            "Unable to infer dataset labels for Fisher sampling. "
+            "Expected .labels/.targets, split[label_key], dict['labels'], or tuple(item, label)."
+        )
+    return out
+
+
+def proportional_sample_indices(
+    dataset: Any,
+    sample_size: int,
+    *,
+    seed: int = 42,
+) -> list[int]:
+    labels = extract_dataset_labels(dataset)
+    total = len(labels)
+    if sample_size <= 0:
+        return []
+    if sample_size >= total:
+        return list(range(total))
+
+    class_indices: dict[int, list[int]] = defaultdict(list)
+    for idx, label in enumerate(labels):
+        class_indices[int(label)].append(idx)
+
+    counts: dict[int, int] = {}
+    remainders: list[tuple[float, int]] = []
+    assigned = 0
+    for cls, idxs in class_indices.items():
+        raw = (float(len(idxs)) * float(sample_size)) / float(total)
+        take = min(len(idxs), int(math.floor(raw)))
+        counts[cls] = take
+        assigned += take
+        remainders.append((raw - float(take), cls))
+
+    remaining = int(sample_size) - int(assigned)
+    remainders.sort(key=lambda item: (-item[0], item[1]))
+    while remaining > 0:
+        progressed = False
+        for _remainder, cls in remainders:
+            capacity = len(class_indices[cls]) - counts[cls]
+            if capacity <= 0:
+                continue
+            counts[cls] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+
+    rng = random.Random(seed)
+    selected: list[int] = []
+    for cls in sorted(class_indices):
+        idxs = class_indices[cls]
+        take = counts.get(cls, 0)
+        if take <= 0:
+            continue
+        if take >= len(idxs):
+            selected.extend(idxs)
+        else:
+            selected.extend(rng.sample(idxs, take))
+    return selected
+
+
+def _build_loader_like(
+    loader: DataLoader,
+    dataset: Any,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        pin_memory=bool(getattr(loader, "pin_memory", True)),
+        drop_last=bool(getattr(loader, "drop_last", False)),
+        collate_fn=getattr(loader, "collate_fn", None),
+        persistent_workers=(bool(getattr(loader, "persistent_workers", False)) and int(num_workers) > 0),
+    )
+
+
 def build_grad_dataloader(
     train_loader: DataLoader,
     train_dataset: Any,
     *,
     grad_batch_size: int | None = None,
     grad_imgs_per_class: int | None = None,
+    grad_data_percentage: float | None = None,
+    grad_sampling_strategy: str = "random",
     grad_num_batches: int | None = None,
     num_workers: int = 6,
     seed: int = 42,
 ) -> DataLoader | FirstNBatches:
     """Build a smaller dataloader for gradient-sign computation when requested."""
-    if grad_imgs_per_class is not None and grad_num_batches is not None:
-        raise ValueError("grad_imgs_per_class and grad_num_batches are mutually exclusive; set only one of them.")
+    if grad_imgs_per_class is not None and grad_data_percentage is not None:
+        raise ValueError("grad_imgs_per_class and grad_data_percentage are mutually exclusive; set only one of them.")
+    if grad_data_percentage is not None:
+        grad_data_percentage = float(grad_data_percentage)
+        if grad_data_percentage <= 0.0 or grad_data_percentage > 100.0:
+            raise ValueError("grad_data_percentage must be in the range (0, 100].")
+    sampling_strategy = str(grad_sampling_strategy).strip().lower()
+    if sampling_strategy not in {"random", "stratified"}:
+        raise ValueError("grad_sampling_strategy must be one of: random, stratified")
 
     batch_size = grad_batch_size or train_loader.batch_size
+    dataset_for_loader: Any = train_loader.dataset
+    use_shuffle = True
 
     if grad_imgs_per_class is not None:
         indices = balanced_sample_indices(train_dataset, grad_imgs_per_class, seed=seed)
-        subset = Subset(train_dataset, indices)
-        return DataLoader(
-            subset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
+        dataset_for_loader = Subset(train_dataset, indices)
+    elif grad_data_percentage is not None and grad_data_percentage < 100.0:
+        total = len(train_dataset)
+        sample_size = max(1, int(math.ceil((grad_data_percentage / 100.0) * float(total))))
+        if sampling_strategy == "stratified":
+            indices = proportional_sample_indices(train_dataset, sample_size, seed=seed)
+        else:
+            rng = random.Random(seed)
+            indices = rng.sample(range(total), sample_size)
+        dataset_for_loader = Subset(train_dataset, indices)
 
-    if grad_batch_size is not None and grad_batch_size != train_loader.batch_size:
-        loader = DataLoader(
-            train_loader.dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-    else:
+    if dataset_for_loader is train_loader.dataset and (
+        grad_batch_size is None or grad_batch_size == train_loader.batch_size
+    ):
         loader = train_loader
+    else:
+        loader = _build_loader_like(
+            train_loader,
+            dataset_for_loader,
+            batch_size=int(batch_size),
+            shuffle=use_shuffle,
+            num_workers=num_workers,
+        )
 
     if grad_num_batches is not None:
         return FirstNBatches(loader, grad_num_batches)
@@ -195,10 +333,10 @@ def patch_base_for_attn(
     strict_load: bool,
     attn_patch_cfg: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
-    from merge_and_rebase.models.patch_openclip_attention import patch_openclip_vit_attn
+    from merge_and_rebase.models.patch_openclip_attention import split_openclip_vit_attn
 
     patch_cfg = dict(attn_patch_cfg or {})
-    n = patch_openclip_vit_attn(
+    n = split_openclip_vit_attn(
         clf.model.visual,
         proj_dropout=0.0,
         attn_impl=str(patch_cfg.get("attn_impl", "softmax")),
@@ -354,7 +492,9 @@ def eval_norm_accs_for_split(
 ) -> tuple[list[float], list[float]]:
     merged_accs: list[float] = []
     norm_accs: list[float] = []
-    for item in per_task:
+    pbar = tqdm(per_task, desc=f"Evaluating {split} accuracies", unit="task", disable=not split == "test")
+
+    for item in pbar:
         task = str(item["task"])
         acc = eval_task_top1(
             device=device,
@@ -384,6 +524,8 @@ def materialize_peft_sd_from_adapter(
     patched_attn: bool,
     attn_patch_cfg: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
+    _require_peft()
+
     """
     Rebuild a full OpenCLIP state_dict from:
       - base_sd: base (pretrained or base checkpoint) state dict in the *correct keyspace*
@@ -401,10 +543,10 @@ def materialize_peft_sd_from_adapter(
 
     # 2) Patch attention if needed (must happen before loading base_sd)
     if patched_attn:
-        from merge_and_rebase.models.patch_openclip_attention import patch_openclip_vit_attn
+        from merge_and_rebase.models.patch_openclip_attention import split_openclip_vit_attn
 
         patch_cfg = dict(attn_patch_cfg or {})
-        n = patch_openclip_vit_attn(
+        n = split_openclip_vit_attn(
             model.visual,
             proj_dropout=0.0,
             attn_impl=str(patch_cfg.get("attn_impl", "softmax")),

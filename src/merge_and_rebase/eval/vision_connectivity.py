@@ -18,6 +18,17 @@ from merge_and_rebase.io.peft_helpers import (
 from merge_and_rebase.io.utils import atomic_write_json
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
+from ..cli_args import (
+    add_config_arg,
+    add_device_dtype_args,
+    add_logging_args,
+    add_suite_arg,
+    add_tasks_arg,
+    build_common_eval_overrides,
+    build_logging_overrides,
+    merge_non_none,
+    parse_json_object_arg,
+)
 from ..data.templates import get_templates
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.utils import (
@@ -35,15 +46,7 @@ from ..eval.utils import (
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ..models.forward_modes import get_forward_mode, list_forward_modes
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
-from .cli_args import (
-    add_config_arg,
-    add_device_dtype_args,
-    add_suite_arg,
-    add_tasks_arg,
-    build_common_eval_overrides,
-    merge_non_none,
-    parse_json_object_arg,
-)
+from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .datasets.vision8_14_20 import SUITES
 
 
@@ -947,9 +950,7 @@ def _run_pair_analysis(
         delta_b = _state_delta(tuned_sd=tuned_sd_b, base_sd=base_sd)
 
         heatmap_task_acc = {item.task: [[0.0 for _ in heatmap_factors] for _ in heatmap_factors] for item in per_task}
-        heatmap_task_loss = {
-            item.task: [[0.0 for _ in heatmap_factors] for _ in heatmap_factors] for item in per_task
-        }
+        heatmap_task_loss = {item.task: [[0.0 for _ in heatmap_factors] for _ in heatmap_factors] for item in per_task}
 
         total_points = len(heatmap_factors) * len(heatmap_factors)
         point_idx = 0
@@ -1162,6 +1163,7 @@ def _write_pairs_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def main() -> None:
+    run_logger = None
     p = argparse.ArgumentParser(
         "Analyze interpolation barriers and linear mode connectivity between two vision checkpoints."
     )
@@ -1247,6 +1249,7 @@ def main() -> None:
     p.add_argument("--forward-mode", type=str, choices=["auto", *list_forward_modes()], default=None)
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--save-plots", action=argparse.BooleanOptionalAction, default=None)
+    add_logging_args(p)
 
     args = p.parse_args()
     tuned_ckpts_map_cli = parse_json_object_arg(args.tuned_ckpts_map, arg_name="--tuned-ckpts-map")
@@ -1287,6 +1290,8 @@ def main() -> None:
     }
     cli_overrides = merge_non_none(cli_overrides, build_common_eval_overrides(args))
     cfg = merge_non_none(cfg, cli_overrides)
+    logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
+    cfg["logging"] = logging_cfg
 
     suite_name = str(cfg.get("suite", "vision8"))
     selected_tasks = _resolve_suite_tasks(cfg=cfg, suite_name=suite_name)
@@ -1349,6 +1354,21 @@ def main() -> None:
     device = str(cfg.get("device", "cuda"))
     output_root = Path(str(cfg.get("output_dir", "src/.cache/vision_connectivity")))
     save_plots = bool(cfg.get("save_plots", True))
+    run_summary_path = default_summary_path(
+        entrypoint="eval.vision_connectivity",
+        logging_cfg=logging_cfg,
+        default_parent=output_root,
+    )
+    run_logger = start_run(
+        entrypoint="eval.vision_connectivity",
+        logging_cfg=logging_cfg,
+        summary_path=run_summary_path,
+        metadata={
+            "config_path": args.config,
+            "resolved_config": cfg,
+            "summary_path": str(run_summary_path),
+        },
+    )
 
     tasks_to_prepare = sorted({t for pair in pair_list for t in pair})
     print(f"Preparing static task contexts for: {tasks_to_prepare}")
@@ -1426,6 +1446,20 @@ def main() -> None:
                 "metrics_json": str(pair_results["files"]["metrics_json"]),
             }
         )
+        if run_logger is not None:
+            run_logger.log_event(
+                "pair_end",
+                metrics={
+                    "connectivity/avg_loss_barrier": float(pair_results["line"]["barrier"]["avg_loss_barrier"]),
+                    "connectivity/avg_error_barrier": float(pair_results["line"]["barrier"]["avg_error_barrier"]),
+                },
+                context={
+                    "pair": [task_a, task_b],
+                    "metrics_json": str(pair_results["files"]["metrics_json"]),
+                    "line_csv": str(pair_results["files"]["line_csv"]),
+                    "heatmap_enabled": bool(pair_results["heatmap"]["enabled"]),
+                },
+            )
 
     if all_pairs:
         output_root.mkdir(parents=True, exist_ok=True)
@@ -1442,6 +1476,20 @@ def main() -> None:
         _write_pairs_summary_csv(summary_csv, pair_summaries)
         print(f"\nSaved all-pairs summary JSON to: {summary_json}")
         print(f"Saved all-pairs summary CSV to: {summary_csv}")
+        if run_logger is not None:
+            run_logger.log_summary(summary)
+            run_logger.finish("success")
+    elif run_logger is not None:
+        run_logger.log_summary(
+            {
+                "suite": suite_name,
+                "tasks": selected_tasks,
+                "num_pairs": len(pair_summaries),
+                "pairs": pair_summaries,
+                "created_unix": int(time.time()),
+            }
+        )
+        run_logger.finish("success")
 
 
 if __name__ == "__main__":
