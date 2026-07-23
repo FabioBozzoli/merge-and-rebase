@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from merge_and_rebase.merge.methods.task_arithmetic import TaskArithmeticMerge
-from merge_and_rebase.merge.runtime import build_dense_delta_branch, build_merged_state_for_alpha
+from merge_and_rebase.merge.runtime import build_dense_delta_branch, build_merged_state_for_alpha, validate_prepared_merge
 from merge_and_rebase.merge.subspaces.core_space import CoreSpace
 
 
@@ -12,6 +12,19 @@ def _peft_state_for_layer(prefix: str, a: torch.Tensor, b: torch.Tensor) -> dict
         f"{prefix}.lora_A.weight": a,
         f"{prefix}.lora_B.weight": b,
     }
+
+
+def test_validate_prepared_merge_records_coverage_and_rejects_invalid_direction() -> None:
+    base = {"weight": torch.zeros(2, 2), "bias": torch.zeros(2)}
+    metadata = validate_prepared_merge((base, {"weight": torch.ones(2, 2)}), expected_base=base, method_name="test")
+    assert metadata == {"base_key_count": 2, "direction_key_count": 1, "omitted_base_key_count": 1}
+
+    try:
+        validate_prepared_merge((base, {"weight": torch.ones(3, 3)}), expected_base=base, method_name="test")
+    except ValueError as error:
+        assert "incompatible tensor" in str(error)
+    else:
+        raise AssertionError("Expected incompatible prepared direction to fail.")
 
 
 def test_build_merged_state_for_alpha_preserves_dense_delta_branch_in_peft_subspace() -> None:

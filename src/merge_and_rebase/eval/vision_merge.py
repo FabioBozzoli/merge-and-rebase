@@ -67,6 +67,7 @@ from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ck
 from ..merge import subspaces as _subspaces  # noqa: F401
 from ..merge.base import PreparedMergeMethod
 from ..merge.methods._common import resolve_merge_weights
+from ..merge.runtime import validate_prepared_merge
 from ..merge.registry import get_method, list_methods  # methods are registered on import
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..models.forward_modes import (
@@ -869,6 +870,7 @@ def main() -> None:
     search_planner = build_search_planner(cfg=cfg, base_method_params=method_params)
     subspace_state_cache: dict[str, dict[str, Any]] = {}
     prepared_cache: dict[str, Any] = {}
+    prepared_metadata: dict[str, dict[str, Any]] = {}
     
     dense_prepared_cache: dict[str, Any] = {}
 
@@ -967,10 +969,12 @@ def main() -> None:
         cache_prepared = bool(candidate_method_params.get("cache_prepared", True))
         cache_key = stable_method_params_cache_key(candidate_method_params)
         if cache_prepared and cache_key in prepared_cache:
+            prepared_metadata[cache_key]["cache_hit"] = int(prepared_metadata[cache_key].get("cache_hit", 0)) + 1
             return prepared_cache[cache_key]
         print(f"\nPreparing merge directions with method: {method.name} ({candidate_method_params})")
         candidate_merge_context = dict(merge_context)
         candidate_merge_context["subspace_prepared"] = candidate_subspace_state["subspace_prepared"]
+        prepare_started = time.perf_counter()
         prepared_value = method.prepare(
             base=candidate_subspace_state["base_sd_for_merge"],
             tuned=candidate_subspace_state["tuned_sds_list"],
@@ -980,6 +984,14 @@ def main() -> None:
             merge_context=candidate_merge_context,
             method_params=candidate_method_params,
         )
+        metadata = validate_prepared_merge(
+            prepared_value,
+            expected_base=candidate_subspace_state["base_sd_for_merge"],
+            method_name=method.name,
+        )
+        metadata["prepare_seconds"] = time.perf_counter() - prepare_started
+        metadata["cache_hit"] = 0
+        prepared_metadata[cache_key] = metadata
         if cache_prepared:
             prepared_cache[cache_key] = prepared_value
         return prepared_value
@@ -1007,6 +1019,11 @@ def main() -> None:
                 "peft_subspace": peft_subspace,
             },
             method_params=candidate_method_params,
+        )
+        validate_prepared_merge(
+            prepared_value,
+            expected_base=dense_base_sd_for_merge,
+            method_name=f"{method.name}:dense",
         )
         if cache_prepared:
             dense_prepared_cache[cache_key] = prepared_value
@@ -1191,6 +1208,7 @@ def main() -> None:
     best_result: SearchEvaluation | None = None
     legacy_alpha_results: dict[float, list[float]] = {}
     legacy_alpha_results_norm: dict[float, list[float]] = {}
+    candidate_runtime: list[dict[str, Any]] = []
 
     while True:
         batch = search_planner.next_batch()
@@ -1203,6 +1221,7 @@ def main() -> None:
             candidate_subspace_state = _subspace_state_for(candidate.method_params)
             candidate_prepared = prepared if prepared is not None else _prepared_for(candidate.method_params)
             candidate_dense_prepared = _dense_prepared_for(candidate.method_params)
+            apply_started = time.perf_counter()
             merged_sd = build_merged_state_for_alpha(
                 method=method,
                 prepared=candidate_prepared,
@@ -1222,6 +1241,7 @@ def main() -> None:
                 dense_base_sd_for_merge=dense_base_sd_for_merge,
                 dense_tuned_sds_list=dense_tuned_sds_list,
             )
+            apply_seconds = time.perf_counter() - apply_started
 
             miss, unexp = load_into_model(clf.model, merged_sd, strict=strict_load)
             print(f"Loaded merged weights ({describe_candidate(candidate)}). missing={miss}, unexpected={unexp}")
@@ -1250,6 +1270,15 @@ def main() -> None:
             )
             batch_results.append(result)
             search_results.append(result)
+            candidate_runtime.append(
+                {
+                    "candidate_index": int(candidate.candidate_index),
+                    "stage": int(candidate.stage),
+                    "alpha": float(candidate.alpha),
+                    "method_params": dict(candidate.method_params),
+                    "apply_seconds": apply_seconds,
+                }
+            )
 
             if not search_planner.is_multi_param():
                 legacy_alpha_results[float(candidate.alpha)] = [float(v) for v in accs]
@@ -1276,6 +1305,7 @@ def main() -> None:
                         "search_stage": int(candidate.stage),
                         "method_params": candidate.method_params,
                         "search_values": candidate.values,
+                        "apply_seconds": apply_seconds,
                         "per_task_acc": {item["task"]: float(accs[idx]) for idx, item in enumerate(per_task)},
                         "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
                     },
@@ -1374,6 +1404,8 @@ def main() -> None:
                 "best_alpha": float(best_alpha),
                 "best_method_params": best_method_params,
                 "search_strategy": search_planner.search_summary(),
+                "prepared_merge_metadata": prepared_metadata,
+                "candidate_runtime": candidate_runtime,
                 "search_results": summarize_search_results(search_results),
                 "alpha_results": {str(k): [float(v) for v in vals] for k, vals in legacy_alpha_results.items()},
                 "alpha_results_norm": {

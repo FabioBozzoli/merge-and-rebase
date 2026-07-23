@@ -51,6 +51,37 @@ uv pip install -e ".[dev,data,test]"
 
 ---
 
+## Reproducibility Artifacts
+
+Published checkpoint bundles are described by `artifacts/manifest.json`. Once a
+camera-ready bundle is released, download and verify it before running a paper
+configuration:
+
+```bash
+python scripts/fetch_artifacts.py --bundle vision8-table2 --destination src/checkpoints
+```
+
+The downloader verifies SHA-256 hashes and refuses bundles that are not yet
+released. The camera-ready experiment sequence, including corrected rebase
+tables, seed replication, efficiency measurements, and HPO sensitivity, is in
+`experiments/camera_ready_plan.json` and can be listed with:
+
+```bash
+python scripts/run_camera_ready_plan.py
+```
+
+Before generating rebase tables, validate the JSON summary so normalized ratios
+cannot be exported as raw accuracies:
+
+```bash
+python scripts/audit_rebase_summary.py path/to/rebase-summary.json
+```
+
+Large checkpoint entries can use either an immutable HTTPS URL or the existing
+`hf-hub:org/repo/path/to/checkpoint.pt` syntax. The TSV reference checkpoints
+remain available through `scripts/download_tsv_checkpoints.py`; their source
+and license must be recorded separately in the artifact manifest.
+
 ## Vision Fine-Tuning
 
 Vision fine-tuning is driven by config files. The CLI is used to choose the config and optionally restrict datasets.

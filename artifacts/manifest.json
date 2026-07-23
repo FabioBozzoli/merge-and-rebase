@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "description": "Release manifest for merge-and-rebase benchmark artifacts. Entries become downloadable only after immutable public URLs and SHA-256 digests are recorded.",
+  "url_schemes": [
+    "https://...",
+    "hf-hub:anonymous-neurips-2199/benchmark-artifacts/path/to/file.pt"
+  ],
+  "bundles": [
+    {
+      "name": "vision8-table2",
+      "status": "pending_release",
+      "description": "Minimal checkpoint and summary bundle required to reproduce one published vision8 Table 2 cell.",
+      "artifacts": []
+    }
+  ]
+}

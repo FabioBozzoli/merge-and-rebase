@@ -8,6 +8,32 @@ import torch
 from merge_and_rebase.io.peft_helpers import normalize_peft_visual_state_dict_keys
 
 
+def validate_prepared_merge(
+    prepared: Any,
+    *,
+    expected_base: Mapping[str, torch.Tensor],
+    method_name: str,
+) -> dict[str, int]:
+    """Validate the common prepared-merge payload before it enters a cache."""
+    if not isinstance(prepared, tuple) or len(prepared) != 2:
+        raise TypeError(f"Prepared merge output for '{method_name}' must be a (base, direction) tuple.")
+    prepared_base, direction = prepared
+    if not isinstance(prepared_base, dict) or not isinstance(direction, dict):
+        raise TypeError(f"Prepared merge output for '{method_name}' must contain two tensor dictionaries.")
+    if set(prepared_base) != set(expected_base):
+        raise ValueError(f"Prepared merge base keys for '{method_name}' do not match the requested base keyspace.")
+    for key, value in direction.items():
+        if key not in expected_base:
+            raise ValueError(f"Prepared merge direction for '{method_name}' contains unexpected key '{key}'.")
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != tuple(expected_base[key].shape):
+            raise ValueError(f"Prepared merge direction for '{method_name}' has incompatible tensor for key '{key}'.")
+    return {
+        "base_key_count": len(prepared_base),
+        "direction_key_count": len(direction),
+        "omitted_base_key_count": len(expected_base) - len(direction),
+    }
+
+
 def to_cpu_fp32(sd: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {k: v.detach().cpu().to(dtype=torch.float32) for k, v in sd.items()}
 

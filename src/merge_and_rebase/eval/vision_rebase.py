@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ from ..run_logging import default_summary_path, finish_with_error, merge_logging
 from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
+from .rebase_metrics import normalized_accuracy_ratio
 
 
 def _legacy_visual_key(key: str) -> str | None:
@@ -144,10 +146,7 @@ def _check_untransported_compatibility(
 
 
 def _norm_acc(result_acc: float, baseline_acc: float) -> float:
-    baseline_acc = float(baseline_acc)
-    if baseline_acc != baseline_acc or baseline_acc <= 0.0:
-        return float("nan")
-    return float(result_acc) / baseline_acc
+    return normalized_accuracy_ratio(result_acc, baseline_acc)
 
 
 def _average_defined(values: list[float]) -> float:
@@ -459,6 +458,7 @@ def main() -> None:
         per_task: list[dict[str, Any]] = []
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
+        transport_timings: dict[str, dict[str, float]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
 
@@ -756,6 +756,9 @@ def main() -> None:
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
+            if torch.cuda.is_available() and device != "cpu":
+                torch.cuda.reset_peak_memory_stats()
+            prepare_started = time.perf_counter()
 
             if method_name == "gradfix":
                 from ..eval.utils import build_grad_dataloader
@@ -840,6 +843,14 @@ def main() -> None:
             else:
                 prepared = transfusion_prepared
 
+            prepare_seconds = time.perf_counter() - prepare_started
+            if torch.cuda.is_available() and device != "cpu":
+                torch.cuda.synchronize()
+                peak_memory_bytes = float(torch.cuda.max_memory_allocated())
+            else:
+                peak_memory_bytes = 0.0
+
+            transport_started = time.perf_counter()
             transported_delta = method.transport(
                 source_base=task_source_base_sd,
                 target_base=target_base_sd,
@@ -848,6 +859,13 @@ def main() -> None:
                 prepared=prepared,
                 **method_params,
             )
+            if torch.cuda.is_available() and device != "cpu":
+                torch.cuda.synchronize()
+            transport_timings[task] = {
+                "prepare_seconds": prepare_seconds,
+                "transport_seconds": time.perf_counter() - transport_started,
+                "peak_memory_allocated_bytes": peak_memory_bytes,
+            }
             transported_deltas.append(transported_delta)
             original_deltas.append(task_delta)
             print(f"  {task}: transported delta computed for {len(transported_delta)} params")
@@ -1179,7 +1197,23 @@ def main() -> None:
             "alpha_selection": alpha_selection,
             "best_alpha": float(best_alpha),
             "baseline_label": baseline_label,
+            "metric_definitions": {
+                "absolute_accuracy": "top-1 accuracy in [0, 1]",
+                "baseline_accuracy": baseline_label,
+                "normalized_accuracy_ratio": "absolute_accuracy / baseline_accuracy",
+                "normalized_accuracy_ratio_display": "ratio; values above 1 indicate improvement over the baseline",
+            },
             "test_results": {
+                # Explicit names prevent a table exporter from treating a ratio as raw accuracy.
+                "per_task_baseline_accuracy": {
+                    item["task"]: float(baseline_test_accs[i]) for i, item in enumerate(per_task)
+                },
+                "per_task_absolute_accuracy": {
+                    item["task"]: float(rebase_test_accs[i]) for i, item in enumerate(per_task)
+                },
+                "per_task_normalized_accuracy_ratio": {
+                    item["task"]: float(norm_accs[i]) for i, item in enumerate(per_task)
+                },
                 "per_task_baseline": {item["task"]: float(baseline_test_accs[i]) for i, item in enumerate(per_task)},
                 "per_task_rebased": {item["task"]: float(rebase_test_accs[i]) for i, item in enumerate(per_task)},
                 "per_task_norm": {item["task"]: float(norm_accs[i]) for i, item in enumerate(per_task)},
@@ -1189,6 +1223,7 @@ def main() -> None:
             "selected_alpha_by_task": {item["task"]: float(selected_alpha_by_task[i]) for i, item in enumerate(per_task)},
             "block_extension_target_dataset_eval": block_extension_eval_rows,
             "transported_artifacts": transported_artifacts,
+            "transport_timings": transport_timings,
             "saved_merged_path": saved_merged_path,
         }
         run_logger.log_summary(final_summary)
