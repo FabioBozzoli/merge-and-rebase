@@ -57,7 +57,10 @@ from ..eval.utils import (
     load_vision_checkpoint_reference,
     materialize_peft_sd_from_adapter,
     maybe_patch_base_for_task_attn,
+    normalize_eval_split,
+    results_key_for_split,
     stable_method_params_cache_key,
+    split_results_payload,
     to_cpu_fp32,
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
@@ -245,6 +248,16 @@ def main() -> None:
         default="auto",
         help="Inference forward mode. 'auto' uses linearized_ntk when all tuned checkpoints explicitly saved forward_mode='linearized_ntk'.",
     )
+    p.add_argument(
+        "--fixed-eval-split",
+        type=str,
+        choices=["val", "test"],
+        default=None,
+        help=(
+            "When using a fixed alpha/method_params configuration, evaluate only this split and skip "
+            "the validation search loop."
+        ),
+    )
     add_logging_args(p)
 
     args = p.parse_args()
@@ -271,6 +284,7 @@ def main() -> None:
         "text_features_source": args.text_features_source,
         "zero_shot_only": args.zero_shot_only,
         "forward_mode": args.forward_mode,
+        "fixed_eval_split": args.fixed_eval_split,
     }
     cli_overrides = merge_non_none(cli_overrides, build_common_eval_overrides(args))
     cli_overrides = merge_non_none(
@@ -1068,13 +1082,101 @@ def main() -> None:
                     "method": method.name,
                     "postmerge": postmerge_result.metadata,
                     "peft_subspace": peft_subspace,
-                    "test_results": {
-                        "per_task_acc": {item["task"]: float(merged_accs[idx]) for idx, item in enumerate(per_task)},
-                        "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
-                        "avg_acc": float(sum(merged_accs) / len(merged_accs)),
-                        "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
-                    },
+                    "test_results": split_results_payload(
+                        per_task=per_task,
+                        accs=[float(v) for v in merged_accs],
+                        norm_accs=[float(v) for v in norm_accs],
+                    ),
                     "saved_merged_path": saved_merged_path,
+                }
+            )
+            run_logger.finish("success")
+        return
+
+    fixed_eval_split_raw = cfg.get("fixed_eval_split", None)
+    if fixed_eval_split_raw is not None:
+        if search_planner.is_multi_param():
+            raise ValueError(
+                "fixed_eval_split requires a fixed alpha and fixed method_params. "
+                "Disable alpha_search and remove hyperparam_search grids first."
+            )
+        fixed_eval_split = normalize_eval_split(fixed_eval_split_raw)
+        fixed_alpha = float(cfg.get("alpha", 1.0))
+        fixed_method_params = dict(method_params)
+        print(
+            f"\n=== Direct {fixed_eval_split} evaluation for fixed setting: "
+            f"alpha={fixed_alpha:.6g}, method_params={fixed_method_params} ==="
+        )
+        fixed_dense_prepared = _dense_prepared_for(fixed_method_params)
+        fixed_subspace_state = _subspace_state_for(fixed_method_params)
+        merged_sd = build_merged_state_for_alpha(
+            method=method,
+            prepared=(_prepared_for(fixed_method_params) if prepared is None else prepared),
+            base_sd_for_merge=fixed_subspace_state["base_sd_for_merge"],
+            tuned_sds_list=fixed_subspace_state["tuned_sds_list"],
+            weights=fixed_subspace_state["weights"],
+            method_params=fixed_method_params,
+            alpha=fixed_alpha,
+            peft_subspace=peft_subspace,
+            subspace=subspace,
+            subspace_prepared=fixed_subspace_state["subspace_prepared"],
+            peft_cfg=peft_cfg,
+            peft_state_by_task=peft_state_by_task,
+            tasks=tasks,
+            merge_base_sd=merge_base_sd,
+            dense_prepared=fixed_dense_prepared,
+            dense_base_sd_for_merge=dense_base_sd_for_merge,
+            dense_tuned_sds_list=dense_tuned_sds_list,
+        )
+        load_into_model(clf.model, merged_sd, strict=strict_load)
+        saved_merged_path = _save_merged_state_dict_if_requested(
+            merged_sd,
+            cfg.get("save_merged", None),
+            label="fixed-eval merged",
+        )
+        subspace_prepared = fixed_subspace_state["subspace_prepared"]
+        del merged_sd
+
+        merged_accs, norm_accs = eval_norm_accs_for_split(
+            clf=clf,
+            per_task=per_task,
+            device=device,
+            split=fixed_eval_split,
+            print_per_task=(fixed_eval_split == "val"),
+        )
+
+        pretty_print_task_accuracies(
+            suite_name,
+            method.name,
+            peft_subspace,
+            per_task,
+            merged_accs,
+            norm_accs,
+            single_accs=[item["single_acc"] for item in per_task],
+        )
+        print_latex_task_rows(per_task, merged_accs, norm_accs)
+        if run_logger is not None:
+            run_logger.log_summary(
+                {
+                    "mode": "fixed_eval_split",
+                    "fixed_eval_split": fixed_eval_split,
+                    "suite": suite_name,
+                    "tasks": tasks,
+                    "method": method.name,
+                    "peft_subspace": peft_subspace,
+                    "best_alpha": float(fixed_alpha),
+                    "best_method_params": fixed_method_params,
+                    results_key_for_split(fixed_eval_split): split_results_payload(
+                        per_task=per_task,
+                        accs=[float(v) for v in merged_accs],
+                        norm_accs=[float(v) for v in norm_accs],
+                    ),
+                    "saved_merged_path": saved_merged_path,
+                    "subspace_artifacts": (
+                        {"similarity_artifact_path": getattr(subspace_prepared, "similarity_artifact_path", None)}
+                        if subspace_prepared is not None
+                        else {}
+                    ),
                 }
             )
             run_logger.finish("success")
@@ -1280,12 +1382,11 @@ def main() -> None:
                 "best_alpha_per_task": {k: float(v) for k, v in best_alpha_per_task.items()},
                 "best_method_params_per_task": best_method_params_per_task,
                 "best_norm_per_task": {k: float(v) for k, v in best_norm_per_task.items()},
-                "test_results": {
-                    "per_task_acc": {item["task"]: float(merged_accs[idx]) for idx, item in enumerate(per_task)},
-                    "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
-                    "avg_acc": float(sum(merged_accs) / len(merged_accs)),
-                    "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
-                },
+                "test_results": split_results_payload(
+                    per_task=per_task,
+                    accs=[float(v) for v in merged_accs],
+                    norm_accs=[float(v) for v in norm_accs],
+                ),
                 "saved_merged_path": saved_merged_path,
                 "subspace_artifacts": (
                     {"similarity_artifact_path": getattr(subspace_prepared, "similarity_artifact_path", None)}

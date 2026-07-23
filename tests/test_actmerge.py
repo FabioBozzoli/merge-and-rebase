@@ -82,6 +82,28 @@ def test_actmerge_averages_non_linear_2d_parameters_by_default() -> None:
     assert torch.allclose(direction["positional_embedding"], expected)
 
 
+def test_actmerge_treats_projected_subspace_coordinates_as_matrices() -> None:
+    base = {"visual.transformer.resblocks.0.attn.q_proj": torch.zeros((2, 2), dtype=torch.float32)}
+    tuned = [
+        {"visual.transformer.resblocks.0.attn.q_proj": torch.tensor([[1.0, 0.0], [0.0, 0.0]])},
+        {"visual.transformer.resblocks.0.attn.q_proj": torch.tensor([[0.0, 0.0], [0.0, 2.0]])},
+    ]
+
+    _, default_direction = ActMerge().prepare(base=base, tuned=tuned, strict=True)
+    _, subspace_direction = ActMerge().prepare(
+        base=base,
+        tuned=tuned,
+        strict=True,
+        merge_context={"peft_subspace": "core"},
+    )
+
+    assert torch.allclose(default_direction["visual.transformer.resblocks.0.attn.q_proj"], torch.tensor([[0.5, 0.0], [0.0, 1.0]]))
+    assert not torch.allclose(
+        subspace_direction["visual.transformer.resblocks.0.attn.q_proj"],
+        default_direction["visual.transformer.resblocks.0.attn.q_proj"],
+    )
+
+
 def test_actmerge_functional_accepts_absolute_form() -> None:
     matrices = [
         torch.tensor([[2.0, 0.0], [0.0, 1.0]], dtype=torch.float32),

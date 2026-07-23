@@ -17,7 +17,7 @@ def cart_merge_impl(
 ) -> torch.Tensor:
     require_2d(matrices, "cart_merge")
 
-    pruning_rank = float(params.get("pruning_rank", 4))
+    pruning_rank = float(params.get("pruning_rank", 0.5))
     scaling_coeffs = float(params.get("scaling_coeffs", 0.5))
 
     theta_avg = torch.stack(matrices).mean(dim=0)
@@ -26,7 +26,15 @@ def cart_merge_impl(
     for i, matrix in enumerate(matrices):
         tau = matrix - theta_avg
         u, s, vh = torch.linalg.svd(tau.to(torch.float64), full_matrices=False)
-        rank_k = int(math.ceil(float(pruning_rank) * float(s.shape[0])))
+        if pruning_rank <= 0.0:
+            raise ValueError("cart_merge method_params['pruning_rank'] must be > 0.")
+        # Values in (0, 1] are retained-rank fractions. Larger values are
+        # absolute ranks, which matches the public configuration schema.
+        rank_k = (
+            int(math.ceil(pruning_rank * float(s.shape[0])))
+            if pruning_rank <= 1.0
+            else int(pruning_rank)
+        )
         rank_k = max(1, min(int(s.shape[0]), rank_k))
         recon = u[:, :rank_k] @ torch.diag(s[:rank_k]) @ vh[:rank_k, :]
         sum_term = sum_term + recon.to(dtype=theta_avg.dtype, device=theta_avg.device) * float(weights[i])

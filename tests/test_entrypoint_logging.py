@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib.machinery
 import sys
 from contextlib import nullcontext
@@ -305,6 +306,111 @@ def test_vision_merge_zero_shot_logs_summary(tmp_path: Path, monkeypatch):
 
     assert fake_logger.summaries
     assert fake_logger.summaries[-1]["mode"] == "zero_shot_only"
+
+
+def test_vision_merge_fixed_eval_split_skips_search_and_logs_test_summary(tmp_path: Path, monkeypatch):
+    fake_logger = _FakeLogger()
+    eval_splits: list[str] = []
+
+    class _DummyClassifier:
+        def __init__(self) -> None:
+            self.model = nn.Linear(1, 1)
+            self.preprocess = object()
+
+        def resolve_eval_text_features(self, **kwargs):
+            return None, "zero_shot"
+
+    suite = SimpleNamespace(tasks=("task_a",), resolver=lambda task: ("hf", None, {"test": "test"}))
+    cfg_path = tmp_path / "fixed_eval.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "suite": "mini",
+                "tasks": "all",
+                "method": "task_arithmetic",
+                "alpha": 0.4,
+                "alpha_search": False,
+                "fixed_eval_split": "test",
+                "single_acc_cache": str(tmp_path / "cache.json"),
+                "tuned_ckpts": {"task_a": str(tmp_path / "task_a.pt")},
+            }
+        )
+    )
+
+    monkeypatch.setattr(vision_merge, "SUITES", {"mini": suite})
+    monkeypatch.setattr(vision_merge, "start_run", lambda **kwargs: fake_logger)
+    monkeypatch.setattr(vision_merge.OpenClipClassifier, "build", staticmethod(lambda cfg: _DummyClassifier()))
+    monkeypatch.setattr(
+        vision_merge.OpenClipClassifier,
+        "extract_tuned_text_features_from_checkpoint",
+        staticmethod(lambda **kwargs: None),
+    )
+    monkeypatch.setattr(vision_merge, "load_hf_splits", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        vision_merge,
+        "build_vision_loaders",
+        lambda **kwargs: SimpleNamespace(classnames=["a", "b"], train=[], val=[], test=[]),
+    )
+    monkeypatch.setattr(vision_merge, "get_templates", lambda task: ["template"])
+    monkeypatch.setattr(
+        vision_merge,
+        "load_vision_checkpoint_reference",
+        lambda ckpt_ref: (
+            ckpt_ref,
+            {"state_dict": {"weight": torch.ones(1, 1), "bias": torch.zeros(1)}},
+        ),
+    )
+    monkeypatch.setattr(vision_merge, "normalize_peft_adapter_dir_checkpoint", lambda obj, checkpoint_path: obj)
+    monkeypatch.setattr(vision_merge, "is_peft_adapter_dir_ckpt", lambda obj: False)
+    monkeypatch.setattr(vision_merge, "is_peft_checkpoint", lambda obj: False)
+    monkeypatch.setattr(vision_merge, "load_ckpt", lambda path: {"weight": torch.ones(1, 1), "bias": torch.zeros(1)})
+    monkeypatch.setattr(vision_merge, "align_to_base_keys", lambda sd, base_sd: sd)
+    monkeypatch.setattr(
+        vision_merge,
+        "extract_checkpoint_attn_patch_info",
+        lambda **kwargs: SimpleNamespace(patched_attn=False, attn_patch_cfg=None, linearized_attn=False),
+    )
+    monkeypatch.setattr(vision_merge, "load_into_model", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(
+        vision_merge,
+        "get_forward_mode",
+        lambda name: SimpleNamespace(bind=lambda **kwargs: None),
+    )
+    monkeypatch.setattr(vision_merge, "eval_task_top1", lambda **kwargs: 0.8)
+    monkeypatch.setattr(
+        vision_merge,
+        "build_merged_state_for_alpha",
+        lambda **kwargs: {"weight": torch.ones(1, 1), "bias": torch.zeros(1)},
+    )
+
+    def _fake_eval_norm_accs_for_split(**kwargs):
+        eval_splits.append(str(kwargs["split"]))
+        return [0.75], [0.9]
+
+    monkeypatch.setattr(vision_merge, "eval_norm_accs_for_split", _fake_eval_norm_accs_for_split)
+    monkeypatch.setattr(vision_merge, "pretty_print_task_accuracies", lambda *args, **kwargs: None)
+    monkeypatch.setattr(vision_merge, "print_latex_task_rows", lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "vision_merge",
+            "--config",
+            str(cfg_path),
+            "--local-log-dir",
+            str(tmp_path),
+        ],
+    )
+
+    vision_merge.main()
+
+    assert eval_splits == ["test"]
+    assert fake_logger.finishes == ["success"]
+    assert fake_logger.summaries[-1]["mode"] == "fixed_eval_split"
+    assert fake_logger.summaries[-1]["best_alpha"] == 0.4
+    assert fake_logger.summaries[-1]["test_results"]["avg_acc"] == 0.75
+    assert not any(event["event_type"] == "alpha_eval_end" for event in fake_logger.events)
 
 
 def test_vision_merge_save_helper_writes_raw_state_dict(tmp_path: Path):

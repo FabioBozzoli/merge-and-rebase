@@ -69,6 +69,35 @@ def stable_method_params_cache_key(value: Any) -> str:
     return json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"))
 
 
+def normalize_eval_split(split: Any) -> str:
+    """Return a supported evaluation split name."""
+    resolved = str(split).strip().lower()
+    if resolved not in {"val", "test"}:
+        raise ValueError("fixed_eval_split must be one of: val, test")
+    return resolved
+
+
+def results_key_for_split(split: str) -> str:
+    """Return the summary field used for metrics from ``split``."""
+    resolved = normalize_eval_split(split)
+    return "test_results" if resolved == "test" else f"{resolved}_results"
+
+
+def split_results_payload(
+    *,
+    per_task: list[dict[str, Any]],
+    accs: list[float],
+    norm_accs: list[float],
+) -> dict[str, Any]:
+    """Build the standard per-split result payload for run summaries."""
+    return {
+        "per_task_acc": {item["task"]: float(accs[idx]) for idx, item in enumerate(per_task)},
+        "per_task_norm_acc": {item["task"]: float(norm_accs[idx]) for idx, item in enumerate(per_task)},
+        "avg_acc": float(sum(accs) / len(accs)),
+        "avg_norm_acc": float(sum(norm_accs) / len(norm_accs)),
+    }
+
+
 def build_cpu_cfg(cfg: OpenClipBuildConfig) -> OpenClipBuildConfig:
     return OpenClipBuildConfig(
         loader=cfg.loader,

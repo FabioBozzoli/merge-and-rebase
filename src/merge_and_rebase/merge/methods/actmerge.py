@@ -60,7 +60,14 @@ class ActMerge:
             raise ValueError("actmerge requires non-negative weights.")
 
         method_params = get_method_params(kwargs)
-        merge_all_2d = bool(method_params.get("merge_all_2d", False))
+        # Subspace projections are all 2D merge coordinates, but their keys
+        # are layer prefixes (for example ``...attn.q_proj``), not parameter
+        # names ending in ``.weight``.  Treat them as matrices by default.
+        # Explicit user input still takes precedence for dense/full merging.
+        merge_all_2d_raw = method_params.get("merge_all_2d", None)
+        merge_context = kwargs.get("merge_context", {})
+        is_subspace = isinstance(merge_context, dict) and str(merge_context.get("peft_subspace", "full")) != "full"
+        merge_all_2d = is_subspace if merge_all_2d_raw is None else bool(merge_all_2d_raw)
         fallback_merge = str(method_params.get("non_matrix_merge", "average")).strip().lower()
         if fallback_merge not in {"zero", "average"}:
             raise ValueError("actmerge method_params['non_matrix_merge'] must be 'zero' or 'average'.")

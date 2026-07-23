@@ -34,7 +34,7 @@ class CARTMerge:
 
         method_params = get_method_params(kwargs)
 
-        pruning_rank = int(method_params.get("pruning_rank", 4))
+        pruning_rank = float(method_params.get("pruning_rank", 0.5))
         scaling_coeffs = float(method_params.get("scaling_coeffs", 0.5))
 
         direction: TensorDict = {}
@@ -73,14 +73,23 @@ class CARTMerge:
 
     @staticmethod
     def _cart_delta(
-        mats: list[torch.Tensor], w: torch.Tensor, pruning_rank: int, scaling_coeffs: float
+        mats: list[torch.Tensor], w: torch.Tensor, pruning_rank: float, scaling_coeffs: float
     ) -> torch.Tensor:
         theta_avg = torch.stack(mats).mean(dim=0)
         sum = torch.zeros_like(theta_avg)
         for i in range(len(mats)):
             tau = mats[i] - theta_avg
             U, S, Vh = torch.linalg.svd(tau.to(torch.float64), full_matrices=False)
-            pruning_rank_k = math.ceil(pruning_rank * S.shape[0])
+            if pruning_rank <= 0.0:
+                raise ValueError("cart_merge method_params['pruning_rank'] must be > 0.")
+            # Values in (0, 1] are retained-rank fractions. Larger values are
+            # absolute ranks, which matches the public configuration schema.
+            pruning_rank_k = (
+                math.ceil(pruning_rank * S.shape[0])
+                if pruning_rank <= 1.0
+                else int(pruning_rank)
+            )
+            pruning_rank_k = min(S.shape[0], pruning_rank_k)
             sum += U[:, :pruning_rank_k] @ torch.diag(S[:pruning_rank_k]) @ Vh[:pruning_rank_k, :] * w[i]
         return theta_avg + scaling_coeffs * sum
 
