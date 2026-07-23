@@ -1,16 +1,105 @@
 {
-  "schema_version": 1,
-  "description": "Release manifest for merge-and-rebase benchmark artifacts. Entries become downloadable only after immutable public URLs and SHA-256 digests are recorded.",
-  "url_schemes": [
-    "https://...",
-    "hf-hub:anonymous-neurips-2199/benchmark-artifacts/path/to/file.pt"
-  ],
   "bundles": [
     {
+      "artifacts": [
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/CarsVal/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/CarsVal/nonlinear_finetuned.pt",
+          "sha256": "a2691941151ab31ea31ba85181e6baefbeeb96bf717acc016d2327158a766be8",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/CarsVal/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/DTDVal/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/DTDVal/nonlinear_finetuned.pt",
+          "sha256": "4efc7f792d73e6f4436a1a4e3abb70ceab55d24772963bab1e1d5d83ca17a1f6",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/DTDVal/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/EuroSATVal/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/EuroSATVal/nonlinear_finetuned.pt",
+          "sha256": "6a20baa557b56509e7e58c8442d77748ad41dd20d9fbf88ef97e08ad5cfc05d8",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/EuroSATVal/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/GTSRBVal/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/GTSRBVal/nonlinear_finetuned.pt",
+          "sha256": "5b0e0cf64146fbd5f9c726a97b97e62a29b35584c7b293a6a4692edb55d27596",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/GTSRBVal/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/MNISTVal/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/MNISTVal/nonlinear_finetuned.pt",
+          "sha256": "2783dedd6628fcb80dcc4ef7f19ac50c86b6b3c29ad3f39286e6595e8e771add",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/MNISTVal/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/RESISC45Val/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/RESISC45Val/nonlinear_finetuned.pt",
+          "sha256": "f00c8a8610de2e74518622ae1331a20a71345b575c880ce913a6ad0582a2143e",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/RESISC45Val/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/SUN397Val/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/SUN397Val/nonlinear_finetuned.pt",
+          "sha256": "e8abf16812310520b6a38ec5f52ee2fc2098084d2472c674578a1622ae2bc9b8",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/SUN397Val/nonlinear_finetuned.pt"
+        },
+        {
+          "metadata": {
+            "release_notes": "Mirror of the public TSV ViT-B/32 task-checkpoint distribution; see scripts/download_tsv_checkpoints.py for the independent upstream fallback. Use is subject to upstream checkpoint, base-model, and dataset terms.",
+            "source_path": "tsv/models/checkpoints/ViT-B-32/SVHNVal/nonlinear_finetuned.pt"
+          },
+          "name": "nonlinear_finetuned.pt",
+          "path": "tsv/models/checkpoints/ViT-B-32/SVHNVal/nonlinear_finetuned.pt",
+          "sha256": "243ded13ce6d7f3d709d765df214db83b6900ffcccba4abab2388aedaa6cbc7f",
+          "size_bytes": 453859269,
+          "url": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/SVHNVal/nonlinear_finetuned.pt"
+        }
+      ],
+      "description": "Minimal eight-checkpoint bundle required to reproduce the Vision8 Table 2 Task Arithmetic cell.",
       "name": "vision8-table2",
-      "status": "pending_release",
-      "description": "Minimal checkpoint and summary bundle required to reproduce one published vision8 Table 2 cell.",
-      "artifacts": []
+      "status": "released"
     }
+  ],
+  "description": "Release manifest for merge-and-rebase benchmark artifacts. Entries become downloadable only after immutable public URLs and SHA-256 digests are recorded.",
+  "schema_version": 1,
+  "url_schemes": [
+    "https://...",
+    "hf-hub:merge-and-rebase/vision8-checkpoints/path/to/file.pt"
   ]
 }

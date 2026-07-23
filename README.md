@@ -61,6 +61,16 @@ configuration:
 python scripts/fetch_artifacts.py --bundle vision8-table2 --destination src/checkpoints
 ```
 
+For the released Vision8 Task Arithmetic reproduction, use
+`configs/vision8_task_arithmetic_hf_release.json`; its checkpoint references
+download directly from the public model repository and do not require a local
+checkpoint path:
+
+```bash
+python -m merge_and_rebase.eval.vision_merge \
+  --config configs/vision8_task_arithmetic_hf_release.json
+```
+
 The downloader verifies SHA-256 hashes and refuses bundles that are not yet
 released. The camera-ready experiment sequence, including corrected rebase
 tables, seed replication, efficiency measurements, and HPO sensitivity, is in
@@ -80,7 +90,9 @@ python scripts/audit_rebase_summary.py path/to/rebase-summary.json
 Large checkpoint entries can use either an immutable HTTPS URL or the existing
 `hf-hub:org/repo/path/to/checkpoint.pt` syntax. The TSV reference checkpoints
 remain available through `scripts/download_tsv_checkpoints.py`; their source
-and license must be recorded separately in the artifact manifest.
+and license must be recorded separately in the artifact manifest. The released
+Vision8 bundle mirrors that public TSV distribution and records its provenance
+in each manifest entry.
 
 After uploading a neutral Hugging Face model repository, build the manifest
 entries from the exact local files and mark the bundle released only once every
@@ -89,10 +101,11 @@ URL is public:
 ```bash
 python scripts/build_artifact_manifest.py \
   --bundle vision8-table2 \
-  --root src/checkpoints \
-  --url-prefix hf-hub:anonymous-neurips-2199/benchmark-artifacts \
+  --root checkpoints \
+  --url-prefix hf-hub:merge-and-rebase/vision8-checkpoints \
+  --release-notes "Record provenance, license, model, task, and seed." \
   --release \
-  src/checkpoints/path/to/checkpoint.pt
+  checkpoints/path/to/checkpoint.pt
 ```
 
 ## Vision Fine-Tuning

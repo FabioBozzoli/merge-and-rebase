@@ -29,7 +29,13 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path("src/checkpoints"), help="Local artifact root.")
     parser.add_argument("--url-prefix", required=True, help="Immutable URL prefix, e.g. hf-hub:anonymous-neurips-2199/benchmark-artifacts")
     parser.add_argument("--release", action="store_true", help="Mark the bundle released after all URLs are public.")
+    parser.add_argument(
+        "--release-notes",
+        help="Required with --release; provenance, license, and compatibility note stored with every artifact.",
+    )
     args = parser.parse_args()
+    if args.release and not args.release_notes:
+        parser.error("--release-notes is required when --release is set.")
 
     manifest: dict[str, Any]
     if args.manifest.exists():
@@ -59,7 +65,8 @@ def main() -> None:
                 "size_bytes": path.stat().st_size,
                 "metadata": {
                     "source_path": relative.as_posix(),
-                    "release_notes": "Fill base_model, task, strategy, seed, and license before publication."
+                    "release_notes": args.release_notes
+                    or "Fill base_model, task, strategy, seed, and license before publication."
                 },
             }
         )
