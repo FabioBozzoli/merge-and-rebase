@@ -10,13 +10,13 @@
   "alpha": 0.3,
   "weights": null,
   "tuned_ckpts": {
-    "Cars": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/CarsVal/nonlinear_finetuned.pt",
-    "DTD": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/DTDVal/nonlinear_finetuned.pt",
-    "MNIST": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/MNISTVal/nonlinear_finetuned.pt",
-    "SVHN": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/SVHNVal/nonlinear_finetuned.pt",
-    "EuroSAT": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/EuroSATVal/nonlinear_finetuned.pt",
-    "GTSRB": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/GTSRBVal/nonlinear_finetuned.pt",
-    "RESISC45": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/RESISC45Val/nonlinear_finetuned.pt",
-    "SUN397": "hf-hub:merge-and-rebase/vision8-checkpoints/tsv/models/checkpoints/ViT-B-32/SUN397Val/nonlinear_finetuned.pt"
+    "Cars": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/Cars/full.pt",
+    "DTD": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/DTD/full.pt",
+    "MNIST": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/MNIST/full.pt",
+    "SVHN": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/SVHN/full.pt",
+    "EuroSAT": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/EuroSAT/full.pt",
+    "GTSRB": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/GTSRB/full.pt",
+    "RESISC45": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/RESISC45/full.pt",
+    "SUN397": "hf-hub:merge-and-rebase/vision8-checkpoints/finetune/ViT-B-32/openai/SUN397/full.pt"
   }
 }

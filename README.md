@@ -53,27 +53,46 @@ uv pip install -e ".[dev,data,test]"
 
 ## Reproducibility Artifacts
 
-Published checkpoint bundles are described by `artifacts/manifest.json`. Once a
-camera-ready bundle is released, download and verify it before running a paper
-configuration:
+Published checkpoint bundles are described by `artifacts/manifest.json`. The
+downloader verifies SHA-256 hashes and refuses bundles that are not yet
+released:
 
 ```bash
-python scripts/fetch_artifacts.py --bundle vision8-table2 --destination src/checkpoints
+python scripts/fetch_artifacts.py --bundle <bundle-name> --destination src/checkpoints
 ```
 
-For the released Vision8 Task Arithmetic reproduction, use
-`configs/vision8_task_arithmetic_hf_release.json`; its checkpoint references
-download directly from the public model repository and do not require a local
-checkpoint path:
+### TSV Vision8 checkpoints
+
+The submitted Vision8 Task Arithmetic configuration
+`configs/vision8_task_arithmetic.json` uses the public TSV checkpoint layout.
+Download it into the path expected by that configuration:
+
+```bash
+python scripts/download_tsv_checkpoints.py --out src/checkpoints/tsv
+```
+
+The script retries with a clean gdown cache and without cookies. If it still
+fails because Google Drive is throttled or requires browser consent, download
+the same public folder manually from
+<https://drive.google.com/drive/folders/1UEM1Thcz1c7dc1nji1i5uTN53Kf6G3-e>
+and preserve its `models/checkpoints/...` directory layout under
+`src/checkpoints/tsv`. Then run:
+
+```bash
+python -m merge_and_rebase.eval.vision_merge \
+  --config configs/vision8_task_arithmetic.json
+```
+
+The verified author fine-tuned checkpoint release can instead be fetched from
+the public model repository automatically:
 
 ```bash
 python -m merge_and_rebase.eval.vision_merge \
   --config configs/vision8_task_arithmetic_hf_release.json
 ```
 
-The downloader verifies SHA-256 hashes and refuses bundles that are not yet
-released. The camera-ready experiment sequence, including corrected rebase
-tables, seed replication, efficiency measurements, and HPO sensitivity, is in
+The camera-ready experiment sequence, including corrected rebase tables, seed
+replication, efficiency measurements, and HPO sensitivity, is in
 `experiments/camera_ready_plan.json` and can be listed with:
 
 ```bash
@@ -88,11 +107,7 @@ python scripts/audit_rebase_summary.py path/to/rebase-summary.json
 ```
 
 Large checkpoint entries can use either an immutable HTTPS URL or the existing
-`hf-hub:org/repo/path/to/checkpoint.pt` syntax. The TSV reference checkpoints
-remain available through `scripts/download_tsv_checkpoints.py`; their source
-and license must be recorded separately in the artifact manifest. The released
-Vision8 bundle mirrors that public TSV distribution and records its provenance
-in each manifest entry.
+`hf-hub:org/repo/path/to/checkpoint.pt` syntax.
 
 After uploading a neutral Hugging Face model repository, build the manifest
 entries from the exact local files and mark the bundle released only once every
