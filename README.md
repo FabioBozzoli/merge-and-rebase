@@ -82,6 +82,19 @@ Large checkpoint entries can use either an immutable HTTPS URL or the existing
 remain available through `scripts/download_tsv_checkpoints.py`; their source
 and license must be recorded separately in the artifact manifest.
 
+After uploading a neutral Hugging Face model repository, build the manifest
+entries from the exact local files and mark the bundle released only once every
+URL is public:
+
+```bash
+python scripts/build_artifact_manifest.py \
+  --bundle vision8-table2 \
+  --root src/checkpoints \
+  --url-prefix hf-hub:anonymous-neurips-2199/benchmark-artifacts \
+  --release \
+  src/checkpoints/path/to/checkpoint.pt
+```
+
 ## Vision Fine-Tuning
 
 Vision fine-tuning is driven by config files. The CLI is used to choose the config and optionally restrict datasets.
