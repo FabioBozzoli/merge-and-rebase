@@ -24,6 +24,7 @@ except ImportError:
     get_peft_model = None
     set_peft_model_state_dict = None
 
+from merge_and_rebase.eval.rebase_metrics import NORMALIZED_RATIO_TOL
 from merge_and_rebase.io.ckpt import load_ckpt, load_into_model, resolve_ckpt_path
 from merge_and_rebase.io.peft_helpers import (
     get_attn_patch_cfg,
@@ -575,6 +576,11 @@ def eval_norm_accs_for_split(
         )
         single_acc = float(item["single_acc"])
         norm = (acc / single_acc) if single_acc > 0 else 0.0
+        if norm > 1.0 + NORMALIZED_RATIO_TOL:
+            print(
+                f"WARNING: {task} normalized ratio {norm:.6f} > 1.0 (merged accuracy exceeds "
+                f"single-task baseline); report as a decimal ratio, not a percentage."
+            )
         merged_accs.append(acc)
         norm_accs.append(norm)
         if print_per_task:

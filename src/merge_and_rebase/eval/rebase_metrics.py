@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+NORMALIZED_RATIO_TOL: float = 1e-6
+
 
 def validate_accuracy(value: float, *, label: str) -> float:
     """Validate a raw top-1 accuracy before it is normalized or serialized."""
@@ -48,4 +50,9 @@ def audit_rebase_summary(payload: dict[str, Any]) -> list[str]:
         messages.append(
             f"{task}: absolute={absolute_acc:.6f}, baseline={baseline_acc:.6f}, ratio={ratio:.6f}"
         )
+        if math.isfinite(ratio) and ratio > 1.0 + NORMALIZED_RATIO_TOL:
+            messages.append(
+                f"{task}: WARNING normalized ratio {ratio:.6f} > 1.0 (transport exceeds "
+                "untransported baseline); report as a decimal ratio, not a percentage."
+            )
     return messages

@@ -1201,7 +1201,10 @@ def main() -> None:
                 "absolute_accuracy": "top-1 accuracy in [0, 1]",
                 "baseline_accuracy": baseline_label,
                 "normalized_accuracy_ratio": "absolute_accuracy / baseline_accuracy",
-                "normalized_accuracy_ratio_display": "ratio; values above 1 indicate improvement over the baseline",
+                "normalized_accuracy_ratio_display": (
+                    "ratio (decimal, not a percentage); values above 1.0 indicate the rebased/transported "
+                    "model exceeds the untransported baseline; report as a decimal ratio, never multiplied by 100"
+                ),
             },
             "test_results": {
                 # Explicit names prevent a table exporter from treating a ratio as raw accuracy.
