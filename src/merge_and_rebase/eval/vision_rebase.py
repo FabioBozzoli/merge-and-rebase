@@ -397,13 +397,8 @@ def main() -> None:
         source_depth = int(len(clf_source.model.visual.transformer.resblocks))
         target_depth = int(len(clf_target.model.visual.transformer.resblocks))
         run_block_extension_prestep = bool(
-            blockext_like_method and block_extension_enabled and source_depth < target_depth
+            blockext_like_method and block_extension_enabled and source_depth != target_depth
         )
-        if blockext_like_method and block_extension_enabled and source_depth > target_depth:
-            raise ValueError(
-                "Block extension preprocess only supports growing the smaller source network. "
-                f"Got source depth {source_depth} > target depth {target_depth}."
-            )
         if blockext_like_method:
             if run_block_extension_prestep:
                 print(

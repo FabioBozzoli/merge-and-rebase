@@ -10,7 +10,8 @@
     "num_batches": 5,
     "seq_align": "interpolate2d",
     "split_qkv": true,
-    "center_acts": false
+    "center_acts": false,
+    "device_transform": "cpu"
   },
   "block_extension_enabled": true,
   "block_extension_params": {
@@ -37,7 +38,8 @@
       "out_proj": 100,
       "c_proj": 100,
       "c_fc": 500
-    }
+    },
+    "lmc_mode": "independent"
   },
   "eval_before_rebase": true,
   "block_extension_eval_split": "test",

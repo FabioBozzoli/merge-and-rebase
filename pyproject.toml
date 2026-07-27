@@ -55,6 +55,10 @@ docs = [
   "mkdocstrings[python]>=0.28",
 ]
 
+harness = [
+  "lm-eval>=0.4.0",
+]
+
 [tool.uv]
 python-preference = "managed"
 

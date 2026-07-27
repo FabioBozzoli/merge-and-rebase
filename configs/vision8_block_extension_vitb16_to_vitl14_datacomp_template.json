@@ -19,7 +19,8 @@
     "eval_before_extension": true,
     "first_n_eval_batches": null,
     "verbose": false,
-    "show_progress": false
+    "show_progress": false,
+    "lmc_mode": "independent"
   },
   "eval_split": "test",
   "batch_size": 32,

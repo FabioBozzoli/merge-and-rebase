@@ -5,12 +5,13 @@
   "source_clip_pretrained": "datacomp_xl_s13b_b90k",
   "target_clip_model": "ViT-L-14",
   "target_clip_pretrained": "datacomp_xl_s13b_b90k",
-  "method": "theseus",
+  "method": "bico",
   "method_params": {
     "num_batches": 1,
     "seq_align": "interpolate2d",
     "split_qkv": true,
-    "center_acts": false
+    "center_acts": false,
+    "device_transform": "cpu"
   },
   "block_extension_enabled": true,
   "block_extension_params": {
@@ -25,7 +26,8 @@
     "skip_final_ln": false,
     "verbose": true,
     "show_progress": true,
-    "ridge_identity": 1000
+    "ridge_identity": 1000,
+    "lmc_mode": "independent"
   },
   "eval_before_rebase": true,
   "block_extension_eval_split": "test",
@@ -44,6 +46,6 @@
   "weights": null,
   "strict_load": false,
   "tuned_ckpts": {
-    "EuroSAT": "src/checkpoints/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt"
+    "EuroSAT": "src/checkpoints/theseus/models/checkpoints_by_task/eurosat/ViT-B-16/datacomp_xl_s13b_b90k/best.pt"
   }
 }

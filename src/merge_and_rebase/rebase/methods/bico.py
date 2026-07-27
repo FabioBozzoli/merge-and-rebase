@@ -21,8 +21,8 @@ _ZERO_KEYS = {"class_embedding", "positional_embedding", "conv1.weight"}
 class _BiCoHook:
     """Register forward hooks for input activations and backward hooks for output gradients."""
 
-    def __init__(self, model: torch.nn.Module):
-        self.model = _t._visual_module(model)
+    def __init__(self, model: torch.nn.Module, *, scope: torch.nn.Module | None = None):
+        self.model = scope if scope is not None else _t._visual_module(model)
         self.inputs: dict[str, torch.Tensor] = {}
         self.in_grads: dict[str, torch.Tensor] = {}
         self.out_grads: dict[str, torch.Tensor] = {}
@@ -113,6 +113,7 @@ def collect_bilinear_statistics(
     seed: int = 0,
     batch_size: int | None = None,
     store_grams: bool = False,
+    family_adapter: Any = None,
 ) -> dict[str, _t.ActivationStore]:
     """
     Collect input activation statistics and output-gradient statistics.
@@ -124,9 +125,16 @@ def collect_bilinear_statistics(
       {module_name}.in  -> ActivationStore (input activations)
       {module_name}.out -> ActivationStore (output gradients)
     """
+    if family_adapter is not None:
+        source_scope = family_adapter.transport_scope(source_model)
+        target_scope = family_adapter.transport_scope(target_model)
+    else:
+        source_scope = None
+        target_scope = None
+
     registry: dict[str, _t.ActivationStore] = {}
-    source_hook = _BiCoHook(source_model)
-    target_hook = _BiCoHook(target_model)
+    source_hook = _BiCoHook(source_model, scope=source_scope)
+    target_hook = _BiCoHook(target_model, scope=target_scope)
     dev = _t._resolve_device(device)
 
     cpu_device = torch.device("cpu")
@@ -219,6 +227,7 @@ def collect_gradin_statistics(
     seed: int = 0,
     batch_size: int | None = None,
     store_grams: bool = False,
+    family_adapter: Any = None,
 ) -> dict[str, _t.ActivationStore]:
     """
     Like collect_bilinear_statistics, but fills .in using input-side gradients
@@ -231,9 +240,16 @@ def collect_gradin_statistics(
       {module_name}.in  -> ActivationStore (input gradients, or forward activations)
       {module_name}.out -> ActivationStore (output gradients, dL/dy)
     """
+    if family_adapter is not None:
+        source_scope = family_adapter.transport_scope(source_model)
+        target_scope = family_adapter.transport_scope(target_model)
+    else:
+        source_scope = None
+        target_scope = None
+
     registry: dict[str, _t.ActivationStore] = {}
-    source_hook = _BiCoHook(source_model)
-    target_hook = _BiCoHook(target_model)
+    source_hook = _BiCoHook(source_model, scope=source_scope)
+    target_hook = _BiCoHook(target_model, scope=target_scope)
     dev = _t._resolve_device(device)
 
     cpu_device = torch.device("cpu")
@@ -360,14 +376,21 @@ class BiCoRebase:
         patch_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
+        family_adapter: Any = None,
         **kwargs,
     ) -> dict[str, Any]:
         split_qkv = kwargs.pop("split_qkv", None)
         if split_qkv is not None:
             patch_qkv = bool(split_qkv)
         transform_granularity = str(kwargs.pop("transform_granularity", "param")).strip().lower()
+        if transform_granularity not in {"param", "module_type", "block", "global"}:
+            raise ValueError("transform_granularity must be one of: param, module_type, block, global")
         if transform_granularity != "param":
             raise ValueError("BiCo transform_granularity support currently requires 'param'.")
+        device_transform = str(kwargs.pop("device_transform", "cpu")).strip().lower()
+        if device_transform not in {"cpu", "gpu"}:
+            raise ValueError("device_transform must be one of: cpu, gpu")
+        svd_device = device if device_transform == "gpu" else "cpu"
         del kwargs
 
         if n_batches is None:
@@ -384,7 +407,8 @@ class BiCoRebase:
             print(
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
-                f"whiten_power={whiten_power}, n_batches={n_batches}, seed={int(seed)})"
+                f"whiten_power={whiten_power}, n_batches={n_batches}, seed={int(seed)}, "
+                f"transform_granularity={transform_granularity}, device_transform={device_transform})"
             )
 
         patched_source = 0
@@ -427,6 +451,7 @@ class BiCoRebase:
                 seed=int(seed),
                 batch_size=batch_size,
                 store_grams=whiten_power > 0.0,
+                family_adapter=family_adapter,
             )
             if verbose:
                 print(f"{log_prefix} prepare: collected activation+gradient entries = {len(activation_registry)}")
@@ -435,19 +460,25 @@ class BiCoRebase:
                 if verbose:
                     print(f"{log_prefix} prepare: precomputing per-layer transforms")
 
-                visual_key_map = _t._visual_delta_keys(delta)
-                target_visual_base = _t._visual_state_dict(target_base)
-                visual_delta = {
-                    stripped_key: delta[original_key]
-                    for stripped_key, original_key in visual_key_map.items()
-                    if stripped_key in target_visual_base
-                }
+                if family_adapter is not None:
+                    tp_keys = family_adapter.transportable_keys(target_base)
+                    visual_key_map = {k: k for k in delta if k in tp_keys}
+                    target_visual_base = {k: target_base[k] for k in visual_key_map.values() if k in target_base}
+                    visual_delta = {k: delta[k] for k in visual_key_map if k in target_visual_base}
+                else:
+                    visual_key_map = _t._visual_delta_keys(delta)
+                    target_visual_base = _t._visual_state_dict(target_base)
+                    visual_delta = {
+                        stripped_key: delta[original_key]
+                        for stripped_key, original_key in visual_key_map.items()
+                        if stripped_key in target_visual_base
+                    }
 
-                if split_fused_qkv:
+                if split_fused_qkv and family_adapter is None:
                     target_visual_base = _t._split_fused_qkv_state(target_visual_base)
                     visual_delta = _t._split_fused_qkv_state(visual_delta)
 
-                transforms_by_key = _t._precompute_transforms(
+                transforms_by_key, _ = _t._precompute_transforms(
                     target_model=target_model,
                     target_visual_base=target_visual_base,
                     visual_delta=visual_delta,
@@ -455,8 +486,11 @@ class BiCoRebase:
                     center_acts=bool(center_acts),
                     whiten_power=whiten_power,
                     whiten_eps=whiten_eps,
+                    transform_granularity=transform_granularity,
                     show_progress=bool(show_progress),
                     method_name=self.name,
+                    svd_device=svd_device,
+                    family_adapter=family_adapter,
                 )
                 if verbose:
                     print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
@@ -489,6 +523,9 @@ class BiCoRebase:
             "unpatched_source_blocks": unpatched_source,
             "unpatched_target_blocks": unpatched_target,
             "whiten_power": whiten_power,
+            "transform_granularity": transform_granularity,
+            "device_transform": device_transform,
+            "compute_device": _t._resolve_device(device) if device_transform == "gpu" else torch.device("cpu"),
         }
 
     def apply(
@@ -500,6 +537,7 @@ class BiCoRebase:
         strict: bool = False,
         verbose: bool = True,
         show_progress: bool = True,
+        family_adapter: Any = None,
         **kwargs,
     ) -> TensorDict:
         del kwargs
@@ -512,32 +550,41 @@ class BiCoRebase:
         if transforms_by_key is None:
             raise ValueError("BiCo prepared payload is missing 'transforms_by_key'.")
 
-        visual_key_map = _t._visual_delta_keys(delta)
-        target_visual_base = _t._visual_state_dict(target_base)
-
-        visual_delta = {
-            stripped_key: delta[original_key]
-            for stripped_key, original_key in visual_key_map.items()
-            if stripped_key in target_visual_base
-        }
-
-        split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
-        if split_fused_qkv:
-            target_visual_base_work = _t._split_fused_qkv_state(target_visual_base)
-            visual_delta_work = _t._split_fused_qkv_state(visual_delta)
+        if family_adapter is not None:
+            tp_keys = family_adapter.transportable_keys(target_base)
+            visual_key_map = {k: k for k in delta if k in tp_keys}
+            target_visual_base_work = {k: target_base[k] for k in visual_key_map.values() if k in target_base}
+            visual_delta_work = {k: delta[k] for k in visual_key_map if k in target_visual_base_work}
+            split_fused_qkv = False
         else:
-            target_visual_base_work = target_visual_base
-            visual_delta_work = visual_delta
+            visual_key_map = _t._visual_delta_keys(delta)
+            target_visual_base = _t._visual_state_dict(target_base)
+
+            visual_delta = {
+                stripped_key: delta[original_key]
+                for stripped_key, original_key in visual_key_map.items()
+                if stripped_key in target_visual_base
+            }
+
+            split_fused_qkv = bool(prepared.get("split_fused_qkv", False))
+            if split_fused_qkv:
+                target_visual_base_work = _t._split_fused_qkv_state(target_visual_base)
+                visual_delta_work = _t._split_fused_qkv_state(visual_delta)
+            else:
+                target_visual_base_work = target_visual_base
+                visual_delta_work = visual_delta
 
         if strict and not visual_delta_work:
             raise ValueError("BiCo did not find any visual delta keys to transport.")
 
+        compute_device = prepared.get("compute_device", "cpu")
         aligned_visual = _t._apply_transforms_to_visual_delta(
             target_visual_base=target_visual_base_work,
             visual_delta=visual_delta_work,
             transforms_by_key=transforms_by_key,
             show_progress=bool(show_progress),
             method_name=self.name,
+            device=compute_device,
         )
 
         if split_fused_qkv:
@@ -599,6 +646,7 @@ class BiCoRebase:
         patch_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
+        family_adapter: Any = None,
         **kwargs,
     ) -> TensorDict:
         del source_base
@@ -636,6 +684,7 @@ class BiCoRebase:
                 patch_qkv=patch_qkv,
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
+                family_adapter=family_adapter,
                 **kwargs,
             )
         else:
@@ -650,6 +699,7 @@ class BiCoRebase:
             strict=bool(strict),
             verbose=bool(verbose),
             show_progress=bool(show_progress),
+            family_adapter=family_adapter,
         )
 
 

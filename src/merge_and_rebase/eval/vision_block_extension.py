@@ -229,7 +229,12 @@ def main() -> None:
     clf_source = OpenClipClassifier.build(source_cfg)
     source_base_sd = to_cpu_fp32({k: v for k, v in clf_source.model.state_dict().items()})
 
-    target_layers_total = _maybe_target_layers_total(cfg=cfg, source_cfg=source_cfg)
+    inferred_target_layers_total = _maybe_target_layers_total(cfg=cfg, source_cfg=source_cfg)
+    target_layers_total = (
+        inferred_target_layers_total
+        if inferred_target_layers_total is not None
+        else block_extension_cfg.target_layers_total
+    )
     print(f"Source model: {source_cfg.model_name} / {source_cfg.pretrained}")
     print(
         "Block extension config: "

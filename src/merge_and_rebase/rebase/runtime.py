@@ -29,7 +29,9 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
         whiten_power = float(method_params.get("whiten_power", 0.0))
         covariance_mode = str(method_params.get("covariance_mode", "activations"))
-        return f"theseus(batches={batches}, align={seq_align}, cov={covariance_mode}, whiten={whiten_power:g})"
+        dev_transform = str(method_params.get("device_transform", "cpu"))
+        dev_suffix = f", device={dev_transform}" if dev_transform != "cpu" else ""
+        return f"theseus(batches={batches}, align={seq_align}, cov={covariance_mode}, whiten={whiten_power:g}){dev_suffix}"
     if method_name == "theseus_reference":
         batches = int(method_params.get("num_batches", 1))
         token_strategy = str(method_params.get("token_strategy", "interpolate_2d"))
@@ -42,7 +44,9 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
     if method_name == "bico":
         batches = int(method_params.get("num_batches", 1))
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        return f"bico(batches={batches}, align={seq_align})"
+        dev_transform = str(method_params.get("device_transform", "cpu"))
+        dev_suffix = f", device={dev_transform}" if dev_transform != "cpu" else ""
+        return f"bico(batches={batches}, align={seq_align}){dev_suffix}"
     if method_name == "bico_gradin":
         batches = int(method_params.get("num_batches", 1))
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
