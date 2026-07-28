@@ -213,6 +213,7 @@ logs/
 *.ipynb
 .opencode
 results
+experiments/
 paper
 src/merge_and_rebase/rebase/permutations/cached_permutations/
 slurm_logs/

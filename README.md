@@ -91,14 +91,6 @@ python -m merge_and_rebase.eval.vision_merge \
   --config configs/vision8_task_arithmetic_hf_release.json
 ```
 
-The camera-ready experiment sequence, including corrected rebase tables, seed
-replication, efficiency measurements, and HPO sensitivity, is in
-`experiments/camera_ready_plan.json` and can be listed with:
-
-```bash
-python scripts/run_camera_ready_plan.py
-```
-
 Before generating rebase tables, validate the JSON summary so normalized ratios
 cannot be exported as raw accuracies:
 
