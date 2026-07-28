@@ -214,6 +214,7 @@ logs/
 .opencode
 results
 experiments/
+rebuttal/
 paper
 src/merge_and_rebase/rebase/permutations/cached_permutations/
 slurm_logs/
