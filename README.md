@@ -3,6 +3,8 @@
 ![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/pytorch-2.1%2B-EE4C2C?logo=pytorch&logoColor=white)
 ![OpenCLIP](https://img.shields.io/badge/backbone-OpenCLIP-1F6FEB)
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-222?logo=githubpages&logoColor=white)](https://apanariello4.github.io/merge-and-rebase/)
+[![Docs deployment](https://github.com/apanariello4/merge-and-rebase/actions/workflows/docs.yml/badge.svg)](https://apanariello4.github.io/merge-and-rebase/)
 
 `merge-and-rebase` is a research codebase for fine-tuning, model merging, task-vector transport, and evaluation across vision and text models.
 
