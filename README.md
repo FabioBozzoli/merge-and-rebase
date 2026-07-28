@@ -27,6 +27,7 @@ python -m merge_and_rebase.eval.vision_merge \
 
 ## Documentation
 
+- [Documentation site](https://apanariello4.github.io/merge-and-rebase/): rendered guides, tutorials, and API reference.
 - [Getting started](docs/getting-started.md): environments, repository layout, and common commands.
 - [Tutorials](docs/tutorials/reproduce-vision8.md): end-to-end runs with released and local checkpoints.
 - [Concepts](docs/concepts.md): task vectors, bases, preparation, metrics, and compatibility.

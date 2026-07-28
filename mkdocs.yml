@@ -1,6 +1,8 @@
 site_name: merge-and-rebase
 site_description: Fine-tuning, model merging, and task-vector transport.
+site_url: https://apanariello4.github.io/merge-and-rebase/
 repo_url: https://github.com/apanariello4/merge-and-rebase
+repo_name: apanariello4/merge-and-rebase
 theme:
   name: material
   language: en
