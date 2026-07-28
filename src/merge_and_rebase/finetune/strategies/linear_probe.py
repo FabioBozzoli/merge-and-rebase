@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from .base import build_optimizer
 from merge_and_rebase.finetune.schedulers import build_lr_scheduler
+
+from .base import build_optimizer
 from .registry import register
 
 

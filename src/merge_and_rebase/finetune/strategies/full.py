@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from merge_and_rebase.finetune.schedulers import build_lr_scheduler, cosine_lr
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from merge_and_rebase.finetune.schedulers import build_lr_scheduler
 from merge_and_rebase.models.parameter_subsets import resolve_parameter_subset
+
 from ._delta_parameterization import bind_delta_parameterization
 from .base import build_optimizer
 from .registry import register

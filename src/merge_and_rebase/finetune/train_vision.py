@@ -6,10 +6,10 @@ import json
 import math
 import random
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from collections.abc import Mapping
 
 import numpy as np
 import torch

@@ -132,7 +132,7 @@ def zero_shot_logits_from_features(
     if should_normalize:
         image_features = normalize_features(image_features)
     text_features = text_features.to(device=image_features.device, dtype=image_features.dtype)
-    return float(getattr(classifier, "logit_scale")) * (image_features @ text_features.t())
+    return float(classifier.logit_scale) * (image_features @ text_features.t())
 
 
 class OpenClipClassifier(nn.Module):

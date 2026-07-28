@@ -7,8 +7,6 @@ only WeightMatcher and its direct dependencies.
 from __future__ import annotations
 
 import sys
-from enum import auto
-from typing import Dict, Tuple, Union
 
 import numpy as np
 import torch
@@ -43,7 +41,7 @@ def alternate_layers(num_layers: int) -> list[int]:
 
 def get_layer_iteration_order(
     order: str, num_layers: int
-) -> Union[torch.Tensor, range, list]:
+) -> torch.Tensor | range | list:
     if order == LayerIterationOrder.RANDOM:
         return torch.randperm(num_layers)
     elif order == LayerIterationOrder.FORWARD:
@@ -77,7 +75,7 @@ def compute_weights_similarity(
 
 
 def solve_linear_assignment_problem(
-    sim_matrix: Union[torch.Tensor, np.ndarray],
+    sim_matrix: torch.Tensor | np.ndarray,
     return_matrix: bool = False,
     maximize: bool = True,
 ) -> torch.Tensor:
@@ -112,10 +110,10 @@ class WeightMatcher:
     def __init__(
         self,
         ps: PermutationSpec,
-        fixed: Dict[str, Tensor],
-        permutee: Dict[str, Tensor],
+        fixed: dict[str, Tensor],
+        permutee: dict[str, Tensor],
         max_iter: int = 100,
-        init_perm: Dict[str, Tensor] | None = None,
+        init_perm: dict[str, Tensor] | None = None,
         layer_iteration_order: str = LayerIterationOrder.FORWARD,
         p_trim: float | None = None,
         num_heads: int | None = None,
@@ -144,7 +142,7 @@ class WeightMatcher:
         self.perm_names = list(self.all_perm_indices.keys())
         self.num_layers = len(self.perm_names)
 
-    def _initialize_perm_indices(self) -> Dict[str, Tensor]:
+    def _initialize_perm_indices(self) -> dict[str, Tensor]:
         if self.init_perm is not None:
             return self.init_perm
         if self.num_heads is not None:
@@ -156,7 +154,7 @@ class WeightMatcher:
             }
         return {p: torch.arange(n) for p, n in self.perm_sizes.items()}
 
-    def _initialize_head_indices(self) -> Dict[str, Dict[str, Tensor]] | None:
+    def _initialize_head_indices(self) -> dict[str, dict[str, Tensor]] | None:
         if self.intra_head:
             return {
                 key: {
@@ -164,7 +162,7 @@ class WeightMatcher:
                     for idx in range(self.num_heads)
                 }
                 for key, n in zip(
-                    self.all_perm_indices.keys(), self.perm_sizes.values()
+                    self.all_perm_indices.keys(), self.perm_sizes.values(), strict=True
                 )
                 if "attn" in key
             }
@@ -172,7 +170,7 @@ class WeightMatcher:
 
     def _initialize_similarity_matrices(
         self, p: str, intra_head_phase: bool
-    ) -> Tuple[int, Union[Tensor, Dict[str, Tensor]]]:
+    ) -> tuple[int, Tensor | dict[str, Tensor]]:
         if "attn" in p and self.num_heads is not None:
             if intra_head_phase:
                 num_neurons = self.perm_sizes[p] // self.num_heads
@@ -218,7 +216,7 @@ class WeightMatcher:
         w_a: Tensor,
         w_b: Tensor,
         p: str,
-        sim_matrix: Dict[str, Tensor],
+        sim_matrix: dict[str, Tensor],
     ):
         for i in range(self.num_heads):
             sim_matrix[f"sim_matrix_{i}"] += w_a[i] @ w_b[
@@ -231,7 +229,7 @@ class WeightMatcher:
         w_b: Tensor,
         params_name: str,
         p: str,
-        sim_matrix: Union[Tensor, Dict[str, Tensor]],
+        sim_matrix: Tensor | dict[str, Tensor],
         intra_head_phase: bool,
     ):
         if "bias" in params_name:
@@ -259,7 +257,7 @@ class WeightMatcher:
     def _update_attention_perm_indices(
         self,
         p: str,
-        sim_matrix: Union[Tensor, Dict[str, Tensor]],
+        sim_matrix: Tensor | dict[str, Tensor],
         intra_head_phase: bool,
     ) -> bool:
         if not intra_head_phase:
@@ -302,13 +300,13 @@ class WeightMatcher:
 
     def run(
         self,
-    ) -> Tuple[
-        Dict[str, Tensor], Union[Dict[str, Dict[str, Tensor]], None]
+    ) -> tuple[
+        dict[str, Tensor], dict[str, dict[str, Tensor]] | None
     ]:
         """Run weight matching until convergence or max_iter."""
         intra_head_phase = False
         extra_head_progress = False
-        for iteration in tqdm(
+        for _iteration in tqdm(
             range(self.max_iter), desc="Weight matching", file=sys.stdout
         ):
             sys.stdout.flush()

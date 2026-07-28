@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -10,7 +9,8 @@ from merge_and_rebase.io.ckpt import align_to_base_keys, normalize_common_prefix
 from merge_and_rebase.io.peft_helpers import state_dict_looks_patched_attn
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 
-from ._vision_scaled_forward import (
+# Re-export the scaled-forward helpers for existing finetuning integrations.
+from ._vision_scaled_forward import (  # noqa: F401
     effective_parameter_map,
     parameter_maps_compatible,
     run_scaled_image_encoder,

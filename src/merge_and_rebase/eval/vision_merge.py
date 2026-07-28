@@ -59,16 +59,16 @@ from ..eval.utils import (
     maybe_patch_base_for_task_attn,
     normalize_eval_split,
     results_key_for_split,
-    stable_method_params_cache_key,
     split_results_payload,
+    stable_method_params_cache_key,
     to_cpu_fp32,
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
 from ..merge import subspaces as _subspaces  # noqa: F401
 from ..merge.base import PreparedMergeMethod
 from ..merge.methods._common import resolve_merge_weights
-from ..merge.runtime import validate_prepared_merge
 from ..merge.registry import get_method, list_methods  # methods are registered on import
+from ..merge.runtime import validate_prepared_merge
 from ..merge.subspaces.registry import get_subspace, list_subspaces
 from ..models.forward_modes import (
     get_forward_mode,

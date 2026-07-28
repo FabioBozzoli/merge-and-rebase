@@ -229,6 +229,7 @@ src/.cache/*
 src/.cache/imagenet21k/*
 !src/.cache/imagenet21k/imagenet21k_miil_tree.pth
 merge_and_rebase_ekfac_stats.txt
+docs/repo-overview-slides.html
 
 
 launch_scripts/

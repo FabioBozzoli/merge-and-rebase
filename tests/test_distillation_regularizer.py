@@ -436,7 +436,7 @@ def test_along_path_reuses_alpha_within_virtual_batch_and_resamples_next_step(mo
     )
     samples = iter([0.2, 0.7])
     monkeypatch.setattr(
-        "merge_and_rebase.finetune.regularizers.distillation.random.uniform",
+        "merge_and_rebase.finetune.regularizers._distill_runtime.random.uniform",
         lambda low, high: next(samples),
     )
 
@@ -1411,8 +1411,8 @@ def test_train_task_logs_teacher_accuracy_at_task_end(monkeypatch, tmp_path) -> 
     metrics = task_end_events[0]["metrics"]
     assert f"val/Cars/top1_teacher" in metrics
     assert f"test/Cars/top1_teacher" in metrics
-    assert metrics[f"val/Cars/top1_teacher"] == metrics[f"val/Cars/top1_teacher"]
-    assert metrics[f"test/Cars/top1_teacher"] == metrics[f"test/Cars/top1_teacher"]
+    assert 0.0 <= metrics[f"val/Cars/top1_teacher"] <= 1.0
+    assert 0.0 <= metrics[f"test/Cars/top1_teacher"] <= 1.0
 
 
 def test_train_task_logs_teacher_accuracy_at_task_end_for_composite(monkeypatch, tmp_path) -> None:
@@ -1495,8 +1495,8 @@ def test_train_task_logs_teacher_accuracy_at_task_end_for_composite(monkeypatch,
     task_end_events = [event for event in run_logger.events if event["event_type"] == "task_end"]
     assert task_end_events
     metrics = task_end_events[0]["metrics"]
-    assert metrics[f"val/Cars/top1_teacher"] == metrics[f"val/Cars/top1_teacher"]
-    assert metrics[f"test/Cars/top1_teacher"] == metrics[f"test/Cars/top1_teacher"]
+    assert 0.0 <= metrics[f"val/Cars/top1_teacher"] <= 1.0
+    assert 0.0 <= metrics[f"test/Cars/top1_teacher"] <= 1.0
 
 
 def test_train_task_logs_backward_losses_independently_from_log_every(monkeypatch, tmp_path) -> None:

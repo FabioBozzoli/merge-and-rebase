@@ -102,8 +102,11 @@ class LinearizedModule:
             raise ValueError("LinearizedModule.forward requires at least one tensor input to determine the device.")
 
         with forward_ad_safe_attention_context(first_tensor.device):
-            f0, f_jvp = jvp(_f, self.theta0, tangents)
-        out = f0 + f_jvp
+            if self.theta0:
+                f0, f_jvp = jvp(_f, self.theta0, tangents)
+                out = f0 + f_jvp
+            else:
+                out = _f()
         if pre_post_transform_callback is not None:
             pre_post_transform_callback(out)
         if post_transform is not None:

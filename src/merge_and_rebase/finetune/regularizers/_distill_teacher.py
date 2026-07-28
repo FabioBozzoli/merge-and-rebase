@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
 from merge_and_rebase.finetune._vision_runtime import (
@@ -23,11 +22,16 @@ from merge_and_rebase.finetune.reference_tasks import (
     apply_reference_tags_to_out_dir,
 )
 from merge_and_rebase.finetune.regularizers._distill_config import as_mapping, merge_build_cfg, teacher_train_cfg
-from merge_and_rebase.finetune.regularizers.base import CheckpointArtifact, OptimizerBundle, finalize_model_for_regularizer
+from merge_and_rebase.finetune.regularizers.base import (
+    CheckpointArtifact,
+    OptimizerBundle,
+    finalize_model_for_regularizer,
+)
 from merge_and_rebase.finetune.regularizers.registry import get_regularizer
 from merge_and_rebase.finetune.strategies.registry import get_strategy
 from merge_and_rebase.models.forward_modes import bind_training_forward_mode, normalize_forward_mode_params
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig
+
 
 def build_optimizer(params, *, optimizer_name: str, lr: float, weight_decay: float) -> optim.Optimizer:
     name = str(optimizer_name).strip().lower()

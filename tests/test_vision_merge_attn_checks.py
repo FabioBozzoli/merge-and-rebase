@@ -199,7 +199,10 @@ def test_checkpoint_payload_loads_forward_mode_params(tmp_path) -> None:
 
     payload = _load_checkpoint_payload(str(path))
     assert payload.forward_mode == "linearized_ntk"
-    assert payload.forward_mode_params == {"linearized_feature_normalization": False}
+    assert payload.forward_mode_params == {
+        "linearized_feature_normalization": False,
+        "linearized_logit_normalization": True,
+    }
 
 
 def test_resolve_zero_shot_only_defaults_true_without_tuned_ckpts() -> None:

@@ -7,7 +7,6 @@ the functions needed for the transport workflow.
 from __future__ import annotations
 
 import copy
-from typing import Dict, Union
 
 import torch
 
@@ -58,10 +57,10 @@ def perm_tensor_by_perm_matrix(
 def get_permuted_param(
     param: torch.Tensor,
     perms_to_apply,
-    perm_matrices: Dict[str, torch.Tensor],
+    perm_matrices: dict[str, torch.Tensor],
     except_axis=None,
     num_heads: int = 12,
-    all_heads_indices: Dict[str, Dict[str, torch.Tensor]] | None = None,
+    all_heads_indices: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     """Apply all relevant permutations to a parameter tensor."""
     for axis, perm_id in enumerate(perms_to_apply):
@@ -156,15 +155,15 @@ def get_permuted_param(
 
 def apply_permutation_to_statedict(
     ps: PermutationSpec,
-    perm_matrices: Dict[str, torch.Tensor],
-    model_a_dict: Dict[str, torch.Tensor],
-    model_b_dict: Dict[str, torch.Tensor] | None = None,
-    heads_permutation: Dict[str, Dict[str, torch.Tensor]] | None = None,
+    perm_matrices: dict[str, torch.Tensor],
+    model_a_dict: dict[str, torch.Tensor],
+    model_b_dict: dict[str, torch.Tensor] | None = None,
+    heads_permutation: dict[str, dict[str, torch.Tensor]] | None = None,
     skip_params: bool = False,
     num_heads: int = 12,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Apply a set of permutations to a model's state_dict according to a PermutationSpec."""
-    permuted_params: Dict[str, torch.Tensor] = {}
+    permuted_params: dict[str, torch.Tensor] = {}
 
     for param_name, param in model_a_dict.items():
         param_name_in_perm_dict = param_name

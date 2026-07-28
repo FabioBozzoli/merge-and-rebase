@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import random
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -55,9 +52,9 @@ from merge_and_rebase.finetune.regularizers._distill_teacher import (
 from merge_and_rebase.finetune.regularizers._distill_teacher import (
     prepare_teacher_runtime as _prepare_teacher_runtime,
 )
-from merge_and_rebase.finetune.schedulers import build_lr_scheduler
 from merge_and_rebase.finetune.regularizers.base import BatchOverride, OptimizerBundle
 from merge_and_rebase.finetune.regularizers.registry import register
+from merge_and_rebase.finetune.schedulers import build_lr_scheduler
 from merge_and_rebase.finetune.strategies.registry import get_strategy
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig
 

@@ -9,11 +9,14 @@ import torch.nn as nn
 import torch.optim as optim
 from peft import LoraConfig, get_peft_model
 
-from merge_and_rebase.finetune.strategies.base import build_optimizer
 from merge_and_rebase.finetune.schedulers import build_lr_scheduler
+from merge_and_rebase.finetune.strategies.base import build_optimizer
 from merge_and_rebase.models.parameter_subsets import resolve_visual_parameter_plan
 from merge_and_rebase.models.patch_openclip_attention import LoRAableLinearMHA, LoRAableMHA, split_openclip_vit_attn
-from merge_and_rebase.models.patch_openclip_projection import has_lora_compatible_proj_surface, patch_openclip_visual_proj
+from merge_and_rebase.models.patch_openclip_projection import (
+    has_lora_compatible_proj_surface,
+    patch_openclip_visual_proj,
+)
 
 from ._delta_parameterization import bind_delta_parameterization
 from .registry import register

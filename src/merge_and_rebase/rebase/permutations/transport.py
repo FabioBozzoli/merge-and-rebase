@@ -6,8 +6,6 @@ for the permutation sanity check.
 """
 from __future__ import annotations
 
-from typing import Any, Dict
-
 import torch
 
 from .spec import CLIP_Visual_PermutationSpecBuilder
@@ -16,17 +14,17 @@ from .utils import apply_permutation_to_statedict
 
 def apply_visual_permutation_to_state(
     *,
-    state: Dict[str, torch.Tensor],
-    perm_indices: Dict[str, torch.Tensor],
-    heads_indices: Dict[str, Dict[str, torch.Tensor]] | None,
+    state: dict[str, torch.Tensor],
+    perm_indices: dict[str, torch.Tensor],
+    heads_indices: dict[str, dict[str, torch.Tensor]] | None,
     prefix: str,
     depth: int,
     num_heads: int,
     split_qkv: bool = True,
     spec_variant: str | None = None,
-    reference: Dict[str, torch.Tensor] | None = None,
+    reference: dict[str, torch.Tensor] | None = None,
     device: str = "cuda",
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """
     Apply pre-computed permutations to a visual state dict.
 

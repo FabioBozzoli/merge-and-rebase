@@ -16,9 +16,15 @@ from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig
 from merge_and_rebase.models.patch_openclip_attention import split_openclip_vit_attn
 from merge_and_rebase.utils.peft_materialization import (
     is_lora_parameter_name as _shared_is_lora_parameter_name,
-    materialized_peft_param_map as _shared_materialized_peft_param_map,
+)
+from merge_and_rebase.utils.peft_materialization import (
     is_peft_linear_module as _shared_is_peft_linear_module,
+)
+from merge_and_rebase.utils.peft_materialization import (
     materialize_peft_lora_weight as _shared_materialize_peft_lora_weight,
+)
+from merge_and_rebase.utils.peft_materialization import (
+    materialized_peft_param_map as _shared_materialized_peft_param_map,
 )
 
 from ._vision_collection import build_vision_regularizer_task_context
@@ -418,8 +424,8 @@ def ensure_openclip_kfac_surface(
         delta_learn_w0=bool(cfg["delta_learn_w0"]),
         delta_w0_rank=int(cfg["delta_w0_rank"]),
     )
-    setattr(model_or_visual, "peft_patched_attn", True)
-    setattr(model_or_visual, "peft_attn_patch_cfg", cfg)
+    model_or_visual.peft_patched_attn = True
+    model_or_visual.peft_attn_patch_cfg = cfg
     return {"attn_patch_cfg": cfg, "patched_blocks": int(patched)}
 
 
@@ -473,7 +479,7 @@ def select_tracked_parameters(model_or_visual: nn.Module) -> TrackedCurvaturePla
         if _is_peft_linear_module(module):
             if not _is_matrix_module_name(normalized_module_name):
                 continue
-            base_layer = getattr(module, "base_layer")
+            base_layer = module.base_layer
             weight = getattr(base_layer, "weight", None)
             bias = getattr(base_layer, "bias", None)
         elif isinstance(module, (nn.Linear, nn.modules.linear.NonDynamicallyQuantizableLinear)):
@@ -927,13 +933,13 @@ def collect_curvature(
                 proj_block = next((b for b in plan.matrix_blocks.values() if b.is_projection and b.module_name is None), None)
                 if proj_block is not None:
 
-                    def proj_grad_hook(grad, *, key=proj_block.key):
+                    def proj_grad_hook(grad, *, key=proj_block.key, batch_size=current_batch_size):
                         with torch.no_grad():
                             hook_input = grad.detach().to(dtype=dtype)
                             rows, denom = _flatten_sequence(
                                 hook_input,
                                 "non_sequence",
-                                current_batch_size=current_batch_size,
+                                current_batch_size=batch_size,
                                 target=key,
                             )
                             _kahan_add(ggT_accs, key, _matrix_gram_from_rows(rows, normalize_by=denom))

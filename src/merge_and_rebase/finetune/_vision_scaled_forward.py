@@ -91,9 +91,9 @@ def _stash_last_features(
     model._last_image_features = image_features
     model._last_logits = logits
     classifier = model.clip_model
-    setattr(classifier, "_last_visual_features", visual_features)
-    setattr(classifier, "_last_image_features", image_features)
-    setattr(classifier, "_last_logits", logits)
+    classifier._last_visual_features = visual_features
+    classifier._last_image_features = image_features
+    classifier._last_logits = logits
 
 
 def run_scaled_image_encoder(

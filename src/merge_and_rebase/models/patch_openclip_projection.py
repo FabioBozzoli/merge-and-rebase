@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from types import MethodType
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -68,7 +67,7 @@ def patch_openclip_visual_proj(visual: nn.Module) -> int:
         raise RuntimeError("Could not patch visual.proj: unsupported visual forward surface.")
 
     visual.forward = MethodType(_forward_with_linear_proj, visual)  # type: ignore[method-assign]
-    setattr(visual, "_peft_patched_proj", True)
+    visual._peft_patched_proj = True
     return 1
 
 

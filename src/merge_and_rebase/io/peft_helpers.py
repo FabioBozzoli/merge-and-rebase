@@ -29,7 +29,7 @@ _FUSED_ATTN_MARKERS = (
     ".attn.in_proj_bias",
 )
 _ADAPTER_REF_SUFFIXES = (".pt", ".bin", ".safetensors", ".ckpt", ".pth")
-_HF_ADAPTER_DIR_CACHE: dict[str, str] = {}
+_HF_ADAPTER_DIR_CACHE: dict[str, Path] = {}
 _PATCHED_ATTN_TARGET_MODULES = frozenset({"q_proj", "k_proj", "v_proj", "out_proj"})
 
 
@@ -44,73 +44,8 @@ def is_peft_adapter_reference(ref: str) -> bool:
     return "/" in ref and not ref.endswith(_ADAPTER_REF_SUFFIXES)
 
 
-def resolve_peft_adapter_dir(ref: str) -> str:
-    path = Path(ref)
-    if path.exists():
-        if path.is_dir() and (path / "adapter_config.json").exists():
-            return str(path)
-        raise ValueError(f"PEFT adapter reference is not an adapter directory: {ref}")
-
-    if not is_peft_adapter_reference(ref):
-        raise ValueError(f"Not a PEFT adapter reference: {ref}")
-
-    if ref not in _HF_ADAPTER_DIR_CACHE:
-        try:
-            from huggingface_hub import snapshot_download
-        except Exception as exc:
-            raise ImportError("Resolving Hugging Face PEFT adapters requires `huggingface_hub`.") from exc
-
-        _HF_ADAPTER_DIR_CACHE[ref] = snapshot_download(
-            repo_id=ref,
-            repo_type="model",
-            allow_patterns=(
-                "adapter_config.json",
-                "adapter_model.safetensors",
-                "adapter_model.bin",
-                "merge_and_rebase_meta.json",
-            ),
-        )
-    return _HF_ADAPTER_DIR_CACHE[ref]
-
-
-def is_peft_adapter_reference(ref: str) -> bool:
-    path = Path(ref)
-    if path.exists():
-        return path.is_dir() and (path / "adapter_config.json").exists()
-    return "/" in ref and not ref.endswith(_ADAPTER_REF_SUFFIXES)
-
-
-def resolve_peft_adapter_dir(ref: str) -> str:
-    path = Path(ref)
-    if path.exists():
-        if path.is_dir() and (path / "adapter_config.json").exists():
-            return str(path)
-        raise ValueError(f"PEFT adapter reference is not an adapter directory: {ref}")
-
-    if not is_peft_adapter_reference(ref):
-        raise ValueError(f"Not a PEFT adapter reference: {ref}")
-
-    if ref not in _HF_ADAPTER_DIR_CACHE:
-        try:
-            from huggingface_hub import snapshot_download
-        except Exception as exc:
-            raise ImportError("Resolving Hugging Face PEFT adapters requires `huggingface_hub`.") from exc
-
-        _HF_ADAPTER_DIR_CACHE[ref] = snapshot_download(
-            repo_id=ref,
-            repo_type="model",
-            allow_patterns=(
-                "adapter_config.json",
-                "adapter_model.safetensors",
-                "adapter_model.bin",
-                "merge_and_rebase_meta.json",
-            ),
-        )
-    return _HF_ADAPTER_DIR_CACHE[ref]
-
-
-
-def resolve_peft_adapter_dir(adapter_dir: str, *, checkpoint_path: str | None = None) -> Path:
+def resolve_peft_adapter_dir(ref: str, *, checkpoint_path: str | None = None) -> Path:
+    """Resolve a local PEFT adapter directory or download a Hugging Face repo."""
     candidates: list[Path] = []
     seen: set[str] = set()
 
@@ -120,14 +55,37 @@ def resolve_peft_adapter_dir(adapter_dir: str, *, checkpoint_path: str | None = 
             seen.add(key)
             candidates.append(path)
 
-    _add_candidate(Path(adapter_dir))
+    _add_candidate(Path(ref))
     if checkpoint_path is not None:
         ckpt_path = Path(checkpoint_path)
         _add_candidate(ckpt_path.with_name(f"{ckpt_path.stem}_adapter"))
 
     for candidate in candidates:
         if candidate.exists():
-            return candidate
+            if candidate.is_dir() and (candidate / "adapter_config.json").exists():
+                return candidate
+            raise ValueError(f"PEFT adapter reference is not an adapter directory: {candidate}")
+
+    if is_peft_adapter_reference(ref):
+        if ref not in _HF_ADAPTER_DIR_CACHE:
+            try:
+                from huggingface_hub import snapshot_download
+            except Exception as exc:
+                raise ImportError("Resolving Hugging Face PEFT adapters requires `huggingface_hub`.") from exc
+
+            _HF_ADAPTER_DIR_CACHE[ref] = Path(
+                snapshot_download(
+                    repo_id=ref,
+                    repo_type="model",
+                    allow_patterns=(
+                        "adapter_config.json",
+                        "adapter_model.safetensors",
+                        "adapter_model.bin",
+                        "merge_and_rebase_meta.json",
+                    ),
+                )
+            )
+        return _HF_ADAPTER_DIR_CACHE[ref]
 
     tried = ", ".join(str(candidate) for candidate in candidates)
     raise FileNotFoundError(f"PEFT adapter_dir not found. Tried: {tried}")

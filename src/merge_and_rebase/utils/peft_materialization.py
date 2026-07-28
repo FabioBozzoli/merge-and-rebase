@@ -11,14 +11,14 @@ def is_lora_parameter_name(name: str) -> bool:
 
 
 def is_peft_linear_module(module: nn.Module) -> bool:
-    return hasattr(module, "base_layer") and isinstance(getattr(module, "base_layer"), nn.Linear)
+    return hasattr(module, "base_layer") and isinstance(module.base_layer, nn.Linear)
 
 
 def materialize_peft_lora_weight(module: nn.Module) -> torch.Tensor:
     if not is_peft_linear_module(module):
         raise TypeError("Expected a PEFT LoRA-wrapped linear module.")
 
-    base_layer = getattr(module, "base_layer")
+    base_layer = module.base_layer
     weight = base_layer.weight
     delta = torch.zeros_like(weight)
     lora_a = getattr(module, "lora_A", {})
@@ -74,7 +74,7 @@ def materialize_peft_lora_weight_from_param_map(
     if not is_peft_linear_module(module):
         raise TypeError("Expected a PEFT LoRA-wrapped linear module.")
 
-    base_layer = getattr(module, "base_layer")
+    base_layer = module.base_layer
     prefix = f"{module_name}." if module_name else ""
     weight_name = f"{prefix}base_layer.weight"
     weight = _param_from_map_or_module(

@@ -182,9 +182,9 @@ def _project_linearized_features(
 
 def _stash_last_features(*, target: Any, classifier: OpenClipClassifier, visual_features: torch.Tensor, image_features: torch.Tensor, logits: torch.Tensor) -> None:
     for obj in {id(target): target, id(classifier): classifier}.values():
-        setattr(obj, "_last_visual_features", visual_features)
-        setattr(obj, "_last_image_features", image_features)
-        setattr(obj, "_last_logits", logits)
+        obj._last_visual_features = visual_features
+        obj._last_image_features = image_features
+        obj._last_logits = logits
 
 
 def _bind_linearized_classifier_forward(

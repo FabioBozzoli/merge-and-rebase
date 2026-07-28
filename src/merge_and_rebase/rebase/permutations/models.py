@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 import types
-from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -17,10 +16,8 @@ import torch.nn.functional as F
 
 try:
     import open_clip
-except ImportError:
-    raise ImportError(
-        "open_clip support requires: pip install open_clip_torch"
-    )
+except ImportError as exc:
+    raise ImportError("open_clip support requires: pip install open_clip_torch") from exc
 
 
 # ── Shortcut layer ────────────────────────────────────────────────────

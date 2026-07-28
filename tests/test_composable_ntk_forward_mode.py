@@ -206,6 +206,20 @@ def test_linearized_module_supports_current_params_and_post_transform() -> None:
     assert torch.allclose(out, expected)
 
 
+def test_linearized_module_without_trainable_params_uses_reference() -> None:
+    ref = _KwargLinear()
+    current = _KwargLinear()
+    linearized = LinearizedModule.from_module(ref, copy_module=True, param_names=[])
+
+    with torch.no_grad():
+        current.a.add_(10.0)
+
+    x = torch.tensor([[1.0, 2.0]])
+    out = linearized.forward(current_module=current, args=(x,))
+
+    assert torch.allclose(out, ref(x))
+
+
 def test_apply_training_forward_mode_linearizes_only_trainable_text_params() -> None:
     model = _TinyTextModel()
     model.score.bias.requires_grad = False
