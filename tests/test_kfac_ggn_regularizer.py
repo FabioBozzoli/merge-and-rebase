@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,12 +15,12 @@ from merge_and_rebase.finetune.regularizers.kfac_ggn import (
     KfacGgnConfig,
     KfacGgnRegularizer,
     TaskCurvatureStats,
+    _base_snapshot,
     _cls_only_from_sequence,
+    _delta_params,
     _flatten_sequence,
     _matrix_gram_from_rows,
     _sum_over_sequence_axis,
-    _base_snapshot,
-    _delta_params,
     _visual_param_map,
     collect_curvature,
     ensure_openclip_kfac_surface,
@@ -32,7 +33,11 @@ from merge_and_rebase.finetune.regularizers.kfac_ggn import (
 from merge_and_rebase.finetune.regularizers.registry import list_regularizers
 from merge_and_rebase.finetune.strategies.peft_lora import PeftLoraVision
 from merge_and_rebase.finetune.train_vision import ImageEncoder
-from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier, zero_shot_logits_from_features
+from merge_and_rebase.models.openclip_classifier import (
+    OpenClipBuildConfig,
+    OpenClipClassifier,
+    zero_shot_logits_from_features,
+)
 
 
 def _dummy_transform(x):
@@ -161,7 +166,7 @@ def _copy_batch_first_to_mammoth(source: _ToyBatchFirstVisual, target: _ToyMammo
         target.ln_post.weight.copy_(source.ln_post.weight)
         target.ln_post.bias.copy_(source.ln_post.bias)
         target.lin_proj.weight.copy_(source.proj.T)
-        for src_block, tgt_block in zip(source.transformer.resblocks, target.transformer.resblocks):
+        for src_block, tgt_block in zip(source.transformer.resblocks, target.transformer.resblocks, strict=True):
             tgt_block.ln_1.load_state_dict(src_block.ln_1.state_dict())
             tgt_block.ln_2.load_state_dict(src_block.ln_2.state_dict())
             tgt_block.mlp.load_state_dict(src_block.mlp.state_dict())
@@ -217,7 +222,9 @@ class _DummyStrategy:
         del weight_decay, warmup_length, steps, device, kwargs
         params = [p for p in model.parameters() if p.requires_grad]
         opt = optim.Adam(params, lr=lr)
-        scheduler = lambda step: None
+        def scheduler(_step):
+            return None
+
         return opt, scheduler, {"trainable_params": sum(p.numel() for p in params)}
 
 
@@ -779,7 +786,7 @@ def test_kfac_regularizer_zero_at_base_and_positive_after_supported_update() -> 
     regularizer = KfacGgnRegularizer()
     train_loader = torch.utils.data.DataLoader([(torch.randn(4), torch.tensor(0)) for _ in range(4)], batch_size=2)
     loaders = SimpleNamespace(train=train_loader)
-    surface = ensure_openclip_kfac_surface(model)
+    ensure_openclip_kfac_surface(model)
     plan = select_tracked_parameters(model)
     aaT, ggT, ffT = _build_identity_curvature(plan)
     with TemporaryDirectory() as tmpdir:

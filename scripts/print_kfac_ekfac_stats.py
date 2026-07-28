@@ -5,12 +5,11 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, DefaultDict, List, Tuple
+from typing import Any
 
 import torch
 
-
-Stats = Tuple[float, float, float, float, float]
+Stats = tuple[float, float, float, float, float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +36,7 @@ def load_payload(path: Path) -> Mapping[str, Any]:
     return payload
 
 
-def iter_tensors(payload: Mapping[str, Any], prefix: str = "") -> List[Tuple[str, torch.Tensor]]:
+def iter_tensors(payload: Mapping[str, Any], prefix: str = "") -> list[tuple[str, torch.Tensor]]:
     out = []  # type: List[Tuple[str, torch.Tensor]]
     for key, value in payload.items():
         name = f"{prefix}.{key}" if prefix else str(key)
@@ -108,7 +107,7 @@ def normalize_tensor_for_reporting(
 def same_stats(lhs: Stats, rhs: Stats, *, rel_tol: float = 1e-12, abs_tol: float = 1e-12) -> bool:
     return all(
         (math.isnan(a) and math.isnan(b)) or math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
-        for a, b in zip(lhs, rhs)
+        for a, b in zip(lhs, rhs, strict=True)
     )
 
 
@@ -138,7 +137,7 @@ def collect_entries(
     path: Path,
     *,
     normalize_results: bool = False,
-) -> List[Tuple[str, str, Stats, str]]:
+) -> list[tuple[str, str, Stats, str]]:
     payload = load_payload(path)
     payload_kind = detect_payload_kind(payload)
     entries = []

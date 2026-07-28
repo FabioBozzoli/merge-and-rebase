@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import importlib.machinery
+import json
 import sys
 from contextlib import nullcontext
 from pathlib import Path

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
-from torch.func import functional_call
 
 from merge_and_rebase.finetune import train_text, train_vision
 from merge_and_rebase.finetune.forward_mode import apply_training_forward_mode, resolve_training_forward_mode
@@ -352,10 +351,10 @@ def test_bind_training_forward_mode_supports_full_delta_backed_vision_models() -
     )
 
     assert info["linearized_params"] > 0
-    linearized = getattr(model, "_linearized_module")
+    linearized = model._linearized_module
     assert any(name.endswith("1.weight") for name in linearized.param_names)
 
-    delta_module = getattr(model, "_delta_module")
+    delta_module = model._delta_module
     weight_idx = next(i for i, name in enumerate(delta_module.names) if name.endswith("clip_model.model.visual.1.weight"))
     with torch.no_grad():
         delta_module.params[weight_idx].fill_(0.25)
@@ -573,7 +572,7 @@ def test_bind_training_forward_mode_materializes_lora_weight_space_for_vision() 
         params={"linearized_feature_normalization": False, "linearized_logit_normalization": False},
     )
 
-    linearized = getattr(model, "_linearized_module")
+    linearized = model._linearized_module
     assert all("lora_" not in name for name in linearized.param_names)
     assert any(name.endswith("base_layer.weight") for name in linearized.param_names)
 
@@ -633,7 +632,7 @@ def test_apply_training_forward_mode_materializes_lora_weight_space_for_text() -
         output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
     )
 
-    linearized = getattr(model, "_linearized_module")
+    linearized = model._linearized_module
     assert all("lora_" not in name for name in linearized.param_names)
     assert any(name.endswith("proj.base_layer.weight") for name in linearized.param_names)
 

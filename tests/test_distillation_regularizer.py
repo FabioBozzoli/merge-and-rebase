@@ -8,11 +8,14 @@ import torch.optim as optim
 from torch.func import functional_call
 
 from merge_and_rebase.finetune import train_vision
-from merge_and_rebase.finetune.reference_tasks import build_reference_task_resolution_context
 from merge_and_rebase.finetune._vision_runtime import ImageEncoder, run_scaled_image_encoder, snapshot_parameter_map
+from merge_and_rebase.finetune.reference_tasks import build_reference_task_resolution_context
 from merge_and_rebase.finetune.regularizers._distill_config import merge_build_cfg
+from merge_and_rebase.finetune.regularizers._distill_runtime import (
+    apply_prepared_distillation,
+    compute_distillation_loss,
+)
 from merge_and_rebase.finetune.regularizers.base import BatchOverride, OptimizerBundle
-from merge_and_rebase.finetune.regularizers._distill_runtime import apply_prepared_distillation, compute_distillation_loss
 from merge_and_rebase.finetune.regularizers.distillation import DistillationRegularizer
 from merge_and_rebase.finetune.regularizers.registry import list_regularizers
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig
@@ -1315,23 +1318,23 @@ def test_train_task_logs_separate_loss_components(monkeypatch, tmp_path) -> None
     assert train_step_events
     metrics = train_step_events[0]["metrics"]
 
-    assert f"train/Cars/loss_task" in metrics
-    assert f"train/Cars/loss_reg" in metrics
-    assert f"train/Cars/loss_total_step" in metrics
-    assert f"train/Cars/loss_distill" in metrics
-    assert f"train/Cars/loss_penalty" in metrics
-    assert f"train/Cars/loss_reg_ffT" in metrics
-    assert f"train/Cars/loss_ft_proj" in metrics
-    assert f"train/Cars/loss_reg_cls_emb" in metrics
-    assert f"train/Cars/sampled_alpha" in metrics
+    assert "train/Cars/loss_task" in metrics
+    assert "train/Cars/loss_reg" in metrics
+    assert "train/Cars/loss_total_step" in metrics
+    assert "train/Cars/loss_distill" in metrics
+    assert "train/Cars/loss_penalty" in metrics
+    assert "train/Cars/loss_reg_ffT" in metrics
+    assert "train/Cars/loss_ft_proj" in metrics
+    assert "train/Cars/loss_reg_cls_emb" in metrics
+    assert "train/Cars/sampled_alpha" in metrics
 
     teacher_events = [event for event in run_logger.events if event["event_type"] == "train_step_teacher"]
     assert teacher_events
     teacher_metrics = teacher_events[0]["metrics"]
-    assert f"train/Cars/loss_teacher_task" in teacher_metrics
-    assert f"train/Cars/loss_teacher_supervised" in teacher_metrics
-    assert f"train/Cars/loss_reg_teacher" in teacher_metrics
-    assert f"train/Cars/loss_teacher_total" in teacher_metrics
+    assert "train/Cars/loss_teacher_task" in teacher_metrics
+    assert "train/Cars/loss_teacher_supervised" in teacher_metrics
+    assert "train/Cars/loss_reg_teacher" in teacher_metrics
+    assert "train/Cars/loss_teacher_total" in teacher_metrics
 
 
 def test_train_task_logs_teacher_accuracy_at_task_end(monkeypatch, tmp_path) -> None:
@@ -1409,10 +1412,10 @@ def test_train_task_logs_teacher_accuracy_at_task_end(monkeypatch, tmp_path) -> 
     task_end_events = [event for event in run_logger.events if event["event_type"] == "task_end"]
     assert task_end_events
     metrics = task_end_events[0]["metrics"]
-    assert f"val/Cars/top1_teacher" in metrics
-    assert f"test/Cars/top1_teacher" in metrics
-    assert 0.0 <= metrics[f"val/Cars/top1_teacher"] <= 1.0
-    assert 0.0 <= metrics[f"test/Cars/top1_teacher"] <= 1.0
+    assert "val/Cars/top1_teacher" in metrics
+    assert "test/Cars/top1_teacher" in metrics
+    assert 0.0 <= metrics["val/Cars/top1_teacher"] <= 1.0
+    assert 0.0 <= metrics["test/Cars/top1_teacher"] <= 1.0
 
 
 def test_train_task_logs_teacher_accuracy_at_task_end_for_composite(monkeypatch, tmp_path) -> None:
@@ -1495,8 +1498,8 @@ def test_train_task_logs_teacher_accuracy_at_task_end_for_composite(monkeypatch,
     task_end_events = [event for event in run_logger.events if event["event_type"] == "task_end"]
     assert task_end_events
     metrics = task_end_events[0]["metrics"]
-    assert 0.0 <= metrics[f"val/Cars/top1_teacher"] <= 1.0
-    assert 0.0 <= metrics[f"test/Cars/top1_teacher"] <= 1.0
+    assert 0.0 <= metrics["val/Cars/top1_teacher"] <= 1.0
+    assert 0.0 <= metrics["test/Cars/top1_teacher"] <= 1.0
 
 
 def test_train_task_logs_backward_losses_independently_from_log_every(monkeypatch, tmp_path) -> None:
@@ -1584,14 +1587,14 @@ def test_train_task_logs_backward_losses_independently_from_log_every(monkeypatc
     backward_events = [event for event in run_logger.events if event["event_type"] == "train_backward_loss"]
     assert backward_events
     backward_metrics = backward_events[0]["metrics"]
-    assert f"train_backward/Cars/loss_task" in backward_metrics
-    assert f"train_backward/Cars/loss_reg" in backward_metrics
-    assert f"train_backward/Cars/loss_total" in backward_metrics
-    assert f"train_backward/Cars/loss_distill" in backward_metrics
-    assert f"train_backward/Cars/loss_teacher_task" in backward_metrics
-    assert f"train_backward/Cars/loss_teacher_supervised" in backward_metrics
-    assert f"train_backward/Cars/loss_reg_teacher" in backward_metrics
-    assert f"train_backward/Cars/loss_teacher_total" in backward_metrics
+    assert "train_backward/Cars/loss_task" in backward_metrics
+    assert "train_backward/Cars/loss_reg" in backward_metrics
+    assert "train_backward/Cars/loss_total" in backward_metrics
+    assert "train_backward/Cars/loss_distill" in backward_metrics
+    assert "train_backward/Cars/loss_teacher_task" in backward_metrics
+    assert "train_backward/Cars/loss_teacher_supervised" in backward_metrics
+    assert "train_backward/Cars/loss_reg_teacher" in backward_metrics
+    assert "train_backward/Cars/loss_teacher_total" in backward_metrics
 
     train_step_events = [event for event in run_logger.events if event["event_type"] == "train_step"]
     assert not train_step_events

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from merge_and_rebase.artifacts import fetch_artifact, load_manifest, resolve_bundle
 

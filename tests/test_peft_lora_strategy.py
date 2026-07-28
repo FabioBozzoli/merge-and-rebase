@@ -3,10 +3,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from merge_and_rebase.finetune.train_vision import _save_peft_visual_adapter
 from merge_and_rebase.finetune._vision_runtime import ImageEncoder
 from merge_and_rebase.finetune.regularizers.kfac_ggn import ensure_openclip_kfac_surface
 from merge_and_rebase.finetune.strategies.peft_lora import PeftLoraVision
+from merge_and_rebase.finetune.train_vision import _save_peft_visual_adapter
 from merge_and_rebase.models.patch_openclip_attention import LoRAableMHA, split_openclip_vit_attn
 
 

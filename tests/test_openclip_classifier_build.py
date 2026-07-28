@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier, zero_shot_logits_from_features
+from merge_and_rebase.models.openclip_classifier import (
+    OpenClipBuildConfig,
+    OpenClipClassifier,
+    zero_shot_logits_from_features,
+)
 
 
 class _DummyModel(nn.Module):

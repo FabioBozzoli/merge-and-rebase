@@ -115,7 +115,7 @@ def render_svg(chart: ParsedFlowchart) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_width} {total_height}" role="img" aria-label="Compiled Mermaid flowchart">',
         '<style>',
         '.box{fill:#fff9ef;stroke:#0f3d3e;stroke-width:2;rx:14;ry:14;}',
-        '.edge{stroke:#8a4b08;stroke-width:2.4;fill:none;marker-end:url(#%s);}' % marker_id,
+        f'.edge{{stroke:#8a4b08;stroke-width:2.4;fill:none;marker-end:url(#{marker_id});}}',
         '.label{fill:#102a2b;font-family:Aptos,Trebuchet MS,sans-serif;font-size:16px;font-weight:600;text-anchor:middle;dominant-baseline:middle;}',
         '</style>',
         '<defs>',
@@ -143,7 +143,6 @@ def render_svg(chart: ParsedFlowchart) -> str:
             svg.append(f'<path class="edge" d="M {x1} {y1} L {x1} {mid_y} L {x2} {mid_y} L {x2} {y2 - 4}" />')
     else:
         x = pad
-        max_height = max(h for *_, h in node_specs)
         for node_id, _label, lines, width, height in node_specs:
             y = (total_height - height) / 2
             svg.append(f'<rect class="box" x="{x}" y="{y}" width="{width}" height="{height}" rx="14" ry="14" />')

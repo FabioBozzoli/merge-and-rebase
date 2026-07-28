@@ -22,7 +22,6 @@ from merge_and_rebase.finetune.regularizers.ekfac_ggn import (
 from merge_and_rebase.finetune.regularizers.kfac_ggn import (
     KfacGgnConfig,
     TaskCurvatureStats,
-    _metadata as _kfac_metadata,
     collect_curvature,
     ensure_openclip_kfac_surface,
     load_task_curvature,
@@ -30,12 +29,16 @@ from merge_and_rebase.finetune.regularizers.kfac_ggn import (
     save_task_curvature,
     select_tracked_parameters,
     task_cache_path,
+)
+from merge_and_rebase.finetune.regularizers.kfac_ggn import (
+    _metadata as _kfac_metadata,
+)
+from merge_and_rebase.finetune.regularizers.kfac_ggn import (
     task_cache_path as kfac_task_cache_path,
 )
 from merge_and_rebase.finetune.regularizers.registry import list_regularizers
 from merge_and_rebase.finetune.train_vision import ImageEncoder
 from merge_and_rebase.models.openclip_classifier import OpenClipBuildConfig
-
 
 
 def _dummy_transform(x):
@@ -164,7 +167,7 @@ def _copy_batch_first_to_mammoth(source: _ToyBatchFirstVisual, target: _ToyMammo
         target.ln_post.weight.copy_(source.ln_post.weight)
         target.ln_post.bias.copy_(source.ln_post.bias)
         target.lin_proj.weight.copy_(source.proj.T)
-        for src_block, tgt_block in zip(source.transformer.resblocks, target.transformer.resblocks):
+        for src_block, tgt_block in zip(source.transformer.resblocks, target.transformer.resblocks, strict=True):
             tgt_block.ln_1.load_state_dict(src_block.ln_1.state_dict())
             tgt_block.ln_2.load_state_dict(src_block.ln_2.state_dict())
             tgt_block.mlp.load_state_dict(src_block.mlp.state_dict())

@@ -5,10 +5,14 @@ import pickle
 import numpy as np
 import pytest
 import torch
-from datasets import ClassLabel, Dataset, DatasetDict, Features, Image as HFImage
+from datasets import Dataset, DatasetDict
 from PIL import Image
 
-from merge_and_rebase.data.vision_loaders import KMNIST_CLASSNAMES, build_vision_loaders, emnist_fix_transform, load_hf_splits
+from merge_and_rebase.data.vision_loaders import (
+    build_vision_loaders,
+    emnist_fix_transform,
+    load_hf_splits,
+)
 
 
 def _identity(x):

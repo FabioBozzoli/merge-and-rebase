@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 
 from merge_and_rebase.merge.methods.task_arithmetic import TaskArithmeticMerge
-from merge_and_rebase.merge.runtime import build_dense_delta_branch, build_merged_state_for_alpha, validate_prepared_merge
+from merge_and_rebase.merge.runtime import (
+    build_dense_delta_branch,
+    build_merged_state_for_alpha,
+    validate_prepared_merge,
+)
 from merge_and_rebase.merge.subspaces.core_space import CoreSpace
 
 

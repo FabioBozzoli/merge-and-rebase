@@ -4,13 +4,13 @@ import pytest
 import torch
 
 from merge_and_rebase.eval.vision_connectivity import _load_checkpoint_payload
-from merge_and_rebase.models.forward_modes import resolve_shared_forward_mode_params
 from merge_and_rebase.eval.vision_merge import (
     _acc_cache_key,
     _assert_qkv_patched_before_linearizing,
     _extract_checkpoint_attn_patch_info,
     _resolve_zero_shot_only,
 )
+from merge_and_rebase.models.forward_modes import resolve_shared_forward_mode_params
 
 
 def test_extract_checkpoint_attn_patch_info_requires_cfg_when_patched() -> None:

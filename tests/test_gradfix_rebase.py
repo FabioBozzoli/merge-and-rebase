@@ -159,7 +159,7 @@ def test_compute_gradient_signs_mean_returns_signs() -> None:
     dl = _make_tiny_dataloader()
     signs = compute_gradient_signs(model, dl, recipe=recipe, device="cpu", vote="mean")
     assert len(signs) > 0
-    for name, t in signs.items():
+    for _name, t in signs.items():
         # Every entry must be -1, 0, or +1
         assert torch.all((t == -1) | (t == 0) | (t == 1))
 
@@ -170,7 +170,7 @@ def test_compute_gradient_signs_max_returns_signs() -> None:
     dl = _make_tiny_dataloader()
     signs = compute_gradient_signs(model, dl, recipe=recipe, device="cpu", vote="max")
     assert len(signs) > 0
-    for name, t in signs.items():
+    for _name, t in signs.items():
         assert torch.all((t == -1) | (t == 0) | (t == 1))
 
 
