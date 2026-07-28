@@ -30,6 +30,10 @@ uv run ruff check src tests scripts
 # Run the test suite.
 uv run pytest -q
 
+# Preview the documentation site locally.
+uv sync --extra docs
+uv run mkdocs serve
+
 # Fine-tune a Vision8 subset.
 python -m merge_and_rebase.finetune.train_vision \
   --vision-config src/merge_and_rebase/finetune/configs/vision.yaml \

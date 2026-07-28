@@ -13,11 +13,12 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class TIESMerge:
-    """
-    TIES-style merge:
-      - prune each task vector to topK magnitude per-row (here: global vector topK fraction)
-      - resolve sign per-dimension (majority)
-      - disjoint merge by sign (mean by default)
+    """Prune task vectors, resolve their signs, and merge agreeing entries.
+
+    ``topk`` retains a magnitude fraction per task vector (or a percentage
+    above one); ``merging_type`` selects ``"mean"`` (default), ``"sum"``, or
+    ``"max"`` aggregation. Set ``low_memory`` to process checkpoint tensors
+    incrementally rather than constructing a flattened task-vector bank.
     """
 
     name: str = "ties_merge"

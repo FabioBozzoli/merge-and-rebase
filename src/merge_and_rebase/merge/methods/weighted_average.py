@@ -13,11 +13,12 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class WeightedAverageMerge:
-    """
-    merged = base + alpha * (avg(tuned) - base)
+    """Interpolate the base model toward a weighted average of checkpoints.
 
-    If weights are all 1: avg is simple mean of checkpoints.
-    If weights provided: avg is weighted mean.
+    The prepared direction is ``avg(tuned) - base`` and ``apply`` returns
+    ``base + alpha * direction``. ``method_params["normalize"]`` chooses
+    weight-sum normalization (``"sumw"``, default) or task-count
+    normalization (``"n"``).
     """
 
     name: str = "weighted_average"

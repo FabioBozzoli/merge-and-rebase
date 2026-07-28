@@ -9,10 +9,10 @@ python -m merge_and_rebase.eval.vision_rebase \
 
 Useful starter configurations include:
 
-- [GradFix over Vision8](../configs/vision8_gradfix.json)
-- [Theseus over Vision8](../configs/vision8_theseus_all.json)
-- [TransFusion transport](../configs/vision8_transfusion_rebase.json)
-- [BiCo alpha sweep](../configs/vision8_bico_all_alpha_sweep.json)
+- [GradFix over Vision8](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/vision8_gradfix.json)
+- [Theseus over Vision8](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/vision8_theseus_all.json)
+- [TransFusion transport](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/vision8_transfusion_rebase.json)
+- [BiCo alpha sweep](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/vision8_bico_all_alpha_sweep.json)
 
 ## Core Fields
 

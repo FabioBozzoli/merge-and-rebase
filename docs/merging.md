@@ -7,7 +7,7 @@ python -m merge_and_rebase.eval.vision_merge \
   --config configs/vision8_task_arithmetic_hf_release.json
 ```
 
-The equivalent language-model entrypoint is `python -m merge_and_rebase.eval.llm_merge`; see [configs/llm_merge_llama3_8b_knots_hf.json](../configs/llm_merge_llama3_8b_knots_hf.json) for a starting configuration.
+The equivalent language-model entrypoint is `python -m merge_and_rebase.eval.llm_merge`; see [configs/llm_merge_llama3_8b_knots_hf.json](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/llm_merge_llama3_8b_knots_hf.json) for a starting configuration.
 
 ## Configuration
 

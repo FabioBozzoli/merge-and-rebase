@@ -1,0 +1,71 @@
+site_name: merge-and-rebase
+site_description: Fine-tuning, model merging, and task-vector transport.
+repo_url: https://github.com/apanariello4/merge-and-rebase
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.tooltips
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.superfences
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            members_order: source
+            show_source: false
+            # API pages provide the human-readable method headings themselves.
+            # Hiding the root avoids a duplicate class-name heading below each.
+            show_root_heading: false
+            show_root_toc_entry: false
+nav:
+  - Overview:
+      - Home: index.md
+      - Getting Started: getting-started.md
+      - Concepts: concepts.md
+  - Tutorials:
+      - Reproduce Vision8: tutorials/reproduce-vision8.md
+      - Merge Local Checkpoints: tutorials/merge-local-checkpoints.md
+      - Transport a Task Vector: tutorials/rebase-task-vector.md
+      - Post-Merge Adaptation: tutorials/postmerge-adaptation.md
+  - Workflows:
+      - Configuration Reference: configuration.md
+      - Artifacts and Checkpoints: artifacts.md
+      - Fine-Tuning: fine-tuning.md
+      - Merging: merging.md
+      - Rebasin: rebasin.md
+  - Reference:
+      - Methods Overview: methods.md
+      - Merge Methods API: api/merge-methods.md
+      - Rebasin Methods API: api/rebase-methods.md
+      - Post-Merge Methods API: api/postmerge-methods.md
+  - Repository:
+      - Overview Slides: repo-overview-slides.md

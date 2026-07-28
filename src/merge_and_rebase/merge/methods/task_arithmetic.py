@@ -13,9 +13,11 @@ from ._common import axpy_state_dict, default_weights
 
 @dataclass(frozen=True)
 class TaskArithmeticMerge:
-    """
-    merged = base + alpha * Σ_i w_i * (tuned_i - base)
-    Optionally masks each task vector by magnitude first (unstructured).
+    """Add weighted task vectors to the shared base checkpoint.
+
+    The prepared direction is ``sum_i w_i * (tuned_i - base)`` and ``apply``
+    returns ``base + alpha * direction``. Task Arithmetic has no
+    method-specific parameters.
     """
 
     name: str = "task_arithmetic"

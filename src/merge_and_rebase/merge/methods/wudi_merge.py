@@ -15,14 +15,11 @@ from .functional import merge_functional
 
 @dataclass(frozen=True)
 class WUDIMerge:
-    """
-    Minimal WUDI implementation.
+    """Solve the WUDI matrix objective independently for each tensor.
 
-    We apply the closed-form zero-regularization variant per tensor:
-      argmin_M Σ_i ||(M - Δ_i) Δ_i^T||_F^2 / ||Δ_i||_F^2
-
-    Non-matrix 1D tensors use a simple fallback because the paper focuses on
-    linear weights. By default we average 1D deltas for practical stability.
+    The default ``closed_form`` solver uses a ridge-regularized linear solve;
+    ``solver: "gd"`` instead optimizes the objective with Adam. One-dimensional
+    tensors use the ``vector_1d_merge`` fallback, which defaults to averaging.
     """
 
     name: str = "wudi"

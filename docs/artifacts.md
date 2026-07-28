@@ -20,7 +20,7 @@ Checkpoint references may be local paths, immutable HTTPS URLs, or Hugging Face 
 hf-hub:org/repository/path/to/checkpoint.pt
 ```
 
-The evaluation loaders download Hub and URL references automatically. The released Vision8 configuration is [configs/vision8_task_arithmetic_hf_release.json](../configs/vision8_task_arithmetic_hf_release.json).
+The evaluation loaders download Hub and URL references automatically. The released Vision8 configuration is [configs/vision8_task_arithmetic_hf_release.json](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/vision8_task_arithmetic_hf_release.json).
 
 ## TSV Layout
 

@@ -13,13 +13,12 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class PCBMerge:
-    """
-    Simplified PCB merge on flattened task vectors [N, D].
+    """Balance flattened task vectors through intra- and inter-task signals.
 
-    Defaults follow the reference implementation, while keeping the code compact and robust:
-      - clamp absolute deltas by per-task rank ratios
-      - build a balancing mask from intra/inter signals
-      - aggregate with per-task lambda scaling
+    PCB clamps absolute deltas by the `clamp_min_ratio` and
+    `clamp_max_ratio` quantiles, builds an attention scale with `att_ratio`,
+    then applies the task-weight multiplier `lam`. The ratios are validated in
+    the method implementation.
     """
 
     name: str = "pcb"

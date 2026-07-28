@@ -28,6 +28,9 @@ python -m merge_and_rebase.eval.vision_merge \
 ## Documentation
 
 - [Getting started](docs/getting-started.md): environments, repository layout, and common commands.
+- [Tutorials](docs/tutorials/reproduce-vision8.md): end-to-end runs with released and local checkpoints.
+- [Concepts](docs/concepts.md): task vectors, bases, preparation, metrics, and compatibility.
+- [Configuration reference](docs/configuration.md): merge, rebasin, post-merge, and fine-tuning fields.
 - [Artifacts and checkpoints](docs/artifacts.md): released checkpoints, manifests, validation, and local checkpoints.
 - [Fine-tuning](docs/fine-tuning.md): vision and text configurations, strategies, regularizers, and logging.
 - [Merging](docs/merging.md): merge methods, evaluation, alpha search, and hyperparameter search.

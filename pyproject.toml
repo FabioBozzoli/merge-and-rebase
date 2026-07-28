@@ -49,6 +49,12 @@ dev = [
   "pytest-cov>=5.0",
 ]
 
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.6",
+  "mkdocstrings[python]>=0.28",
+]
+
 [tool.uv]
 python-preference = "managed"
 

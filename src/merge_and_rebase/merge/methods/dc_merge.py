@@ -14,11 +14,12 @@ from .functional import merge_functional
 
 @dataclass(frozen=True)
 class DCMerge:
-    """
-    DC-Merge over dense task deltas.
+    """Merge dense task deltas through whitened low-rank coordinate covers.
 
-    LoRA checkpoints are expected to be materialized into dense model deltas by
-    the existing evaluation pipeline before reaching this method.
+    The method truncates and optionally smooths each matrix spectrum, merges
+    their core matrices with ``cover_merge_method``, and maps the result back
+    through the coordinate cover. LoRA checkpoints must be materialized into
+    dense deltas before this method is called.
     """
 
     name: str = "dc_merge"
