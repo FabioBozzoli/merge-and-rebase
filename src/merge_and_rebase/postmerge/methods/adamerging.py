@@ -79,6 +79,13 @@ def _build_vision_backward_entropy_loss(context: PostMergeContext, cfg: dict[str
 
 @dataclass(frozen=True)
 class AdaMergingPostMerge:
+    """Optimize bounded task- or layer-level merge coefficients after merging.
+
+    The method minimizes an entropy objective supplied by ``PostMergeContext``.
+    Configure ``alpha_mode``, ``steps``, ``lr``, and alpha bounds through the
+    post-merge configuration. The current implementation supports full subspaces.
+    """
+
     name: str = "adamerging"
 
     def run(self, context: PostMergeContext) -> PostMergeResult:

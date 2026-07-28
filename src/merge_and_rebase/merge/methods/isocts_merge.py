@@ -13,6 +13,13 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class IsoCTSMerge:
+    """Compose matrix deltas from common and task-specific singular subspaces.
+
+    ``common_space_fraction`` allocates the shared subspace; the remaining rank
+    is divided across tasks. As with other matrix methods, one-dimensional
+    tensors are controlled by ``vector_1d_merge``.
+    """
+
     name: str = "isocts_merge"
 
     def prepare(

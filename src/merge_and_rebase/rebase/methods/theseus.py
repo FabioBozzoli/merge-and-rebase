@@ -916,6 +916,13 @@ def _apply_transforms_to_visual_delta(
 
 @dataclass(frozen=True)
 class TheseusRebase:
+    """Transport matrix task-vector updates with activation-aligned layer maps.
+
+    ``prepare`` estimates source-to-target coordinate transforms from activations
+    or data-free covariance information. ``apply`` reuses those transforms for
+    a compatible delta, making alpha sweeps cheaper than rebuilding alignment.
+    """
+
     name: str = "theseus"
 
     def prepare(

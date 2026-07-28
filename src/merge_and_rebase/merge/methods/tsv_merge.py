@@ -13,6 +13,13 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class TSVMerge:
+    """Merge matrix-valued task deltas through truncated singular-vector components.
+
+    ``sv_reduction`` and ``max_rank`` control the retained rank; ``svd_dtype``
+    controls decomposition precision. One-dimensional deltas are zero by default
+    or averaged when ``vector_1d_merge`` is ``"average"``.
+    """
+
     name: str = "tsv_merge"
 
     def prepare(

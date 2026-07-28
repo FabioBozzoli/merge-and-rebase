@@ -13,6 +13,13 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class DAREMerge:
+    """Merge randomly sparsified task vectors with optional expectation-preserving rescaling.
+
+    ``drop_rate`` (or ``p``) controls the fraction of delta entries removed from
+    each task. Set ``seed`` for reproducible masks and ``low_memory`` to process
+    checkpoint tensors without materializing the full flattened task-vector bank.
+    """
+
     name: str = "dare_merge"
 
     def prepare(

@@ -39,6 +39,12 @@ def _history_row(step: int, loss: torch.Tensor) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class TaskVectorFinetunePostMerge:
+    """Fine-tune each task delta independently after initializing their merge bank.
+
+    This vision-only post-merge method keeps task-vector parameters separate and
+    materializes their weighted composition after optimization.
+    """
+
     name: str = "task_vector_finetune"
 
     def run(self, context: PostMergeContext) -> PostMergeResult:
@@ -101,6 +107,12 @@ class TaskVectorFinetunePostMerge:
 
 @dataclass(frozen=True)
 class MergedDeltaFinetunePostMerge:
+    """Fine-tune a single already-composed visual task-vector delta.
+
+    Unlike ``TaskVectorFinetunePostMerge``, optimization acts directly on the
+    merged update rather than preserving one trainable delta per task.
+    """
+
     name: str = "merged_delta_finetune"
 
     def run(self, context: PostMergeContext) -> PostMergeResult:
@@ -171,6 +183,12 @@ class MergedDeltaFinetunePostMerge:
 
 @dataclass(frozen=True)
 class VisionHeadProbePostMerge:
+    """Fine-tune only final vision projection and normalization task-vector tensors.
+
+    The method keeps the remaining merged update fixed and is intended as a
+    lightweight vision-only post-merge adaptation step.
+    """
+
     name: str = "vision_head_probe"
 
     def run(self, context: PostMergeContext) -> PostMergeResult:

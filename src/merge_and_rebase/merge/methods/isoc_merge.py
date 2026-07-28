@@ -14,6 +14,13 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class IsoCMerge:
+    """Merge matrix deltas after replacing their singular spectrum with its mean.
+
+    The method operates on compatible two-dimensional floating-point tensors.
+    Set ``vector_1d_merge`` to ``"average"`` to include one-dimensional task
+    deltas; otherwise they remain unchanged from the base model.
+    """
+
     name: str = "isoc_merge"
 
     def prepare(

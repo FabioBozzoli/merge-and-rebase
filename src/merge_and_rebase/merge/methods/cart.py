@@ -14,6 +14,13 @@ from ._common import axpy_state_dict, default_weights, get_method_params
 
 @dataclass(frozen=True)
 class CARTMerge:
+    """Compose low-rank task-vector updates with Cartesian pruning and scaling.
+
+    ``pruning_rank`` selects the retained rank fraction for matrix deltas and
+    ``scaling_coeffs`` scales the resulting direction before the common alpha
+    interpolation is applied.
+    """
+
     name: str = "cart_merge"
 
     def prepare(
