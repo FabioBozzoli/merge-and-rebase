@@ -12,7 +12,6 @@ import torch
 
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
-from ..alpha_search import PerTaskAlphaTracker, average_scores
 from ..cli_args import (
     add_alpha_args,
     add_config_arg,
@@ -43,6 +42,7 @@ from ..rebase.runtime import (
     resolve_rebase_method_config,
 )
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
+from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
@@ -976,7 +976,15 @@ def main() -> None:
 
         if alpha_selection == "shared":
             best_rebase_avg = float("-inf")
+            best_baseline_avg = float("-inf")
             best_alpha = float(positive_alphas[0] if positive_alphas else alphas[0])
+            # When every task's baseline is target_zeroshot (untransported infeasible),
+            # the baseline is alpha-independent — keep best_baseline_alpha at 0.0 so
+            # the summary does not report a spurious non-zero value.
+            has_untransported = any(can_eval_untransported_by_task)
+            best_baseline_alpha = (
+                float(positive_alphas[0] if positive_alphas else alphas[0]) if has_untransported else 0.0
+            )
             sweep_results: list[dict[str, Any]] = []
             shared_bad_steps = 0
 
@@ -1033,6 +1041,18 @@ def main() -> None:
 
                 if float(alpha) > 0.0:
                     eps = 1e-12
+                    # Track baseline best alpha independently of rebased best alpha,
+                    # but only when there is at least one untransported baseline task
+                    # (otherwise the baseline is target_zeroshot and alpha-independent).
+                    if has_untransported:
+                        if avg_baseline != avg_baseline:  # NaN guard
+                            avg_baseline_for_track = float("-inf")
+                        else:
+                            avg_baseline_for_track = float(avg_baseline)
+                        if avg_baseline_for_track > best_baseline_avg + eps:
+                            best_baseline_avg = avg_baseline_for_track
+                            best_baseline_alpha = float(alpha)
+
                     if avg_rebase > best_rebase_avg + eps:
                         best_rebase_avg = avg_rebase
                         best_alpha = float(alpha)
@@ -1054,15 +1074,21 @@ def main() -> None:
                 avg_r = average_scores(r["rebase_accs"])
                 avg_b = _average_defined(r["baseline_accs"])
                 print(f"  alpha={a:.3f}  {baseline_label}={avg_b:.6f}  {result_label}={avg_r:.6f}")
-            print(f"\nBest alpha: {best_alpha:.3f} (avg rebased val acc={best_rebase_avg:.6f})")
+            print(
+                f"\nBest alpha: rebase={best_alpha:.3f} (avg rebased val acc={best_rebase_avg:.6f}) | "
+                f"baseline={best_baseline_alpha:.3f} (avg baseline val acc={best_baseline_avg:.6f})"
+            )
 
-            print(f"\n(Re-running best alpha ({best_alpha:.3f}) on test split)")
+            print(
+                f"\n(Re-running on test split: rebase at alpha={best_alpha:.3f}, baseline at alpha={best_baseline_alpha:.3f})"
+            )
             all_indices = list(range(len(per_task)))
-            baseline_test_by_idx = _eval_baseline_task_indices("test", all_indices, float(best_alpha))
+            baseline_test_by_idx = _eval_baseline_task_indices("test", all_indices, float(best_baseline_alpha))
             rebase_test_by_idx = _eval_rebased_task_indices("test", all_indices, float(best_alpha))
             baseline_test_accs = [baseline_test_by_idx[i] for i in all_indices]
             rebase_test_accs = [rebase_test_by_idx[i] for i in all_indices]
             selected_alpha_by_task = [float(best_alpha)] * len(per_task)
+            selected_baseline_alpha_by_task = [float(best_baseline_alpha)] * len(per_task)
 
         else:
             tracker = PerTaskAlphaTracker(
@@ -1070,40 +1096,112 @@ def main() -> None:
                 initial_alpha=float(positive_alphas[0] if positive_alphas else alphas[0]),
                 patience=alpha_patience,
             )
+            # For tasks where the untransported baseline is infeasible (different
+            # architecture / shape), the baseline is target_zeroshot and
+            # alpha-independent. Pre-seed the secondary tracker so
+            # best_secondary_alpha stays at 0.0 and the secondary stream never
+            # participates in alpha optimization for these tasks.
+            for idx in range(len(per_task)):
+                if not can_eval_untransported_by_task[idx]:
+                    baseline_val = _eval_baseline_task(alpha_search_split, idx, 0.0)
+                    tracker.best_secondary_alpha[idx] = 0.0
+                    tracker.best_secondary_acc[idx] = baseline_val
+                    tracker.secondary_active[idx] = False
             sweep_results = []
 
             for alpha in alphas:
-                active_indices = tracker.active_indices()
-                if not active_indices:
-                    print("\nAll tasks have early-stopped; ending per-task alpha sweep.")
+                # The baseline may keep being swept after the rebased has early-stopped
+                # a task, so we evaluate the union of primary- and secondary-active tasks
+                # and decouple the two streams' early stopping.
+                eval_indices = tracker.eval_active_indices()
+                if not eval_indices:
+                    print("\nAll tasks have early-stopped on both streams; ending per-task alpha sweep.")
                     break
 
+                primary_indices = set(tracker.primary_active_indices())
                 print(f"\n=== alpha {alpha:.3f} — {method_label} (split: {alpha_search_split}, mode: per_task) ===")
 
-                baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, active_indices, float(alpha))
-                rebase_by_idx = _eval_rebased_task_indices(alpha_search_split, active_indices, float(alpha))
+                # Baseline must be evaluated for every index in the union (baseline may
+                # still be active for tasks where the rebased already early-stopped).
+                baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, eval_indices, float(alpha))
+                # Rebased is only evaluated for primary-active tasks; for tasks where it
+                # has already stopped, we pass -inf as a no-op placeholder.
+                rebase_eval_indices = [idx for idx in eval_indices if idx in primary_indices]
+                rebase_by_idx_active = _eval_rebased_task_indices(alpha_search_split, rebase_eval_indices, float(alpha))
+                rebase_by_idx: dict[int, float] = {}
+                for idx in eval_indices:
+                    if idx in primary_indices:
+                        rebase_by_idx[idx] = rebase_by_idx_active[idx]
+                    else:
+                        rebase_by_idx[idx] = float("-inf")
 
-                baseline_accs = [baseline_by_idx[idx] for idx in active_indices]
-                rebase_accs = [rebase_by_idx[idx] for idx in active_indices]
+                baseline_accs = [baseline_by_idx[idx] for idx in eval_indices]
+                rebase_accs = [rebase_by_idx[idx] for idx in eval_indices]
 
                 print(
                     f"  {'task':<{task_col}}  {baseline_label:>{metric_col}}  {result_label:>{metric_col}}  {'norm':>{metric_col}}"
                 )
                 print(f"  {'-' * task_col}  {'-' * metric_col}  {'-' * metric_col}  {'-' * metric_col}")
-                for idx, baseline_acc, rebase_acc in zip(active_indices, baseline_accs, rebase_accs, strict=True):
+                for idx, baseline_acc, rebase_acc in zip(eval_indices, baseline_accs, rebase_accs, strict=True):
                     task_name = per_task[idx]["task"]
-                    norm = _norm_acc(rebase_acc, baseline_acc)
+                    # During the val sweep, norm uses the baseline's own best-so-far
+                    # accuracy (not the same-alpha baseline), so the per-step ratio
+                    # already reflects the final normalization semantics.
+                    best_secondary = float(tracker.best_secondary_acc[idx])
+                    norm_baseline = best_secondary if best_secondary != float("-inf") else baseline_acc
+                    # For tasks whose rebased stream already early-stopped, rebase_acc
+                    # is -inf (not evaluated this step); display the frozen best rebased
+                    # accuracy instead so the reported number tracks the rebased peak.
+                    if idx in primary_indices:
+                        display_rebase = rebase_acc
+                    else:
+                        frozen = float(tracker.best_primary_acc[idx])
+                        display_rebase = frozen if frozen != float("-inf") else 0.0
+                    norm = _norm_acc(display_rebase, norm_baseline)
+                    marker = " " if idx in primary_indices else "*"
                     print(
-                        f"  {task_name:<{task_col}}  {baseline_acc:>{metric_col}.6f}  {rebase_acc:>{metric_col}.6f}  {norm:>{metric_col}.6f}"
+                        f" {marker}{task_name:<{task_col - 1}}  {baseline_acc:>{metric_col}.6f}  {display_rebase:>{metric_col}.6f}  {norm:>{metric_col}.6f}"
                     )
 
-                avg_rebase = average_scores(rebase_accs)
+                # Average rebased across ALL tasks: use the current value for active tasks
+                # and the frozen best for stopped tasks, so the avg does not
+                # collapse to 0.0 once every rebased task has early-stopped.
+                all_rebase_vals: list[float] = []
+                for idx in range(len(per_task)):
+                    if idx in primary_indices:
+                        all_rebase_vals.append(float(rebase_by_idx[idx]))
+                    else:
+                        frozen = float(tracker.best_primary_acc[idx])
+                        all_rebase_vals.append(frozen if frozen != float("-inf") else 0.0)
+                avg_rebase = average_scores(all_rebase_vals)
                 avg_baseline = _average_defined(baseline_accs)
-                avg_norm = _average_defined([_norm_acc(r, b) for r, b in zip(rebase_accs, baseline_accs, strict=True)])
+                avg_norm = _average_defined(
+                    [_norm_acc(
+                        float(rebase_by_idx[idx]) if idx in primary_indices else max(float(tracker.best_primary_acc[idx]), 0.0),
+                        baseline_accs[i],
+                    ) for i, idx in enumerate(eval_indices)]
+                )
                 print(f"  {'-' * task_col}  {'-' * metric_col}  {'-' * metric_col}  {'-' * metric_col}")
                 print(
                     f"  {'avg':<{task_col}}  {avg_baseline:>{metric_col}.6f}  {avg_rebase:>{metric_col}.6f}  {avg_norm:>{metric_col}.6f}"
                 )
+
+                stopped_primary: list[int] = []
+                stopped_secondary: list[int] = []
+                if float(alpha) > 0.0:
+                    stopped_primary, stopped_secondary = tracker.update(
+                        alpha=float(alpha),
+                        indices=eval_indices,
+                        primary_accs=rebase_accs,
+                        secondary_accs=baseline_accs,
+                    )
+                    if stopped_primary:
+                        stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_primary)
+                        print(f"  Early-stopping REBASED tasks at alpha={alpha:.3f}: {stopped_names}")
+                    if stopped_secondary:
+                        stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_secondary)
+                        print(f"  Early-stopping BASELINE tasks at alpha={alpha:.3f}: {stopped_names}")
+
                 run_logger.log_event(
                     "alpha_eval_end",
                     metrics={
@@ -1112,57 +1210,57 @@ def main() -> None:
                         "alpha/avg_norm_acc": float(avg_norm),
                     },
                     context={
-                        "active_tasks": [per_task[idx]["task"] for idx in active_indices],
-                        "per_task_baseline": {per_task[idx]["task"]: float(baseline_by_idx[idx]) for idx in active_indices},
-                        "per_task_rebased": {per_task[idx]["task"]: float(rebase_by_idx[idx]) for idx in active_indices},
+                        "active_tasks": [per_task[idx]["task"] for idx in eval_indices],
+                        "per_task_baseline": {per_task[idx]["task"]: float(baseline_by_idx[idx]) for idx in eval_indices},
+                        "per_task_rebased": {per_task[idx]["task"]: float(rebase_by_idx[idx]) for idx in eval_indices},
+                        "stopped_primary": [int(idx) for idx in stopped_primary],
+                        "stopped_secondary": [int(idx) for idx in stopped_secondary],
                     },
                 )
-
-                stopped_indices: list[int] = []
-                if float(alpha) > 0.0:
-                    stopped_indices = tracker.update(
-                        alpha=float(alpha),
-                        indices=active_indices,
-                        baseline_accs=baseline_accs,
-                        rebase_accs=rebase_accs,
-                    )
-                    if stopped_indices:
-                        stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_indices)
-                        print(f"  Early-stopping tasks at alpha={alpha:.3f}: {stopped_names}")
 
                 sweep_results.append(
                     {
                         "alpha": float(alpha),
-                        "active_indices": list(active_indices),
+                        "active_indices": list(eval_indices),
                         "baseline_accs": baseline_accs,
                         "rebase_accs": rebase_accs,
+                        "primary_active": [int(idx) for idx in eval_indices if idx in primary_indices],
                     }
                 )
 
             print("\n=== Alpha search summary (per-task) ===")
             for idx, item in enumerate(per_task):
                 print(
-                    f"  {item['task']}: best_alpha={tracker.best_alpha[idx]:.3f}  "
-                    f"best_val={tracker.best_rebase_acc[idx]:.6f}"
+                    f"  {item['task']}: rebase_alpha={tracker.best_primary_alpha[idx]:.3f}  "
+                    f"rebase_val={tracker.best_primary_acc[idx]:.6f} | "
+                    f"baseline_alpha={tracker.best_secondary_alpha[idx]:.3f}  "
+                    f"baseline_val={tracker.best_secondary_acc[idx]:.6f}"
                 )
-            print(f"\nAvg per-task best val acc: {tracker.best_avg():.6f}")
+            print(f"\nAvg per-task best rebase val acc: {tracker.best_avg():.6f}")
+            best_baseline_vals = [float(v) for v in tracker.best_secondary_acc if v != float("-inf")]
+            if best_baseline_vals:
+                print(f"Avg per-task best baseline val acc: {sum(best_baseline_vals) / len(best_baseline_vals):.6f}")
 
-            print("\n(Re-running per-task best alphas on test split)")
-            baseline_test_accs = []
-            rebase_test_accs = []
-            selected_alpha_by_task = []
+            print("\n(Re-running per-task best alphas on test split — decoupled per stream)")
+            baseline_test_accs: list[float] = []
+            rebase_test_accs: list[float] = []
+            selected_alpha_by_task: list[float] = []
+            selected_baseline_alpha_by_task: list[float] = []
             for idx, item in enumerate(per_task):
-                task_alpha = float(tracker.best_alpha[idx])
-                selected_alpha_by_task.append(task_alpha)
-                print(f"  {item['task']}: alpha={task_alpha:.3f}")
+                rebase_alpha = float(tracker.best_primary_alpha[idx])
+                baseline_alpha = float(tracker.best_secondary_alpha[idx])
+                selected_alpha_by_task.append(rebase_alpha)
+                selected_baseline_alpha_by_task.append(baseline_alpha)
+                print(f"  {item['task']}: rebase_alpha={rebase_alpha:.3f}  baseline_alpha={baseline_alpha:.3f}")
 
-                baseline_test_accs.append(_eval_baseline_task("test", idx, task_alpha))
+                baseline_test_accs.append(_eval_baseline_task("test", idx, baseline_alpha))
 
-                rebase_sd_task = axpy_state_dict(target_base_sd, rebased_deltas[idx], alpha=task_alpha)
+                rebase_sd_task = axpy_state_dict(target_base_sd, rebased_deltas[idx], alpha=rebase_alpha)
                 _load_into_target_model(rebase_sd_task)
                 del rebase_sd_task
                 rebase_test_accs.append(_eval_task(item, "test"))
             best_alpha = float(sum(selected_alpha_by_task) / max(1, len(selected_alpha_by_task)))
+            best_baseline_alpha = float(sum(selected_baseline_alpha_by_task) / max(1, len(selected_baseline_alpha_by_task)))
 
         norm_accs = [_norm_acc(r, b) for r, b in zip(rebase_test_accs, baseline_test_accs, strict=True)]
 
@@ -1180,8 +1278,8 @@ def main() -> None:
 
         if alpha_selection == "per_task":
             print("\nSelected test-time alpha by task:")
-            for item, alpha in zip(per_task, selected_alpha_by_task, strict=True):
-                print(f"  {item['task']}: {alpha:.3f}")
+            for item, r_a, b_a in zip(per_task, selected_alpha_by_task, selected_baseline_alpha_by_task, strict=True):
+                print(f"  {item['task']}: rebase={r_a:.3f}  baseline={b_a:.3f}")
 
         saved_merged_path: str | None = None
         if cfg.get("save_merged"):
@@ -1196,11 +1294,15 @@ def main() -> None:
             "method_label": method_label,
             "alpha_selection": alpha_selection,
             "best_alpha": float(best_alpha),
+            "best_baseline_alpha": float(best_baseline_alpha),
             "baseline_label": baseline_label,
             "metric_definitions": {
-                "absolute_accuracy": "top-1 accuracy in [0, 1]",
-                "baseline_accuracy": baseline_label,
-                "normalized_accuracy_ratio": "absolute_accuracy / baseline_accuracy",
+                "absolute_accuracy": "top-1 accuracy in [0, 1] (rebased/transported at the rebased's own best alpha)",
+                "baseline_accuracy": "untransported baseline top-1 at the baseline's own best alpha",
+                "normalized_accuracy_ratio": (
+                    "absolute_accuracy (at rebased best alpha) / baseline_accuracy (at baseline best alpha); "
+                    "each stream independently optimizes alpha on the alpha-search split"
+                ),
                 "normalized_accuracy_ratio_display": (
                     "ratio (decimal, not a percentage); values above 1.0 indicate the rebased/transported "
                     "model exceeds the untransported baseline; report as a decimal ratio, never multiplied by 100"
@@ -1224,6 +1326,9 @@ def main() -> None:
                 "avg_norm": float(sum(norm_accs) / len(norm_accs)),
             },
             "selected_alpha_by_task": {item["task"]: float(selected_alpha_by_task[i]) for i, item in enumerate(per_task)},
+            "selected_baseline_alpha_by_task": {
+                item["task"]: float(selected_baseline_alpha_by_task[i]) for i, item in enumerate(per_task)
+            },
             "block_extension_target_dataset_eval": block_extension_eval_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
