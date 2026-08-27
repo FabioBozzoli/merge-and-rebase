@@ -17,8 +17,6 @@ class _PairSupport:
 _METHOD_SUPPORT: dict[str, _PairSupport] = {
     "theseus": _PairSupport(cross_size=True),
     "bico": _PairSupport(cross_size=True),
-    "delta_bico": _PairSupport(cross_size=True),
-    "delta_theseus": _PairSupport(cross_size=True),
     "identity": _PairSupport(cross_size=False),
     "orthogonal_shift": _PairSupport(cross_size=False),
     "gradfix": _PairSupport(cross_size=False),
@@ -74,7 +72,7 @@ def check_pair(
             f"Method '{method_name}' does not support cross-size rebasing. "
             f"Source hidden={source_meta.hidden_size}/{source_meta.intermediate_size} "
             f"vs target hidden={target_meta.hidden_size}/{target_meta.intermediate_size}. "
-            "Cross-size support: theseus, bico, delta_bico, delta_theseus"
+            "Cross-size support: theseus, bico"
         )
 
     if same_size and source_depth != target_depth:

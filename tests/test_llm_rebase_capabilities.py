@@ -23,8 +23,6 @@ def test_same_size_allowed() -> None:
     check_pair("gradfix", src, tgt)
     check_pair("theseus", src, tgt)
     check_pair("bico", src, tgt)
-    check_pair("delta_bico", src, tgt)
-    check_pair("delta_theseus", src, tgt)
 
 
 def test_cross_size_allowed_for_thesus() -> None:
@@ -32,8 +30,6 @@ def test_cross_size_allowed_for_thesus() -> None:
     tgt = _meta(hidden=8192, intermediate=28672)
     check_pair("theseus", src, tgt)
     check_pair("bico", src, tgt)
-    check_pair("delta_bico", src, tgt)
-    check_pair("delta_theseus", src, tgt)
 
 
 def test_cross_size_rejected_for_identity() -> None:
