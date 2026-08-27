@@ -4,6 +4,7 @@ import argparse
 import itertools
 import os
 import time
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +36,9 @@ from ..eval.utils import (
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
 from ..io.peft_helpers import normalize_attn_patch_cfg
+from ..merge.base import PreparedMergeMethod
 from ..merge.methods._common import axpy_state_dict
+from ..merge.registry import get_method as get_merge_method
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
@@ -215,6 +218,74 @@ def _build_task_context(
         build_cfg_task=_build_cfg_for(target_cfg),
         source_build_cfg_task=_build_cfg_for(source_cfg),
     )
+
+
+_VALID_MERGE_MODES = ("none", "rebase_then_merge", "merge_then_rebase")
+
+
+def _resolve_merge_mode_config(cfg: dict[str, Any], alpha_selection: str) -> tuple[str, str, dict[str, Any]]:
+    """Resolve and validate the merge-mode knobs.
+
+    Returns (merge_mode, merge_method_name, merge_params). ``merge_mode="none"``
+    keeps the historical per-task transfer evaluation; the two other modes
+    compose the transported (or source-side) deltas into a single merged model.
+    """
+    merge_mode = str(cfg.get("merge_mode", "none")).strip().lower()
+    if merge_mode not in _VALID_MERGE_MODES:
+        raise ValueError(f"merge_mode must be one of: {', '.join(_VALID_MERGE_MODES)}")
+
+    if merge_mode != "none" and alpha_selection == "per_task":
+        raise ValueError(
+            "merge_mode requires alpha_selection='shared': a merged model has a single shared alpha."
+        )
+
+    merge_method_name = str(cfg.get("merge_method", "task_arithmetic"))
+    get_merge_method(merge_method_name)  # validate early for clearer UX
+
+    raw_params = cfg.get("merge_params", {}) or {}
+    if not isinstance(raw_params, dict):
+        raise ValueError("merge_params must be a JSON object / mapping when provided.")
+    return merge_mode, merge_method_name, dict(raw_params)
+
+
+def _pseudo_tuned(
+    base_sd: dict[str, torch.Tensor],
+    deltas: list[dict[str, torch.Tensor]],
+) -> list[dict[str, torch.Tensor]]:
+    """Synthesize tuned states ``base + delta_i`` as expected by MergeMethod APIs."""
+    return [axpy_state_dict(base_sd, d, alpha=1.0) for d in deltas]
+
+
+def _merge_direction(
+    *,
+    base_sd: dict[str, torch.Tensor],
+    deltas: list[dict[str, torch.Tensor]],
+    merge_method_name: str,
+    weights: Sequence[float],
+    merge_params: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Merge task deltas into one direction in delta-space via the public merge registry.
+
+    For PreparedMergeMethod implementations ``prepare`` already yields the
+    weighted direction; plain methods are merged at alpha=1.0 and the base is
+    subtracted back out. The result feeds ``rebased_deltas=[direction] * n`` so
+    the existing per-task sweep machinery evaluates the same merged model.
+    """
+    merge_method = get_merge_method(merge_method_name)
+    tuned = _pseudo_tuned(base_sd, deltas)
+    method_kwargs = dict(merge_params)
+
+    if isinstance(merge_method, PreparedMergeMethod):
+        _prepared_base, direction = merge_method.prepare(
+            base=base_sd,
+            tuned=tuned,
+            weights=list(weights),
+            **method_kwargs,
+        )
+        return dict(direction)
+
+    merged = merge_method.merge(base=base_sd, tuned=tuned, weights=list(weights), **method_kwargs)
+    return {k: v - base_sd[k] for k, v in merged.items() if k in base_sd}
 
 
 def main() -> None:

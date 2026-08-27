@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+import pytest
+import torch
+
+from merge_and_rebase.eval.vision_rebase import (
+    _merge_direction,
+    _pseudo_tuned,
+    _resolve_merge_mode_config,
+)
+
+
+def _sd(*values: float) -> dict[str, torch.Tensor]:
+    return {"w": torch.tensor(list(values))}
+
+
+def _approx(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> bool:
+    return set(a) == set(b) and all(torch.allclose(a[k], b[k]) for k in a)
+
+
+def test_pseudo_tuned_adds_each_delta_to_base() -> None:
+    base = _sd(1.0, 2.0, 3.0)
+    deltas = [
+        {"w": torch.tensor([1.0, 1.0, 1.0])},
+        {"w": torch.tensor([-2.0, 0.0, 2.0])},
+    ]
+    tuned = _pseudo_tuned(base, deltas)
+    assert len(tuned) == 2
+    assert torch.allclose(tuned[0]["w"], torch.tensor([2.0, 3.0, 4.0]))
+    assert torch.allclose(tuned[1]["w"], torch.tensor([-1.0, 2.0, 5.0]))
+
+
+def test_merge_direction_matches_manual_weighted_sum() -> None:
+    base = _sd(1.0, 2.0, 3.0)
+    d1 = {"w": torch.tensor([1.0, 1.0, 1.0])}
+    d2 = {"w": torch.tensor([-2.0, 0.0, 2.0])}
+    direction = _merge_direction(
+        base_sd=base,
+        deltas=[d1, d2],
+        merge_method_name="task_arithmetic",
+        weights=[2.0, 0.5],
+        merge_params={},
+    )
+    assert torch.allclose(direction["w"], 2.0 * d1["w"] + 0.5 * d2["w"])
+
+
+def test_merge_direction_zero_weight_task_excluded() -> None:
+    base = _sd(1.0)
+    d1 = {"w": torch.tensor([5.0])}
+    d2 = {"w": torch.tensor([-3.0])}
+    direction = _merge_direction(
+        base_sd=base,
+        deltas=[d1, d2],
+        merge_method_name="task_arithmetic",
+        weights=[1.0, 0.0],
+        merge_params={},
+    )
+    assert torch.allclose(direction["w"], torch.tensor([5.0]))
+
+
+def test_plain_merge_method_path_yields_same_direction() -> None:
+    """A merge()-only method (no prepare) must produce the same direction."""
+    from merge_and_rebase.merge.registry import get_method
+
+    task_arith = get_method("task_arithmetic")
+
+    class PlainTaskArithmeticStub:
+        def merge(self, *, base, tuned, weights=None, alpha=1.0, **kwargs):
+            return task_arith.merge(base=base, tuned=tuned, weights=weights, alpha=alpha, **kwargs)
+
+    base = _sd(1.0, -1.0)
+    deltas = [{"w": torch.tensor([1.0, 2.0])}, {"w": torch.tensor([0.5, -1.0])}]
+    weights = [1.0, 1.0]
+
+    # Force the non-prepared branch by wrapping through the stub's own math.
+    tuned = _pseudo_tuned(base, deltas)
+    merged = PlainTaskArithmeticStub().merge(base=base, tuned=tuned, weights=weights)
+    plain_direction = {k: v - base[k] for k, v in merged.items() if k in base}
+
+    direction_registry = _merge_direction(
+        base_sd=base,
+        deltas=list(deltas),
+        merge_method_name="task_arithmetic",
+        weights=weights,
+        merge_params={},
+    )
+    assert _approx(direction_registry, plain_direction)
+
+
+def _identity_transport(deltas: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
+    return [dict(d) for d in deltas]
+
+
+def test_modes_equivalent_for_linear_transport_and_task_arithmetic() -> None:
+    """rebase_then_merge vs merge_then_rebase coincide for linear transports."""
+    source_base = _sd(0.0, 0.0, 0.0)
+    target_base = _sd(10.0, 10.0, 10.0)
+    deltas = [
+        {"w": torch.tensor([1.0, 2.0, 3.0])},
+        {"w": torch.tensor([-1.0, 0.5, 2.0])},
+        {"w": torch.tensor([0.25, -0.75, 1.0])},
+    ]
+    weights = [1.0, 0.5, 2.0]
+
+    transported = _identity_transport(deltas)
+    rebase_then_merge_dir = _merge_direction(
+        base_sd=target_base,
+        deltas=transported,
+        merge_method_name="task_arithmetic",
+        weights=weights,
+        merge_params={},
+    )
+
+    merged_source_dir = _merge_direction(
+        base_sd=source_base,
+        deltas=list(deltas),
+        merge_method_name="task_arithmetic",
+        weights=weights,
+        merge_params={},
+    )
+    merge_then_rebase_dir = _identity_transport([merged_source_dir])[0]
+
+    assert set(rebase_then_merge_dir) == set(merge_then_rebase_dir)
+    for key in rebase_then_merge_dir:
+        assert torch.allclose(rebase_then_merge_dir[key], merge_then_rebase_dir[key])
+
+
+def _prune_top1_transport(deltas: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
+    """Nonlinear transport: keep only each delta's largest-magnitude entry."""
+    out: list[dict[str, torch.Tensor]] = []
+    for d in deltas:
+        v = d["w"]
+        idx = int(torch.argmax(v.abs()))
+        pruned = torch.zeros_like(v)
+        pruned[idx] = v[idx]
+        out.append({"w": pruned})
+    return out
+
+
+def test_modes_diverge_for_nonlinear_transport_and_ties() -> None:
+    """Disjoint pruning + ties (sign/top-k nonlinearities) breaks mode equivalence."""
+    source_base = _sd(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    target_base = _sd(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    deltas = [
+        {"w": torch.tensor([100.0, -40.0, 30.0, -20.0, 10.0, -5.0])},   # dominant coord 0
+        {"w": torch.tensor([30.0, 90.0, -45.0, 25.0, -15.0, 8.0])},     # dominant coord 1
+        {"w": torch.tensor([-25.0, 35.0, 80.0, -50.0, 12.0, -7.0])},    # dominant coord 2
+    ]
+    weights = [1.0, 1.0, 1.0]
+    merge_kwargs = dict(merge_method_name="ties_merge", weights=weights, merge_params={})
+
+    rebase_then_merge_dir = _merge_direction(
+        base_sd=target_base,
+        deltas=_prune_top1_transport(deltas),
+        **merge_kwargs,  # type: ignore[arg-type]
+    )
+    pre_merged = _merge_direction(
+        base_sd=source_base,
+        deltas=list(deltas),
+        **merge_kwargs,  # type: ignore[arg-type]
+    )
+    merge_then_rebase_dir = _prune_top1_transport([pre_merged])[0]
+
+    assert set(rebase_then_merge_dir) == set(merge_then_rebase_dir) == {"w"}
+    # Post-pruning each task keeps a single distinct coordinate, so the merged
+    # direction is supported on exactly {0, 1, 2}; merging before pruning keeps
+    # magnitude information of all six coordinates (topk=1.0 retains them and
+    # resolves signs across tasks). The two orderings cannot coincide here.
+    post_support = int((rebase_then_merge_dir["w"].abs() > 0).sum())
+    pre_support = int((merge_then_rebase_dir["w"].abs() > 0).sum())
+    assert post_support < 6, f"expected sparse post-direction, got support {post_support}"
+    assert not torch.allclose(rebase_then_merge_dir["w"], merge_then_rebase_dir["w"])
+
+
+def test_resolve_merge_mode_config_defaults() -> None:
+    mode, name, params = _resolve_merge_mode_config({}, "shared")
+    assert (mode, name, params) == ("none", "task_arithmetic", {})
+
+
+def test_resolve_merge_mode_config_reads_keys() -> None:
+    cfg = {
+        "merge_mode": "rebase_then_merge",
+        "merge_method": "ties_merge",
+        "merge_params": {"merging_type": "sum"},
+    }
+    mode, name, params = _resolve_merge_mode_config(cfg, "shared")
+    assert (mode, name, params) == ("rebase_then_merge", "ties_merge", {"merging_type": "sum"})
+
+
+@pytest.mark.parametrize("bad_mode", ["merge", "rebase_then", "", "bogus"])
+def test_resolve_merge_mode_config_rejects_unknown_mode(bad_mode: str) -> None:
+    with pytest.raises(ValueError, match="merge_mode"):
+        _resolve_merge_mode_config({"merge_mode": bad_mode}, "shared")
+
+
+def test_resolve_merge_mode_config_rejects_per_task_alpha() -> None:
+    with pytest.raises(ValueError, match="alpha_selection"):
+        _resolve_merge_mode_config({"merge_mode": "rebase_then_merge"}, "per_task")
+
+
+def test_resolve_merge_mode_config_rejects_unknown_merge_method() -> None:
+    with pytest.raises(KeyError, match="no_such_merge"):
+        _resolve_merge_mode_config({"merge_mode": "none", "merge_method": "no_such_merge"}, "shared")
+
+
+def test_resolve_merge_mode_config_rejects_non_dict_params() -> None:
+    with pytest.raises(ValueError, match="merge_params"):
+        _resolve_merge_mode_config({"merge_mode": "merge_then_rebase", "merge_params": [1, 2]}, "shared")
