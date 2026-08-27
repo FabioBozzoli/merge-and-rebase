@@ -5,6 +5,7 @@ import itertools
 import os
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,73 @@ def _norm_acc(result_acc: float, baseline_acc: float) -> float:
 def _average_defined(values: list[float]) -> float:
     defined = [float(v) for v in values if float(v) == float(v)]
     return average_scores(defined) if defined else float("nan")
+
+
+@dataclass(frozen=True)
+class _TaskContext:
+    loaders: Any
+    source_loaders: Any | None
+    classnames: list[str]
+    build_cfg_task: OpenClipBuildConfig
+    source_build_cfg_task: OpenClipBuildConfig
+
+
+def _build_task_context(
+    task: str,
+    *,
+    suite: Any,
+    cfg: dict[str, Any],
+    clf_target: OpenClipClassifier,
+    clf_source: OpenClipClassifier,
+    source_cfg: OpenClipBuildConfig,
+    target_cfg: OpenClipBuildConfig,
+    use_humanized_classnames: bool,
+    need_source_loaders: bool,
+) -> _TaskContext:
+    hf_path, hf_config, split_map = suite.resolver(task)
+    hf_ds = load_hf_splits(hf_path, config=hf_config, requested_splits=tuple(dict.fromkeys(split_map.values())))
+
+    loader_kwargs = dict(
+        hf_ds=hf_ds,
+        hf_path=hf_path,
+        ft_epochs=1,
+        split_map=split_map,
+        batch_size=int(cfg.get("batch_size", 128)),
+        num_workers=int(cfg.get("num_workers", 6)),
+        pin_memory=True,
+        val_fraction=float(cfg.get("val_fraction", 0.1)),
+        seed=int(cfg.get("seed", 42)),
+    )
+    loaders = build_vision_loaders(preprocess=clf_target.preprocess, **loader_kwargs)
+
+    classnames = list(loaders.classnames)
+    if use_humanized_classnames:
+        classnames = [humanize(c) for c in classnames]
+
+    templates = get_templates(task)
+    if not templates:
+        raise ValueError(f"get_templates('{task}') returned empty list")
+
+    def _build_cfg_for(build: OpenClipBuildConfig) -> OpenClipBuildConfig:
+        return OpenClipBuildConfig(
+            model_name=build.model_name,
+            pretrained=build.pretrained,
+            device=build.device,
+            dtype=build.dtype,
+            prompt_templates=templates,
+        )
+
+    return _TaskContext(
+        loaders=loaders,
+        source_loaders=(
+            build_vision_loaders(preprocess=clf_source.preprocess, **loader_kwargs)
+            if need_source_loaders
+            else None
+        ),
+        classnames=classnames,
+        build_cfg_task=_build_cfg_for(target_cfg),
+        source_build_cfg_task=_build_cfg_for(source_cfg),
+    )
 
 
 def main() -> None:
@@ -455,44 +523,21 @@ def main() -> None:
         transfusion_prepared: dict[str, Any] | None = None
 
         for task in tasks:
-            hf_path, hf_config, split_map = suite.resolver(task)
-            hf_ds = load_hf_splits(hf_path, config=hf_config, requested_splits=tuple(dict.fromkeys(split_map.values())))
-
-            loaders = build_vision_loaders(
-                hf_ds=hf_ds,
-                hf_path=hf_path,
-                preprocess=clf_target.preprocess,
-                ft_epochs=1,
-                split_map=split_map,
-                batch_size=int(cfg.get("batch_size", 128)),
-                num_workers=int(cfg.get("num_workers", 6)),
-                pin_memory=True,
-                val_fraction=float(cfg.get("val_fraction", 0.1)),
-                seed=int(cfg.get("seed", 42)),
+            task_ctx = _build_task_context(
+                task,
+                suite=suite,
+                cfg=cfg,
+                clf_target=clf_target,
+                clf_source=clf_source,
+                source_cfg=source_cfg,
+                target_cfg=target_cfg,
+                use_humanized_classnames=use_humanized_classnames,
+                need_source_loaders=bool(theseus_like_method or transfusion_mode or bico_mode),
             )
-
-            classnames = list(loaders.classnames)
-            if use_humanized_classnames:
-                classnames = [humanize(c) for c in classnames]
-
-            templates = get_templates(task)
-            if not templates:
-                raise ValueError(f"get_templates('{task}') returned empty list")
-
-            build_cfg_task = OpenClipBuildConfig(
-                model_name=target_cfg.model_name,
-                pretrained=target_cfg.pretrained,
-                device=target_cfg.device,
-                dtype=target_cfg.dtype,
-                prompt_templates=templates,
-            )
-            source_build_cfg_task = OpenClipBuildConfig(
-                model_name=source_cfg.model_name,
-                pretrained=source_cfg.pretrained,
-                device=source_cfg.device,
-                dtype=source_cfg.dtype,
-                prompt_templates=templates,
-            )
+            loaders = task_ctx.loaders
+            classnames = task_ctx.classnames
+            build_cfg_task = task_ctx.build_cfg_task
+            source_build_cfg_task = task_ctx.source_build_cfg_task
 
             per_task.append(
                 {
@@ -503,20 +548,7 @@ def main() -> None:
                 }
             )
 
-            source_loaders = None
-            if theseus_like_method or transfusion_mode or bico_mode:
-                source_loaders = build_vision_loaders(
-                    hf_ds=hf_ds,
-                    hf_path=hf_path,
-                    preprocess=clf_source.preprocess,
-                    ft_epochs=1,
-                    split_map=split_map,
-                    batch_size=int(cfg.get("batch_size", 128)),
-                    num_workers=int(cfg.get("num_workers", 6)),
-                    pin_memory=True,
-                    val_fraction=float(cfg.get("val_fraction", 0.1)),
-                    seed=int(cfg.get("seed", 42)),
-                )
+            source_loaders = task_ctx.source_loaders
 
             task_source_base_sd = source_base_sd
 
