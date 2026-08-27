@@ -18,7 +18,6 @@ from merge_and_rebase.hyperparam_search import (
 )
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
-from ..alpha_search import average_scores
 from ..cli_args import (
     add_alpha_args,
     add_config_arg,
@@ -128,25 +127,6 @@ def _build_text_calibration_loader(
         drop_last=False,
         collate_fn=_collate,
     )
-
-
-def _scale_delta(delta: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
-    w = float(weight)
-    if w == 1.0:
-        return delta
-    return {k: v * w for k, v in delta.items()}
-
-
-def _norm_acc(result_acc: float, baseline_acc: float) -> float:
-    baseline_acc = float(baseline_acc)
-    if baseline_acc != baseline_acc or baseline_acc <= 0.0:
-        return float("nan")
-    return float(result_acc) / baseline_acc
-
-
-def _average_defined(values: list[float]) -> float:
-    defined = [float(v) for v in values if float(v) == float(v)]
-    return average_scores(defined) if defined else float("nan")
 
 
 def main() -> None:
