@@ -363,7 +363,7 @@ def main() -> None:
         print(f"Capability check passed for {method_name}")
 
         # Block extension config
-        blockext_like_method = method_name in {"theseus", "bico", "delta_theseus", "delta_bico"}
+        blockext_like_method = method_name in {"theseus", "bico"}
         if "block_extension_enabled" not in cfg:
             cfg["block_extension_enabled"] = True
         block_extension_enabled, block_extension_cfg = resolve_block_extension_config(cfg)
@@ -576,7 +576,7 @@ def main() -> None:
             print(f"\n--- '{label}' ({idx + 1}/{len(task_deltas)}) ---")
             t0 = time.time()
 
-            if method_name in ("theseus", "bico", "delta_theseus", "delta_bico") and transport_keys:
+            if method_name in ("theseus", "bico") and transport_keys:
                 # Hybrid: transport body keys, identity-pass the rest
                 body_delta = {k: v for k, v in delta.items() if k in transport_keys}
                 passthrough_delta = {k: v for k, v in delta.items() if k not in transport_keys}
@@ -616,7 +616,6 @@ def main() -> None:
 
                     transport_kwargs.setdefault("seq_align", "interpolate")
                     transport_kwargs.setdefault("n_batches", 2)
-                    curvature_mode = str(transport_kwargs.get("curvature_mode", "none")).strip().lower()
                     transported_body = method.transport(
                         source_base=source_base_sd,
                         target_base=target_base_sd,
@@ -628,7 +627,7 @@ def main() -> None:
                         target_dataloader=target_calib,
                         source_recipe=causal_lm_recipe(device=device),
                         target_recipe=causal_lm_recipe(device=device),
-                        curvature_dataloader=(target_calib if curvature_mode != "none" and method_name in ("delta_theseus", "delta_bico") else None),
+                        curvature_dataloader=None,
                         family_adapter=family_adapter,
                         device=device,
                         **transport_kwargs,
