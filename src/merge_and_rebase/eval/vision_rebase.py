@@ -39,6 +39,7 @@ from ..io.peft_helpers import normalize_attn_patch_cfg
 from ..merge.base import PreparedMergeMethod
 from ..merge.methods._common import axpy_state_dict
 from ..merge.registry import get_method as get_merge_method
+from ..merge.registry import list_methods as list_merge_methods
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
@@ -288,6 +289,126 @@ def _merge_direction(
     return {k: v - base_sd[k] for k, v in merged.items() if k in base_sd}
 
 
+def _build_rebase_prepared(
+    *,
+    method_name: str,
+    method: Any,
+    method_params: dict[str, Any],
+    cfg: dict[str, Any],
+    device: str,
+    grad_batch_size: int | None,
+    grad_imgs_per_class: int | None,
+    grad_num_batches: int | None,
+    theseus_like_method: bool,
+    bico_mode: bool,
+    run_block_extension_prestep: bool,
+    clf_source: OpenClipClassifier,
+    clf_target: OpenClipClassifier,
+    classnames: list[str],
+    loaders: Any,
+    source_loaders: Any,
+    build_cfg_task: OpenClipBuildConfig,
+    source_build_cfg_task: OpenClipBuildConfig,
+    task_source_base_sd: dict[str, torch.Tensor],
+    target_base_sd: dict[str, torch.Tensor],
+    task_delta: dict[str, torch.Tensor],
+    source_base_model_task: torch.nn.Module | None,
+    transfusion_prepared: dict[str, Any] | None,
+) -> Any:
+    """Compute the rebase method's prepared state for one task context.
+
+    Shared by the per-task transport path and by merge_then_rebase's single
+    post-composition transport. Note that theseus/bico use ``task_delta`` for
+    key filtering and shape handling only — values never affect the prepared
+    transforms.
+    """
+    if method_name == "gradfix":
+        from ..eval.utils import build_grad_dataloader
+        from ..models.grad_recipes import clip_contrastive_recipe
+
+        grad_loader = build_grad_dataloader(
+            loaders.train,
+            loaders.train.dataset,
+            grad_batch_size=grad_batch_size,
+            grad_imgs_per_class=grad_imgs_per_class,
+            grad_num_batches=grad_num_batches,
+            num_workers=int(cfg.get("num_workers", 6)),
+            seed=int(cfg.get("seed", 42)),
+        )
+        recipe = clip_contrastive_recipe(
+            clf_target,
+            classnames,
+            build_cfg_task,
+            device=device,
+            reduction="none" if str(method_params.get("vote", "mean")) in {"majority", "max"} else "mean",
+        )
+        return method.prepare(
+            target_model=clf_target.model,
+            target_dataloader=grad_loader,
+            recipe=recipe,
+            device=device,
+            **method_params,
+        )
+
+    if theseus_like_method:
+        source_model_for_theseus = deepcopy(clf_source.model)
+        target_model_for_theseus = deepcopy(clf_target.model)
+        load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
+        load_into_model(target_model_for_theseus, target_base_sd, strict=False)
+
+        return method.prepare(
+            source_model=source_model_for_theseus,
+            target_model=target_model_for_theseus,
+            source_dataloader=source_loaders.train,
+            target_dataloader=loaders.train,
+            target_base=target_base_sd,
+            delta=task_delta,
+            device=device,
+            **method_params,
+        )
+
+    if bico_mode:
+        from ..models.grad_recipes import clip_contrastive_recipe
+
+        if run_block_extension_prestep and source_base_model_task is not None:
+            source_model_for_bico = source_base_model_task
+        else:
+            source_model_for_bico = deepcopy(clf_source.model)
+            load_into_model(source_model_for_bico, task_source_base_sd, strict=False)
+        target_model_for_bico = deepcopy(clf_target.model)
+        load_into_model(target_model_for_bico, target_base_sd, strict=False)
+
+        source_recipe = clip_contrastive_recipe(
+            clf_source,
+            classnames,
+            source_build_cfg_task,
+            device=device,
+        )
+        target_recipe = clip_contrastive_recipe(
+            clf_target,
+            classnames,
+            build_cfg_task,
+            device=device,
+        )
+
+        prepared = method.prepare(
+            source_model=source_model_for_bico,
+            target_model=target_model_for_bico,
+            source_dataloader=source_loaders.train,
+            target_dataloader=loaders.train,
+            source_recipe=source_recipe,
+            target_recipe=target_recipe,
+            target_base=target_base_sd,
+            delta=task_delta,
+            device=device,
+            **method_params,
+        )
+        del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
+        return prepared
+
+    return transfusion_prepared
+
+
 def main() -> None:
     run_logger = None
     try:
@@ -315,6 +436,15 @@ def main() -> None:
         p.add_argument("--strict-load", action="store_true", default=None)
         p.add_argument("--method", type=str, choices=list_methods(), default=None)
         p.add_argument("--method-params", type=str, default=None, help="JSON object for rebase-method kwargs.")
+        p.add_argument(
+            "--merge-mode",
+            type=str,
+            choices=["none", "rebase_then_merge", "merge_then_rebase"],
+            default=None,
+            help="Compose task deltas into one merged model instead of (or after) per-task transport.",
+        )
+        p.add_argument("--merge-method", type=str, choices=list_merge_methods(), default=None)
+        p.add_argument("--merge-params", type=str, default=None, help="JSON object for merge-method kwargs.")
 
         p.add_argument("--mask-mode", type=str, default=None, choices=["normal", "force"])
         p.add_argument("--vote", type=str, default=None, choices=["mean", "majority", "max"])
@@ -358,6 +488,7 @@ def main() -> None:
 
         args = p.parse_args()
         method_params_cli = parse_json_object_arg(args.method_params, arg_name="--method-params")
+        merge_params_cli = parse_json_object_arg(args.merge_params, arg_name="--merge-params")
         block_extension_params_cli = parse_json_object_arg(
             args.block_extension_params,
             arg_name="--block-extension-params",
@@ -393,6 +524,9 @@ def main() -> None:
             "grad_num_batches": args.grad_num_batches,
             "alpha_search": getattr(args, "alpha_search", None),
             "alpha_selection": getattr(args, "alpha_selection", None),
+            "merge_mode": args.merge_mode,
+            "merge_method": args.merge_method,
+            "merge_params": merge_params_cli,
             "alpha_patience": args.alpha_patience,
             "alpha_search_split": args.alpha_search_split,
             "alpha_min": args.alpha_min,
@@ -461,6 +595,8 @@ def main() -> None:
         alpha_selection = str(cfg.get("alpha_selection", "shared")).strip().lower()
         if alpha_selection not in {"shared", "per_task"}:
             raise ValueError("alpha_selection must be one of: shared, per_task")
+
+        merge_mode, merge_method_name, merge_params = _resolve_merge_mode_config(cfg, alpha_selection)
 
         positive_alphas = [float(alpha) for alpha in alphas if float(alpha) > 0.0]
         if alpha_search and not positive_alphas:
@@ -533,6 +669,13 @@ def main() -> None:
         run_block_extension_prestep = bool(
             blockext_like_method and block_extension_enabled and source_depth != target_depth
         )
+        if merge_mode == "merge_then_rebase" and run_block_extension_prestep:
+            raise NotImplementedError(
+                "merge_then_rebase does not support the block-extension prestep yet: "
+                "per-task extended source bases live on different keyspaces and cannot be "
+                "merged without a consensus-base step (see transport_then_merge). "
+                "Use merge_mode='rebase_then_merge' for depth-mismatch pairs."
+            )
         if blockext_like_method:
             if run_block_extension_prestep:
                 print(
@@ -609,6 +752,7 @@ def main() -> None:
             classnames = task_ctx.classnames
             build_cfg_task = task_ctx.build_cfg_task
             source_build_cfg_task = task_ctx.source_build_cfg_task
+            source_loaders = task_ctx.source_loaders
 
             per_task.append(
                 {
@@ -616,10 +760,10 @@ def main() -> None:
                     "loaders": loaders,
                     "classnames": classnames,
                     "build_cfg_task": build_cfg_task,
+                    "source_loaders": source_loaders,
+                    "source_build_cfg_task": source_build_cfg_task,
                 }
             )
-
-            source_loaders = task_ctx.source_loaders
 
             task_source_base_sd = source_base_sd
 
@@ -849,157 +993,200 @@ def main() -> None:
                 print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
-            if torch.cuda.is_available() and device != "cpu":
-                torch.cuda.reset_peak_memory_stats()
-            prepare_started = time.perf_counter()
+            if merge_mode != "merge_then_rebase":
+                if torch.cuda.is_available() and device != "cpu":
+                    torch.cuda.reset_peak_memory_stats()
+                prepare_started = time.perf_counter()
 
-            if method_name == "gradfix":
-                from ..eval.utils import build_grad_dataloader
-                from ..models.grad_recipes import clip_contrastive_recipe
-
-                grad_loader = build_grad_dataloader(
-                    loaders.train,
-                    loaders.train.dataset,
+                prepared = _build_rebase_prepared(
+                    method_name=method_name,
+                    method=method,
+                    method_params=method_params,
+                    cfg=cfg,
+                    device=device,
                     grad_batch_size=grad_batch_size,
                     grad_imgs_per_class=grad_imgs_per_class,
                     grad_num_batches=grad_num_batches,
-                    num_workers=int(cfg.get("num_workers", 6)),
-                    seed=int(cfg.get("seed", 42)),
+                    theseus_like_method=theseus_like_method,
+                    bico_mode=bico_mode,
+                    run_block_extension_prestep=run_block_extension_prestep,
+                    clf_source=clf_source,
+                    clf_target=clf_target,
+                    classnames=classnames,
+                    loaders=loaders,
+                    source_loaders=source_loaders,
+                    build_cfg_task=build_cfg_task,
+                    source_build_cfg_task=source_build_cfg_task,
+                    task_source_base_sd=task_source_base_sd,
+                    target_base_sd=target_base_sd,
+                    task_delta=task_delta,
+                    source_base_model_task=source_base_model_task,
+                    transfusion_prepared=transfusion_prepared,
                 )
-                recipe = clip_contrastive_recipe(
-                    clf_target,
-                    classnames,
-                    build_cfg_task,
-                    device=device,
-                    reduction="none" if str(method_params.get("vote", "mean")) in {"majority", "max"} else "mean",
-                )
-                prepared = method.prepare(
-                    target_model=clf_target.model,
-                    target_dataloader=grad_loader,
-                    recipe=recipe,
-                    device=device,
-                    **method_params,
-                )
-            elif theseus_like_method:
-                source_model_for_theseus = deepcopy(clf_source.model)
-                target_model_for_theseus = deepcopy(clf_target.model)
-                load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
-                load_into_model(target_model_for_theseus, target_base_sd, strict=False)
 
-                prepared = method.prepare(
-                    source_model=source_model_for_theseus,
-                    target_model=target_model_for_theseus,
-                    source_dataloader=source_loaders.train,
-                    target_dataloader=loaders.train,
-                    target_base=target_base_sd,
-                    delta=task_delta,
-                    device=device,
-                    **method_params,
-                )
-            elif bico_mode:
-                from ..models.grad_recipes import clip_contrastive_recipe
-
-                if run_block_extension_prestep and source_base_model_task is not None:
-                    source_model_for_bico = source_base_model_task
+                prepare_seconds = time.perf_counter() - prepare_started
+                if torch.cuda.is_available() and device != "cpu":
+                    torch.cuda.synchronize()
+                    peak_memory_bytes = float(torch.cuda.max_memory_allocated())
                 else:
-                    source_model_for_bico = deepcopy(clf_source.model)
-                    load_into_model(source_model_for_bico, task_source_base_sd, strict=False)
-                target_model_for_bico = deepcopy(clf_target.model)
-                load_into_model(target_model_for_bico, target_base_sd, strict=False)
+                    peak_memory_bytes = 0.0
 
-                source_recipe = clip_contrastive_recipe(
-                    clf_source,
-                    classnames,
-                    source_build_cfg_task,
-                    device=device,
-                )
-                target_recipe = clip_contrastive_recipe(
-                    clf_target,
-                    classnames,
-                    build_cfg_task,
-                    device=device,
-                )
-
-                prepared = method.prepare(
-                    source_model=source_model_for_bico,
-                    target_model=target_model_for_bico,
-                    source_dataloader=source_loaders.train,
-                    target_dataloader=loaders.train,
-                    source_recipe=source_recipe,
-                    target_recipe=target_recipe,
+                transport_started = time.perf_counter()
+                transported_delta = method.transport(
+                    source_base=task_source_base_sd,
                     target_base=target_base_sd,
                     delta=task_delta,
-                    device=device,
+                    strict=strict_load,
+                    prepared=prepared,
                     **method_params,
                 )
-                del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
-            else:
-                prepared = transfusion_prepared
-
-            prepare_seconds = time.perf_counter() - prepare_started
-            if torch.cuda.is_available() and device != "cpu":
-                torch.cuda.synchronize()
-                peak_memory_bytes = float(torch.cuda.max_memory_allocated())
-            else:
-                peak_memory_bytes = 0.0
-
-            transport_started = time.perf_counter()
-            transported_delta = method.transport(
-                source_base=task_source_base_sd,
-                target_base=target_base_sd,
-                delta=task_delta,
-                strict=strict_load,
-                prepared=prepared,
-                **method_params,
-            )
-            if torch.cuda.is_available() and device != "cpu":
-                torch.cuda.synchronize()
-            transport_timings[task] = {
-                "prepare_seconds": prepare_seconds,
-                "transport_seconds": time.perf_counter() - transport_started,
-                "peak_memory_allocated_bytes": peak_memory_bytes,
-            }
-            transported_deltas.append(transported_delta)
-            original_deltas.append(task_delta)
-            print(f"  {task}: transported delta computed for {len(transported_delta)} params")
-            run_logger.log_event(
-                "transport_task_end",
-                metrics={f"rebase/{task}/transported_param_count": float(len(transported_delta))},
-                context={"task": task, "method": method.name},
-            )
-
-            save_transport_dir = cfg.get("save_transported_tvs_dir", None)
-            if save_transport_dir:
-                os.makedirs(save_transport_dir, exist_ok=True)
-                native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
-                legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
-                legacy_no_conv1_path = os.path.join(
-                    save_transport_dir, f"{task}_{method.name}_transported_legacy_visual_no_conv1.pt"
+                if torch.cuda.is_available() and device != "cpu":
+                    torch.cuda.synchronize()
+                transport_timings[task] = {
+                    "prepare_seconds": prepare_seconds,
+                    "transport_seconds": time.perf_counter() - transport_started,
+                    "peak_memory_allocated_bytes": peak_memory_bytes,
+                }
+                transported_deltas.append(transported_delta)
+                original_deltas.append(task_delta)
+                print(f"  {task}: transported delta computed for {len(transported_delta)} params")
+                run_logger.log_event(
+                    "transport_task_end",
+                    metrics={f"rebase/{task}/transported_param_count": float(len(transported_delta))},
+                    context={"task": task, "method": method.name},
                 )
-                torch.save(to_cpu_fp32(transported_delta), native_path)
-                torch.save(_legacy_visual_delta(transported_delta), legacy_path)
-                torch.save(_legacy_visual_delta(transported_delta, drop_conv1=True), legacy_no_conv1_path)
-                print(f"  {task}: saved transported TV -> {native_path}")
-                print(f"  {task}: saved legacy visual TV -> {legacy_path}")
-                print(f"  {task}: saved legacy visual TV without conv1 -> {legacy_no_conv1_path}")
-                transported_artifacts[task] = [native_path, legacy_path, legacy_no_conv1_path]
 
-        rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
-        untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
-        print(f"Prepared {len(tasks)} transported deltas (task-independent alpha mode)")
+                save_transport_dir = cfg.get("save_transported_tvs_dir", None)
+                if save_transport_dir:
+                    os.makedirs(save_transport_dir, exist_ok=True)
+                    native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
+                    legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
+                    legacy_no_conv1_path = os.path.join(
+                        save_transport_dir, f"{task}_{method.name}_transported_legacy_visual_no_conv1.pt"
+                    )
+                    torch.save(to_cpu_fp32(transported_delta), native_path)
+                    torch.save(_legacy_visual_delta(transported_delta), legacy_path)
+                    torch.save(_legacy_visual_delta(transported_delta, drop_conv1=True), legacy_no_conv1_path)
+                    print(f"  {task}: saved transported TV -> {native_path}")
+                    print(f"  {task}: saved legacy visual TV -> {legacy_path}")
+                    print(f"  {task}: saved legacy visual TV without conv1 -> {legacy_no_conv1_path}")
+                    transported_artifacts[task] = [native_path, legacy_path, legacy_no_conv1_path]
+            else:
+                original_deltas.append(task_delta)
+                print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")
 
         can_eval_untransported_by_task: list[bool] = []
-        for task_name, delta_sd in zip(tasks, untransported_deltas, strict=True):
-            enabled, issues = _check_untransported_compatibility(target_base_sd, delta_sd)
-            can_eval_untransported_by_task.append(enabled)
-            if enabled:
-                print(f"Untransported baseline for '{task_name}': enabled.")
-            else:
-                print(f"Untransported baseline for '{task_name}': skipped (incompatible with target model).")
-                for msg in issues[:3]:
-                    print(f"  - {msg}")
-                if len(issues) > 3:
-                    print(f"  - ... and {len(issues) - 3} more incompatibilities")
+        if merge_mode == "none":
+            rebased_deltas = [_scale_delta(d, w) for d, w in zip(transported_deltas, merge_weights, strict=True)]
+            untransported_deltas = [_scale_delta(d, w) for d, w in zip(original_deltas, merge_weights, strict=True)]
+            print(f"Prepared {len(tasks)} transported deltas (task-independent alpha mode)")
+
+            for task_name, delta_sd in zip(tasks, untransported_deltas, strict=True):
+                enabled, issues = _check_untransported_compatibility(target_base_sd, delta_sd)
+                can_eval_untransported_by_task.append(enabled)
+                if enabled:
+                    print(f"Untransported baseline for '{task_name}': enabled.")
+                else:
+                    print(f"Untransported baseline for '{task_name}': skipped (incompatible with target model).")
+                    for msg in issues[:3]:
+                        print(f"  - {msg}")
+                    if len(issues) > 3:
+                        print(f"  - ... and {len(issues) - 3} more incompatibilities")
+        elif merge_mode == "rebase_then_merge":
+            merged_direction = _merge_direction(
+                base_sd=target_base_sd,
+                deltas=transported_deltas,
+                merge_method_name=merge_method_name,
+                weights=merge_weights,
+                merge_params=merge_params,
+            )
+            print(
+                f"Merge mode '{merge_mode}' ({merge_method_name}): composed {len(transported_deltas)} "
+                f"transported deltas -> merged direction with {len(merged_direction)} params"
+            )
+            run_logger.log_event(
+                "merge_composition_end",
+                metrics={"merge/param_count": float(len(merged_direction))},
+                context={
+                    "mode": merge_mode,
+                    "merge_method": merge_method_name,
+                    "merge_params": merge_params,
+                    "n_tasks": len(transported_deltas),
+                },
+            )
+            # One shared merged model: every task evaluates the same direction at alpha.
+            rebased_deltas = [merged_direction] * len(tasks)
+            untransported_deltas = original_deltas
+        else:  # merge_then_rebase
+            merged_source_direction = _merge_direction(
+                base_sd=source_base_sd,
+                deltas=original_deltas,
+                merge_method_name=merge_method_name,
+                weights=merge_weights,
+                merge_params=merge_params,
+            )
+            first_item = per_task[0]
+            prepared_once = _build_rebase_prepared(
+                method_name=method_name,
+                method=method,
+                method_params=method_params,
+                cfg=cfg,
+                device=device,
+                grad_batch_size=grad_batch_size,
+                grad_imgs_per_class=grad_imgs_per_class,
+                grad_num_batches=grad_num_batches,
+                theseus_like_method=theseus_like_method,
+                bico_mode=bico_mode,
+                run_block_extension_prestep=run_block_extension_prestep,
+                clf_source=clf_source,
+                clf_target=clf_target,
+                classnames=list(first_item["classnames"]),
+                loaders=first_item["loaders"],
+                source_loaders=first_item["source_loaders"],
+                build_cfg_task=first_item["build_cfg_task"],
+                source_build_cfg_task=first_item["source_build_cfg_task"],
+                task_source_base_sd=source_base_sd,
+                target_base_sd=target_base_sd,
+                task_delta=merged_source_direction,
+                source_base_model_task=None,
+                transfusion_prepared=transfusion_prepared,
+            )
+            transport_started = time.perf_counter()
+            transported_merged_delta = method.transport(
+                source_base=source_base_sd,
+                target_base=target_base_sd,
+                delta=merged_source_direction,
+                strict=strict_load,
+                prepared=prepared_once,
+                **method_params,
+            )
+            transport_seconds = time.perf_counter() - transport_started
+            print(
+                f"Merge mode '{merge_mode}' ({merge_method_name}): merged on source -> single transport in "
+                f"{transport_seconds:.2f}s ({len(transported_merged_delta)} params)"
+            )
+            run_logger.log_event(
+                "merge_composition_end",
+                metrics={
+                    "merge/param_count": float(len(transported_merged_delta)),
+                    "merge/single_transport_seconds": float(transport_seconds),
+                },
+                context={
+                    "mode": merge_mode,
+                    "merge_method": merge_method_name,
+                    "merge_params": merge_params,
+                    "n_tasks": len(original_deltas),
+                    "calibration_task": str(first_item["task"]),
+                },
+            )
+            rebased_deltas = [transported_merged_delta] * len(tasks)
+            untransported_deltas = original_deltas
+
+        if merge_mode != "none":
+            # The per-task "untransported" baseline is meaningless for a single
+            # merged model; fall back to the (alpha-independent, cached) target
+            # zero-shot baseline so normalized ratios remain defined.
+            can_eval_untransported_by_task = [False] * len(tasks)
 
         def _eval_task(item: dict[str, Any], split: str) -> float:
             return float(
@@ -1376,15 +1563,32 @@ def main() -> None:
 
         saved_merged_path: str | None = None
         if cfg.get("save_merged"):
-            print(
-                "save_merged was requested, but task-independent alpha mode does not produce a single merged checkpoint; skipping save."
-            )
+            if merge_mode == "none":
+                print(
+                    "save_merged was requested, but task-independent alpha mode does not produce a single merged checkpoint; skipping save."
+                )
+            else:
+                best_merged_state = axpy_state_dict(
+                    target_base_sd,
+                    rebased_deltas[0],
+                    alpha=float(best_alpha),
+                )
+                out_path = str(cfg["save_merged"])
+                out_parent = Path(out_path).parent
+                if str(out_parent):
+                    out_parent.mkdir(parents=True, exist_ok=True)
+                torch.save(to_cpu_fp32(best_merged_state), out_path)
+                saved_merged_path = out_path
+                print(f"Saved merged model (alpha={best_alpha:.3f}) -> {out_path}")
 
         final_summary = {
             "suite": suite_name,
             "tasks": tasks,
             "method": method.name,
             "method_label": method_label,
+            "merge_mode": merge_mode,
+            "merge_method": merge_method_name if merge_mode != "none" else None,
+            "merge_params": merge_params if merge_mode != "none" else None,
             "alpha_selection": alpha_selection,
             "best_alpha": float(best_alpha),
             "best_baseline_alpha": float(best_baseline_alpha),

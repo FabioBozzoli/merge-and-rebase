@@ -167,7 +167,6 @@ def test_modes_diverge_for_nonlinear_transport_and_ties() -> None:
     # magnitude information of all six coordinates (topk=1.0 retains them and
     # resolves signs across tasks). The two orderings cannot coincide here.
     post_support = int((rebase_then_merge_dir["w"].abs() > 0).sum())
-    pre_support = int((merge_then_rebase_dir["w"].abs() > 0).sum())
     assert post_support < 6, f"expected sparse post-direction, got support {post_support}"
     assert not torch.allclose(rebase_then_merge_dir["w"], merge_then_rebase_dir["w"])
 
