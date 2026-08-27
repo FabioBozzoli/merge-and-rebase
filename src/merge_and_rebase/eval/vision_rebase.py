@@ -29,6 +29,7 @@ from ..eval.utils import (
     eval_task_top1,
     humanize,
     patch_base_for_attn,
+    resolve_eval_split_loader,
     to_cpu_fp32,
 )
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model, resolve_ckpt_path
@@ -86,12 +87,6 @@ def _visual_only_filter(k: str, v: torch.Tensor) -> bool:
     return k.startswith("visual.")
 
 
-def _resolve_eval_loader(loaders_obj: Any, split: str):
-    if split == "val" and getattr(loaders_obj, "val", None) is not None:
-        return loaders_obj.val
-    return loaders_obj.test
-
-
 def _evaluate_source_model_top1(
     *,
     model: torch.nn.Module,
@@ -110,7 +105,7 @@ def _evaluate_source_model_top1(
         normalize=clf_source.normalize,
         logit_scale=clf_source.logit_scale,
     )
-    eval_loader = _resolve_eval_loader(loaders_obj, split)
+    eval_loader = resolve_eval_split_loader(loaders_obj, split)
     if first_n_batches is not None:
         eval_loader = itertools.islice(iter(eval_loader), max(1, int(first_n_batches)))
 

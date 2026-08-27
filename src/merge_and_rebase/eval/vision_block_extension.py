@@ -22,20 +22,12 @@ from ..cli_args import (
 )
 from ..data.templates import get_templates
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
-from ..eval.utils import humanize, to_cpu_fp32
+from ..eval.utils import humanize, resolve_eval_split_loader, to_cpu_fp32
 from ..io.ckpt import align_to_base_keys, load_ckpt, load_into_model
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..run_logging import default_summary_path, merge_logging_config, start_run
 from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
 from .datasets.vision8_14_20 import SUITES
-
-
-def _resolve_eval_loader(loaders: Any, split: str):
-    if split == "val":
-        return loaders.val
-    if split == "test":
-        return loaders.test
-    raise ValueError(f"Unknown split '{split}'. Expected one of: val, test.")
 
 
 def _evaluate_model_top1(
@@ -57,7 +49,7 @@ def _evaluate_model_top1(
         logit_scale=clf_source.logit_scale,
     )
 
-    eval_loader = _resolve_eval_loader(loaders, split)
+    eval_loader = resolve_eval_split_loader(loaders, split, strict=True)
     if first_n_batches is not None:
         eval_loader = itertools.islice(iter(eval_loader), max(1, int(first_n_batches)))
 
