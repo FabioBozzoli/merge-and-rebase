@@ -173,7 +173,7 @@ def main() -> None:
 
         # Eval
         add_tasks_arg(p, default=None, help_text=f"NLI tasks: {', '.join(NLI_TASKS)} or 'all'")
-        p.add_argument("--eval-mode", type=str, default=None, choices=["auto", "prompt", "head_logits", "nli"])
+        p.add_argument("--eval-mode", type=str, default=None, choices=["auto", "prompt", "head_logits"])
         p.add_argument("--split", type=str, default=None, choices=["train", "validation", "test"])
         p.add_argument("--max-samples-per-task", type=int, default=None)
         p.add_argument("--prompt-template", type=str, default=None)

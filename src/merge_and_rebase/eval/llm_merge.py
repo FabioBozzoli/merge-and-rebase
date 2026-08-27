@@ -1249,8 +1249,8 @@ def _build_hf_model_for_materialization(
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
     torch_dtype = dtype_map.get(build_cfg.dtype, None)
     arch = str(build_cfg.model_arch).strip().lower()
-    if arch not in {"llama", "t5", "auto"}:
-        raise ValueError("model_arch must be one of: llama, t5, auto")
+    if arch not in {"llama", "qwen", "t5", "auto"}:
+        raise ValueError("model_arch must be one of: llama, qwen, t5, auto")
     kind = str(build_cfg.model_kind).strip().lower()
     common = {
         "pretrained_model_name_or_path": build_cfg.model_name_or_path,
@@ -1359,7 +1359,7 @@ def main() -> None:
         "--model-arch",
         type=str,
         default=None,
-        choices=["llama", "t5", "auto"],
+        choices=["llama", "qwen", "t5", "auto"],
         help="Text model architecture family for loading/materialization.",
     )
     add_device_dtype_args(p, device_default=None, dtype_default=None)
