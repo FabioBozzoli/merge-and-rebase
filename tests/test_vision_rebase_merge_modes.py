@@ -7,6 +7,7 @@ from merge_and_rebase.eval.vision_rebase import (
     _merge_direction,
     _pseudo_tuned,
     _resolve_merge_mode_config,
+    _scale_deltas_by,
 )
 
 
@@ -172,8 +173,8 @@ def test_modes_diverge_for_nonlinear_transport_and_ties() -> None:
 
 
 def test_resolve_merge_mode_config_defaults() -> None:
-    mode, name, params = _resolve_merge_mode_config({}, "shared")
-    assert (mode, name, params) == ("none", "task_arithmetic", {})
+    mode, name, params, global_search = _resolve_merge_mode_config({}, "shared")
+    assert (mode, name, params, global_search) == ("none", "task_arithmetic", {}, True)
 
 
 def test_resolve_merge_mode_config_reads_keys() -> None:
@@ -181,9 +182,16 @@ def test_resolve_merge_mode_config_reads_keys() -> None:
         "merge_mode": "rebase_then_merge",
         "merge_method": "ties_merge",
         "merge_params": {"merging_type": "sum"},
+        "global_alpha_search": False,
     }
-    mode, name, params = _resolve_merge_mode_config(cfg, "shared")
-    assert (mode, name, params) == ("rebase_then_merge", "ties_merge", {"merging_type": "sum"})
+    mode, name, params, global_search = _resolve_merge_mode_config(cfg, "per_task")
+    assert (mode, name, params, global_search) == ("rebase_then_merge", "ties_merge", {"merging_type": "sum"}, False)
+
+
+def test_resolve_merge_mode_config_allows_hierarchical_per_task() -> None:
+    mode, _, _, global_search = _resolve_merge_mode_config({"merge_mode": "rebase_then_merge"}, "per_task")
+    assert mode == "rebase_then_merge"
+    assert global_search is True
 
 
 @pytest.mark.parametrize("bad_mode", ["merge", "rebase_then", "", "bogus"])
@@ -192,9 +200,56 @@ def test_resolve_merge_mode_config_rejects_unknown_mode(bad_mode: str) -> None:
         _resolve_merge_mode_config({"merge_mode": bad_mode}, "shared")
 
 
-def test_resolve_merge_mode_config_rejects_per_task_alpha() -> None:
-    with pytest.raises(ValueError, match="alpha_selection"):
-        _resolve_merge_mode_config({"merge_mode": "rebase_then_merge"}, "per_task")
+def test_resolve_merge_mode_config_rejects_per_task_alpha_for_merge_then_rebase() -> None:
+    with pytest.raises(ValueError, match="merge_then_rebase"):
+        _resolve_merge_mode_config({"merge_mode": "merge_then_rebase"}, "per_task")
+
+
+def test_resolve_merge_mode_config_rejects_non_bool_global_alpha_search() -> None:
+    with pytest.raises(ValueError, match="global_alpha_search"):
+        _resolve_merge_mode_config({"merge_mode": "rebase_then_merge", "global_alpha_search": "yes"}, "shared")
+
+
+def test_scale_deltas_by_scales_each_delta() -> None:
+    deltas = [{"w": torch.tensor([1.0, 2.0])}, {"w": torch.tensor([3.0, -4.0])}]
+    scaled = _scale_deltas_by(deltas, [0.5, 2.0])
+    assert torch.allclose(scaled[0]["w"], torch.tensor([0.5, 1.0]))
+    assert torch.allclose(scaled[1]["w"], torch.tensor([6.0, -8.0]))
+
+
+def test_scale_deltas_by_identity_alpha_returns_same_dicts() -> None:
+    deltas = [{"w": torch.tensor([1.0])}]
+    scaled = _scale_deltas_by(deltas, [1.0])
+    assert scaled[0] is deltas[0]
+
+
+def test_scale_deltas_by_length_mismatch_raises() -> None:
+    with pytest.raises(ValueError, match="same length"):
+        _scale_deltas_by([{"w": torch.tensor([1.0])}], [1.0, 2.0])
+
+
+def test_hierarchical_uniform_alpha_equals_scaled_merge() -> None:
+    """Uniform per-task alpha => merge(scaled deltas) == alpha * merge(deltas)."""
+    base = _sd(1.0, 1.0)
+    deltas = [{"w": torch.tensor([1.0, 2.0])}, {"w": torch.tensor([-0.5, 3.0])}]
+    weights = [1.0, 2.0]
+    alpha = 0.7
+
+    hier = _merge_direction(
+        base_sd=base,
+        deltas=_scale_deltas_by(deltas, [alpha, alpha]),
+        merge_method_name="task_arithmetic",
+        weights=weights,
+        merge_params={},
+    )
+    plain = _merge_direction(
+        base_sd=base,
+        deltas=list(deltas),
+        merge_method_name="task_arithmetic",
+        weights=weights,
+        merge_params={},
+    )
+    assert torch.allclose(hier["w"], alpha * plain["w"])
 
 
 def test_resolve_merge_mode_config_rejects_unknown_merge_method() -> None:

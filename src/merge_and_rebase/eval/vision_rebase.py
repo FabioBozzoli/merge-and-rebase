@@ -224,20 +224,26 @@ def _build_task_context(
 _VALID_MERGE_MODES = ("none", "rebase_then_merge", "merge_then_rebase")
 
 
-def _resolve_merge_mode_config(cfg: dict[str, Any], alpha_selection: str) -> tuple[str, str, dict[str, Any]]:
+def _resolve_merge_mode_config(
+    cfg: dict[str, Any],
+    alpha_selection: str,
+) -> tuple[str, str, dict[str, Any], bool]:
     """Resolve and validate the merge-mode knobs.
 
-    Returns (merge_mode, merge_method_name, merge_params). ``merge_mode="none"``
-    keeps the historical per-task transfer evaluation; the two other modes
-    compose the transported (or source-side) deltas into a single merged model.
+    Returns (merge_mode, merge_method_name, merge_params, global_alpha_search).
+    ``merge_mode="none"`` keeps the historical per-task transfer evaluation;
+    ``rebase_then_merge`` supports hierarchical search (per-task alphas followed
+    by a global merge alpha) when ``alpha_selection="per_task"``.
     """
     merge_mode = str(cfg.get("merge_mode", "none")).strip().lower()
     if merge_mode not in _VALID_MERGE_MODES:
         raise ValueError(f"merge_mode must be one of: {', '.join(_VALID_MERGE_MODES)}")
 
-    if merge_mode != "none" and alpha_selection == "per_task":
+    if merge_mode == "merge_then_rebase" and alpha_selection == "per_task":
         raise ValueError(
-            "merge_mode requires alpha_selection='shared': a merged model has a single shared alpha."
+            "merge_then_rebase requires alpha_selection='shared': per-task alpha search "
+            "is only defined for individually transported deltas on the target base. "
+            "Use merge_mode='rebase_then_merge' for hierarchical per-task alphas."
         )
 
     merge_method_name = str(cfg.get("merge_method", "task_arithmetic"))
@@ -246,7 +252,11 @@ def _resolve_merge_mode_config(cfg: dict[str, Any], alpha_selection: str) -> tup
     raw_params = cfg.get("merge_params", {}) or {}
     if not isinstance(raw_params, dict):
         raise ValueError("merge_params must be a JSON object / mapping when provided.")
-    return merge_mode, merge_method_name, dict(raw_params)
+
+    global_alpha_search = cfg.get("global_alpha_search", True)
+    if not isinstance(global_alpha_search, bool):
+        raise ValueError("global_alpha_search must be a boolean (true/false).")
+    return merge_mode, merge_method_name, dict(raw_params), global_alpha_search
 
 
 def _pseudo_tuned(
@@ -255,6 +265,23 @@ def _pseudo_tuned(
 ) -> list[dict[str, torch.Tensor]]:
     """Synthesize tuned states ``base + delta_i`` as expected by MergeMethod APIs."""
     return [axpy_state_dict(base_sd, d, alpha=1.0) for d in deltas]
+
+
+def _scale_deltas_by(
+    deltas: list[dict[str, torch.Tensor]],
+    alphas: Sequence[float],
+) -> list[dict[str, torch.Tensor]]:
+    """Scale each delta by its own alpha (bakes per-task alphas into the deltas)."""
+    if len(deltas) != len(alphas):
+        raise ValueError("deltas and alphas must have the same length.")
+    out: list[dict[str, torch.Tensor]] = []
+    for delta, alpha in zip(deltas, alphas, strict=True):
+        a = float(alpha)
+        if a == 1.0:
+            out.append(delta)
+        else:
+            out.append({k: v * a for k, v in delta.items()})
+    return out
 
 
 def _merge_direction(
@@ -596,7 +623,7 @@ def main() -> None:
         if alpha_selection not in {"shared", "per_task"}:
             raise ValueError("alpha_selection must be one of: shared, per_task")
 
-        merge_mode, merge_method_name, merge_params = _resolve_merge_mode_config(cfg, alpha_selection)
+        merge_mode, merge_method_name, merge_params, global_alpha_search = _resolve_merge_mode_config(cfg, alpha_selection)
 
         positive_alphas = [float(alpha) for alpha in alphas if float(alpha) > 0.0]
         if alpha_search and not positive_alphas:
@@ -1093,30 +1120,41 @@ def main() -> None:
                     if len(issues) > 3:
                         print(f"  - ... and {len(issues) - 3} more incompatibilities")
         elif merge_mode == "rebase_then_merge":
-            merged_direction = _merge_direction(
-                base_sd=target_base_sd,
-                deltas=transported_deltas,
-                merge_method_name=merge_method_name,
-                weights=merge_weights,
-                merge_params=merge_params,
-            )
-            print(
-                f"Merge mode '{merge_mode}' ({merge_method_name}): composed {len(transported_deltas)} "
-                f"transported deltas -> merged direction with {len(merged_direction)} params"
-            )
-            run_logger.log_event(
-                "merge_composition_end",
-                metrics={"merge/param_count": float(len(merged_direction))},
-                context={
-                    "mode": merge_mode,
-                    "merge_method": merge_method_name,
-                    "merge_params": merge_params,
-                    "n_tasks": len(transported_deltas),
-                },
-            )
-            # One shared merged model: every task evaluates the same direction at alpha.
-            rebased_deltas = [merged_direction] * len(tasks)
-            untransported_deltas = original_deltas
+            if alpha_selection == "per_task":
+                # Hierarchical: per-task alphas are searched on the individual
+                # transported deltas first; composition happens after pass 1.
+                merge_input_deltas = list(transported_deltas)
+                rebased_deltas = list(transported_deltas)
+                untransported_deltas = original_deltas
+                print(
+                    f"Hierarchical mode '{merge_mode}' ({merge_method_name}): per-task alpha "
+                    f"search on {len(transported_deltas)} transported deltas before merge"
+                )
+            else:
+                merged_direction = _merge_direction(
+                    base_sd=target_base_sd,
+                    deltas=transported_deltas,
+                    merge_method_name=merge_method_name,
+                    weights=merge_weights,
+                    merge_params=merge_params,
+                )
+                print(
+                    f"Merge mode '{merge_mode}' ({merge_method_name}): composed {len(transported_deltas)} "
+                    f"transported deltas -> merged direction with {len(merged_direction)} params"
+                )
+                run_logger.log_event(
+                    "merge_composition_end",
+                    metrics={"merge/param_count": float(len(merged_direction))},
+                    context={
+                        "mode": merge_mode,
+                        "merge_method": merge_method_name,
+                        "merge_params": merge_params,
+                        "n_tasks": len(transported_deltas),
+                    },
+                )
+                # One shared merged model: every task evaluates the same direction at alpha.
+                rebased_deltas = [merged_direction] * len(tasks)
+                untransported_deltas = original_deltas
         else:  # merge_then_rebase
             merged_source_direction = _merge_direction(
                 base_sd=source_base_sd,
@@ -1254,22 +1292,143 @@ def main() -> None:
                 out[idx] = _eval_task(per_task[idx], split)
             return out
 
-        if alpha_selection == "shared":
+        hierarchical = bool(merge_mode == "rebase_then_merge" and alpha_selection == "per_task")
+        per_task_premerge_alphas: list[float] | None = None
+
+        if alpha_selection == "shared" or hierarchical:
+            if hierarchical:
+                # ---------------- PASS 1: per-task alpha on individual deltas ----------------
+                tracker = PerTaskAlphaTracker(
+                    task_names=[str(item["task"]) for item in per_task],
+                    initial_alpha=float(positive_alphas[0] if positive_alphas else alphas[0]),
+                    patience=alpha_patience,
+                )
+                # Merge-mode baselines are the alpha-independent target zero-shot:
+                # pre-seed the secondary stream inactive for every task.
+                for idx in range(len(per_task)):
+                    baseline_val = _eval_baseline_task(alpha_search_split, idx, 0.0)
+                    tracker.best_secondary_alpha[idx] = 0.0
+                    tracker.best_secondary_acc[idx] = baseline_val
+                    tracker.secondary_active[idx] = False
+
+                for alpha in alphas:
+                    eval_indices = tracker.eval_active_indices()
+                    if not eval_indices:
+                        print("\nAll tasks have early-stopped; ending hierarchical pass-1 alpha sweep.")
+                        break
+
+                    primary_indices = set(tracker.primary_active_indices())
+                    print(
+                        f"\n=== alpha {alpha:.3f} — {method_label} "
+                        f"(split: {alpha_search_split}, mode: per_task pass 1/2, hierarchical) ==="
+                    )
+
+                    baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, eval_indices, float(alpha))
+                    rebase_eval_indices = [idx for idx in eval_indices if idx in primary_indices]
+                    rebase_by_idx_active = _eval_rebased_task_indices(alpha_search_split, rebase_eval_indices, float(alpha))
+                    rebase_by_idx: dict[int, float] = {}
+                    for idx in eval_indices:
+                        rebase_by_idx[idx] = rebase_by_idx_active[idx] if idx in primary_indices else float("-inf")
+                    baseline_accs = [baseline_by_idx[idx] for idx in eval_indices]
+                    rebase_accs = [rebase_by_idx[idx] for idx in eval_indices]
+
+                    for idx, baseline_acc, rebase_acc in zip(eval_indices, baseline_accs, rebase_accs, strict=True):
+                        task_name = per_task[idx]["task"]
+                        if idx in primary_indices:
+                            display_rebase = rebase_acc
+                            marker = " "
+                        else:
+                            frozen = float(tracker.best_primary_acc[idx])
+                            display_rebase = frozen if frozen != float("-inf") else 0.0
+                            marker = "*"
+                        norm = _norm_acc(display_rebase, baseline_acc)
+                        print(
+                            f" {marker}{task_name}: {baseline_label}={baseline_acc:.6f}  "
+                            f"per-task={display_rebase:.6f}  norm={norm:.6f}"
+                        )
+
+                    stopped_primary: list[int] = []
+                    if float(alpha) > 0.0:
+                        stopped_primary, _ = tracker.update(
+                            alpha=float(alpha),
+                            indices=eval_indices,
+                            primary_accs=rebase_accs,
+                            secondary_accs=baseline_accs,
+                        )
+                        if stopped_primary:
+                            stopped_names = ", ".join(str(per_task[idx]["task"]) for idx in stopped_primary)
+                            print(f"  Early-stopping per-task alphas at alpha={alpha:.3f}: {stopped_names}")
+
+                per_task_premerge_alphas = [float(tracker.best_primary_alpha[idx]) for idx in range(len(per_task))]
+                print("\n=== Hierarchical pass-1 summary (per-task alphas) ===")
+                for item, a in zip(per_task, per_task_premerge_alphas, strict=True):
+                    print(f"  {item['task']}: premerge_alpha={a:.3f}")
+                run_logger.log_event(
+                    "hierarchical_pass1_end",
+                    metrics={
+                        "hierarchical/avg_premerge_alpha": float(
+                            sum(per_task_premerge_alphas) / max(1, len(per_task_premerge_alphas))
+                        )
+                    },
+                    context={
+                        "per_task_premerge_alphas": {
+                            item["task"]: float(per_task_premerge_alphas[i]) for i, item in enumerate(per_task)
+                        }
+                    },
+                )
+
+                # ---------------- PASS 2: scale by per-task alphas, compose once ----------------
+                scaled_input = _scale_deltas_by(merge_input_deltas, per_task_premerge_alphas)
+                merged_direction = _merge_direction(
+                    base_sd=target_base_sd,
+                    deltas=scaled_input,
+                    merge_method_name=merge_method_name,
+                    weights=merge_weights,
+                    merge_params=merge_params,
+                )
+                rebased_deltas = [merged_direction] * len(per_task)
+                print(
+                    f"Hierarchical merge ({merge_method_name}): composed {len(scaled_input)} scaled deltas "
+                    f"-> merged direction with {len(merged_direction)} params"
+                )
+                run_logger.log_event(
+                    "merge_composition_end",
+                    metrics={"merge/param_count": float(len(merged_direction))},
+                    context={
+                        "mode": merge_mode,
+                        "merge_method": merge_method_name,
+                        "merge_params": merge_params,
+                        "n_tasks": len(scaled_input),
+                        "per_task_premerge_alphas": {
+                            item["task"]: float(per_task_premerge_alphas[i]) for i, item in enumerate(per_task)
+                        },
+                    },
+                )
+
+            sweep_alphas = list(alphas)
+            if hierarchical and not global_alpha_search:
+                sweep_alphas = [1.0]
+                print("\nglobal_alpha_search=false: evaluating the merged model at gamma=1.0 only.")
+            sweep_positive_alphas = [float(a) for a in sweep_alphas if float(a) > 0.0]
+            sweep_mode_label = "global (gamma)" if hierarchical else "shared"
+
             best_rebase_avg = float("-inf")
             best_baseline_avg = float("-inf")
-            best_alpha = float(positive_alphas[0] if positive_alphas else alphas[0])
+            best_alpha = float(sweep_positive_alphas[0] if sweep_positive_alphas else sweep_alphas[0])
             # When every task's baseline is target_zeroshot (untransported infeasible),
             # the baseline is alpha-independent — keep best_baseline_alpha at 0.0 so
             # the summary does not report a spurious non-zero value.
             has_untransported = any(can_eval_untransported_by_task)
             best_baseline_alpha = (
-                float(positive_alphas[0] if positive_alphas else alphas[0]) if has_untransported else 0.0
+                float(sweep_positive_alphas[0] if sweep_positive_alphas else sweep_alphas[0])
+                if has_untransported
+                else 0.0
             )
             sweep_results: list[dict[str, Any]] = []
             shared_bad_steps = 0
 
-            for alpha in alphas:
-                print(f"\n=== alpha {alpha:.3f} — {method_label} (split: {alpha_search_split}, mode: shared) ===")
+            for alpha in sweep_alphas:
+                print(f"\n=== alpha {alpha:.3f} — {method_label} (split: {alpha_search_split}, mode: {sweep_mode_label}) ===")
 
                 idxs = list(range(len(per_task)))
                 baseline_by_idx = _eval_baseline_task_indices(alpha_search_split, idxs, float(alpha))
@@ -1339,7 +1498,7 @@ def main() -> None:
                         shared_bad_steps = 0
                     elif avg_rebase + eps >= best_rebase_avg:
                         shared_bad_steps = 0
-                    elif len(positive_alphas) > 1:
+                    elif len(sweep_positive_alphas) > 1:
                         shared_bad_steps += 1
                         print(
                             f"  (alpha={alpha:.3f} fell below best shared avg {best_rebase_avg:.6f}; "
@@ -1544,9 +1703,10 @@ def main() -> None:
 
         norm_accs = [_norm_acc(r, b) for r, b in zip(rebase_test_accs, baseline_test_accs, strict=True)]
 
+        alpha_display_label = "hierarchical(per_task+global)" if hierarchical else alpha_selection
         pretty_print_task_accuracies(
             suite_name,
-            f"{method_label}, alpha={alpha_selection}",
+            f"{method_label}, alpha={alpha_display_label}",
             f"A={source_cfg.pretrained} → B={target_cfg.pretrained}",
             per_task,
             rebase_test_accs,
@@ -1556,7 +1716,11 @@ def main() -> None:
             result_label=result_label,
         )
 
-        if alpha_selection == "per_task":
+        if hierarchical and per_task_premerge_alphas is not None:
+            print("\nHierarchical alphas (per-task premerge + global merge alpha):")
+            for item, a in zip(per_task, per_task_premerge_alphas, strict=True):
+                print(f"  {item['task']}: premerge={a:.3f}  global={best_alpha:.3f}")
+        elif alpha_selection == "per_task":
             print("\nSelected test-time alpha by task:")
             for item, r_a, b_a in zip(per_task, selected_alpha_by_task, selected_baseline_alpha_by_task, strict=True):
                 print(f"  {item['task']}: rebase={r_a:.3f}  baseline={b_a:.3f}")
@@ -1589,6 +1753,12 @@ def main() -> None:
             "merge_mode": merge_mode,
             "merge_method": merge_method_name if merge_mode != "none" else None,
             "merge_params": merge_params if merge_mode != "none" else None,
+            "global_alpha_search": global_alpha_search if hierarchical else None,
+            "per_task_premerge_alphas": (
+                {item["task"]: float(per_task_premerge_alphas[i]) for i, item in enumerate(per_task)}
+                if hierarchical and per_task_premerge_alphas is not None
+                else None
+            ),
             "alpha_selection": alpha_selection,
             "best_alpha": float(best_alpha),
             "best_baseline_alpha": float(best_baseline_alpha),
