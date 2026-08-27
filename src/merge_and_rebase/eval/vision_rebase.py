@@ -4,7 +4,7 @@ import argparse
 import itertools
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,6 +282,54 @@ def _scale_deltas_by(
         else:
             out.append({k: v * a for k, v in delta.items()})
     return out
+
+
+def _visual_key_fingerprint(sd: Mapping[str, torch.Tensor]) -> dict[str, Any]:
+    """Compact shape fingerprint of a checkpoint's visual backbone for diagnostics."""
+    depths = [k for k in sd if ".resblocks." in k]
+    block_ids = {int(k.split(".resblocks.")[1].split(".")[0]) for k in depths if ".resblocks." in k}
+    visual_widths = sorted({int(v.shape[0]) for k, v in sd.items() if k.startswith("visual.") and v.dim() >= 1})
+    return {
+        "n_visual_keys": sum(1 for k in sd if k.startswith("visual.")),
+        "max_block_id": max(block_ids) if block_ids else None,
+        "n_blocks": len(block_ids),
+        "visual_out_dims_sample": visual_widths[:4],
+    }
+
+
+def _ckpt_visual_base_coverage(
+    sd: Mapping[str, torch.Tensor],
+    base_sd: Mapping[str, torch.Tensor],
+) -> float:
+    """Fraction of the base's visual keys covered (key + shape) by sd after conservative alignment."""
+    visual_base_keys = [k for k, v in base_sd.items() if k.startswith("visual.") and isinstance(v, torch.Tensor)]
+    if not visual_base_keys:
+        return 0.0
+    aligned = align_to_base_keys(sd, base_sd)
+    covered = sum(1 for k in visual_base_keys if k in aligned)
+    return covered / len(visual_base_keys)
+
+
+def _infer_ckpt_base(
+    sd: Mapping[str, torch.Tensor],
+    *,
+    source_base_sd: Mapping[str, torch.Tensor],
+    target_base_sd: Mapping[str, torch.Tensor],
+    native_coverage_threshold: float = 0.5,
+) -> str | None:
+    """Classify a raw tuned checkpoint as 'source' or 'target' by visual-key coverage.
+
+    Returns 'target' when the checkpoint matches the target visual backbone
+    (a native target checkpoint), 'source' otherwise (ties prefer source so
+    transport stays the default), or None when it matches neither base.
+    """
+    coverage_source = _ckpt_visual_base_coverage(sd, source_base_sd)
+    coverage_target = _ckpt_visual_base_coverage(sd, target_base_sd)
+    if coverage_target >= native_coverage_threshold and coverage_target > coverage_source:
+        return "target"
+    if coverage_source > 0.0:
+        return "source"
+    return None
 
 
 def _merge_direction(
@@ -754,6 +802,59 @@ def main() -> None:
         print(f"Classname mode: {'humanized' if use_humanized_classnames else 'raw'}")
         print(f"Rebase method: {method_label}")
 
+        # ---- Mixed-merging pre-pass: classify each tuned checkpoint by its base ----
+        native_tasks_requested = [str(t) for t in (cfg.get("native_target_tasks", []) or [])]
+        unknown_native_tasks = [t for t in native_tasks_requested if t not in tasks]
+        if unknown_native_tasks:
+            raise ValueError(f"native_target_tasks contains tasks not in the task list: {unknown_native_tasks}")
+        auto_detect_ckpt_base = bool(cfg.get("auto_detect_ckpt_base", True))
+        native_tasks: set[str] = set(native_tasks_requested)
+
+        if native_tasks or auto_detect_ckpt_base:
+            print("Checkpoint base classification (visual-key coverage vs source/target):")
+            for task in tasks:
+                if task in native_tasks:
+                    print(f"  {task}: native target checkpoint (explicit)")
+                    continue
+                raw_sd = load_ckpt(str(tuned_by_task[task]))
+                inferred = _infer_ckpt_base(raw_sd, source_base_sd=source_base_sd, target_base_sd=target_base_sd)
+                if inferred is None:
+                    fingerprint = _visual_key_fingerprint(raw_sd)
+                    raise ValueError(
+                        f"Tuned checkpoint for task '{task}' matches neither the source nor the target "
+                        f"visual backbone ({tuned_by_task[task]}). Checkpoint fingerprint: {fingerprint}. "
+                        f"Source fingerprint: {_visual_key_fingerprint(source_base_sd)}. "
+                        f"Target fingerprint: {_visual_key_fingerprint(target_base_sd)}."
+                    )
+                if inferred == "target":
+                    if not auto_detect_ckpt_base:
+                        raise ValueError(
+                            f"Tuned checkpoint for task '{task}' matches the target architecture; "
+                            "add it to native_target_tasks or set auto_detect_ckpt_base=true."
+                        )
+                    native_tasks.add(task)
+                    print(f"  {task}: native target checkpoint (auto-detected)")
+                else:
+                    print(f"  {task}: source checkpoint (transport required)")
+                del raw_sd
+
+        if native_tasks:
+            if merge_mode == "none":
+                raise ValueError(
+                    "Native target checkpoints require a merge mode; merge_mode='none' evaluates "
+                    "per-task transported deltas only. Use merge_mode='rebase_then_merge'."
+                )
+            if merge_mode == "merge_then_rebase":
+                raise ValueError(
+                    "Native target checkpoints cannot participate in merge_then_rebase: the merge "
+                    "happens on the source base, where native target deltas do not exist."
+                )
+            if transfusion_mode:
+                raise NotImplementedError(
+                    "Native target checkpoints with transfusion are not supported: the permutation "
+                    "prepare step swaps the target keyspace. Use a theseus/bico transport method."
+                )
+
         per_task: list[dict[str, Any]] = []
         transported_deltas: list[dict[str, torch.Tensor]] = []
         original_deltas: list[dict[str, torch.Tensor]] = []
@@ -773,7 +874,9 @@ def main() -> None:
                 source_cfg=source_cfg,
                 target_cfg=target_cfg,
                 use_humanized_classnames=use_humanized_classnames,
-                need_source_loaders=bool(theseus_like_method or transfusion_mode or bico_mode),
+                need_source_loaders=bool(
+                    (theseus_like_method or transfusion_mode or bico_mode) and task not in native_tasks
+                ),
             )
             loaders = task_ctx.loaders
             classnames = task_ctx.classnames
@@ -791,6 +894,10 @@ def main() -> None:
                     "source_build_cfg_task": source_build_cfg_task,
                 }
             )
+
+            if task in native_tasks:
+                print(f"  {task}: native target checkpoint — skipping transport")
+                continue
 
             task_source_base_sd = source_base_sd
 
@@ -1120,27 +1227,59 @@ def main() -> None:
                     if len(issues) > 3:
                         print(f"  - ... and {len(issues) - 3} more incompatibilities")
         elif merge_mode == "rebase_then_merge":
+            native_delta_by_task: dict[str, dict[str, torch.Tensor]] = {}
+            for task in sorted(native_tasks):
+                path = str(tuned_by_task[task])
+                sd = load_ckpt(path)
+                aligned = align_to_base_keys(sd, target_base_sd)
+                if not aligned:
+                    raise ValueError(
+                        f"No tensors from native target checkpoint aligned to target base keys "
+                        f"for task '{task}': {path}."
+                    )
+                native_delta_by_task[task] = TaskVector.from_checkpoints(
+                    target_base_sd,
+                    to_cpu_fp32(aligned),
+                    strict=False,
+                    key_filter=_visual_only_filter,
+                ).delta
+                print(
+                    f"  {task}: native target delta computed ({len(native_delta_by_task[task])} params)"
+                )
+                run_logger.log_event(
+                    "native_delta_end",
+                    metrics={f"rebase/{task}/native_param_count": float(len(native_delta_by_task[task]))},
+                    context={"task": task},
+                )
+
+            transported_iter = iter(transported_deltas)
+            merge_input_deltas = []
+            for t in tasks:
+                if t in native_delta_by_task:
+                    merge_input_deltas.append(native_delta_by_task[t])
+                else:
+                    merge_input_deltas.append(next(transported_iter))
+
             if alpha_selection == "per_task":
                 # Hierarchical: per-task alphas are searched on the individual
-                # transported deltas first; composition happens after pass 1.
-                merge_input_deltas = list(transported_deltas)
-                rebased_deltas = list(transported_deltas)
+                # deltas (transported + native) first; composition happens after pass 1.
+                rebased_deltas = list(merge_input_deltas)
                 untransported_deltas = original_deltas
                 print(
                     f"Hierarchical mode '{merge_mode}' ({merge_method_name}): per-task alpha "
-                    f"search on {len(transported_deltas)} transported deltas before merge"
+                    f"search on {len(merge_input_deltas)} deltas before merge"
                 )
             else:
                 merged_direction = _merge_direction(
                     base_sd=target_base_sd,
-                    deltas=transported_deltas,
+                    deltas=merge_input_deltas,
                     merge_method_name=merge_method_name,
                     weights=merge_weights,
                     merge_params=merge_params,
                 )
                 print(
-                    f"Merge mode '{merge_mode}' ({merge_method_name}): composed {len(transported_deltas)} "
-                    f"transported deltas -> merged direction with {len(merged_direction)} params"
+                    f"Merge mode '{merge_mode}' ({merge_method_name}): composed {len(merge_input_deltas)} "
+                    f"deltas (transported + native) -> merged direction with {len(merged_direction)} params"
                 )
                 run_logger.log_event(
                     "merge_composition_end",
@@ -1149,7 +1288,8 @@ def main() -> None:
                         "mode": merge_mode,
                         "merge_method": merge_method_name,
                         "merge_params": merge_params,
-                        "n_tasks": len(transported_deltas),
+                        "n_tasks": len(merge_input_deltas),
+                        "n_native": len(native_delta_by_task),
                     },
                 )
                 # One shared merged model: every task evaluates the same direction at alpha.
@@ -1753,6 +1893,7 @@ def main() -> None:
             "merge_mode": merge_mode,
             "merge_method": merge_method_name if merge_mode != "none" else None,
             "merge_params": merge_params if merge_mode != "none" else None,
+            "native_target_tasks": sorted(native_tasks) if native_tasks else [],
             "global_alpha_search": global_alpha_search if hierarchical else None,
             "per_task_premerge_alphas": (
                 {item["task"]: float(per_task_premerge_alphas[i]) for i, item in enumerate(per_task)}

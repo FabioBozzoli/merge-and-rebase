@@ -4,11 +4,26 @@ import pytest
 import torch
 
 from merge_and_rebase.eval.vision_rebase import (
+    _ckpt_visual_base_coverage,
+    _infer_ckpt_base,
     _merge_direction,
     _pseudo_tuned,
     _resolve_merge_mode_config,
     _scale_deltas_by,
 )
+
+
+def _clipish_base(depth: int, width: int) -> dict[str, torch.Tensor]:
+    sd: dict[str, torch.Tensor] = {}
+    for i in range(depth):
+        sd[f"visual.transformer.resblocks.{i}.attn.in_proj_weight"] = torch.randn(3 * width, width)
+        sd[f"visual.transformer.resblocks.{i}.ln_1.weight"] = torch.randn(width)
+    sd["visual.ln_pre.weight"] = torch.randn(width)
+    sd["visual.conv1.weight"] = torch.randn(3 * width, 16, 16)
+    sd["visual.class_embedding"] = torch.randn(width)
+    sd["token_embedding.weight"] = torch.randn(100, width)
+    sd["logit_scale"] = torch.tensor(4.6)
+    return sd
 
 
 def _sd(*values: float) -> dict[str, torch.Tensor]:
@@ -250,6 +265,57 @@ def test_hierarchical_uniform_alpha_equals_scaled_merge() -> None:
         merge_params={},
     )
     assert torch.allclose(hier["w"], alpha * plain["w"])
+
+
+# ---------------------------------------------------------------------------
+# Automatic checkpoint-base detection (mixed merging)
+# ---------------------------------------------------------------------------
+
+
+def test_infer_ckpt_base_classifies_source_checkpoint() -> None:
+    source_base = _clipish_base(depth=2, width=8)
+    target_base = _clipish_base(depth=3, width=16)
+    source_ckpt = _clipish_base(depth=2, width=8)
+    assert (
+        _infer_ckpt_base(source_ckpt, source_base_sd=source_base, target_base_sd=target_base) == "source"
+    )
+
+
+def test_infer_ckpt_base_classifies_target_checkpoint_as_native() -> None:
+    source_base = _clipish_base(depth=2, width=8)
+    target_base = _clipish_base(depth=3, width=16)
+    target_ckpt = _clipish_base(depth=3, width=16)
+    assert (
+        _infer_ckpt_base(target_ckpt, source_base_sd=source_base, target_base_sd=target_base) == "target"
+    )
+
+
+def test_infer_ckpt_base_prefers_source_on_same_shapes() -> None:
+    base = _clipish_base(depth=2, width=8)
+    ckpt = _clipish_base(depth=2, width=8)
+    assert _infer_ckpt_base(ckpt, source_base_sd=base, target_base_sd=base) == "source"
+
+
+def test_infer_ckpt_base_returns_none_on_no_match() -> None:
+    source_base = _clipish_base(depth=2, width=8)
+    target_base = _clipish_base(depth=3, width=16)
+    garbage = {"foo.bar": torch.randn(3, 4)}
+    assert _infer_ckpt_base(garbage, source_base_sd=source_base, target_base_sd=target_base) is None
+
+
+def test_ckpt_visual_base_coverage_full_and_zero() -> None:
+    source_base = _clipish_base(depth=2, width=8)
+    target_base = _clipish_base(depth=3, width=16)
+    source_ckpt = _clipish_base(depth=2, width=8)
+    assert _ckpt_visual_base_coverage(source_ckpt, source_base) == pytest.approx(1.0)
+    assert _ckpt_visual_base_coverage(source_ckpt, target_base) == 0.0
+
+
+def test_ckpt_visual_base_coverage_partial() -> None:
+    base = _clipish_base(depth=2, width=8)
+    partial = _clipish_base(depth=1, width=8)  # missing resblock 1
+    coverage = _ckpt_visual_base_coverage(partial, base)
+    assert 0.0 < coverage < 1.0
 
 
 def test_resolve_merge_mode_config_rejects_unknown_merge_method() -> None:
