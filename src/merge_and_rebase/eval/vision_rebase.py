@@ -232,7 +232,7 @@ def _evaluate_source_lmc(
         return float(
             sum(
                 max(0.0, -0.5 * (gaps[left] + gaps[right])) * (float(alphas[right]) - float(alphas[left]))
-                for left, right in zip(in_unit, in_unit[1:], strict=True)
+                for left, right in zip(in_unit, in_unit[1:], strict=False)
             )
         )
 
@@ -254,6 +254,131 @@ def _evaluate_source_lmc(
         "min_error_chord_gap_alpha": float(alphas[min_error_idx]),
         "mean_error_chord_gap": float(sum(error_barriers[i] for i in in_unit) / len(in_unit)),
         "area_below_error_chord": _area_below_chord(error_barriers),
+        "split": split,
+        "first_n_batches": first_n_batches,
+    }
+
+
+@torch.no_grad()
+def _evaluate_cross_task_source_lmc(
+    *,
+    model: torch.nn.Module,
+    restore_sd: dict[str, torch.Tensor],
+    endpoint_a_sd: dict[str, torch.Tensor],
+    endpoint_b_sd: dict[str, torch.Tensor],
+    clf_source: OpenClipClassifier,
+    task_contexts: list[dict[str, Any]],
+    split: str,
+    first_n_batches: int | None,
+    alphas: list[float],
+    device: str,
+) -> dict[str, Any]:
+    """Measure the source-space chord between two BRACE-corrected task endpoints."""
+    if not alphas or not any(abs(float(a)) < 1e-8 for a in alphas) or not any(
+        abs(float(a) - 1.0) < 1e-8 for a in alphas
+    ):
+        raise ValueError("cross-task source LMC alphas must include both 0 and 1")
+    if set(endpoint_a_sd) != set(endpoint_b_sd):
+        raise ValueError("cross-task source LMC endpoint keyspaces differ")
+    if not task_contexts:
+        raise ValueError("cross-task source LMC requires at least one evaluation task")
+
+    eval_clf = OpenClipClassifier(
+        model=model,
+        tokenizer=clf_source.tokenizer,
+        preprocess=clf_source.preprocess,
+        normalize=clf_source.normalize,
+        logit_scale=clf_source.logit_scale,
+    )
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    eval_clf.to(dev)
+    eval_clf.eval()
+
+    text_features_by_task: dict[str, torch.Tensor] = {}
+    for ctx in task_contexts:
+        task = str(ctx["task"])
+        eval_clf.build_zeroshot_text_features(
+            ctx["classnames"],
+            ctx["source_build_cfg_task"],
+            cache_dir="src/.cache/zs_cache",
+            force_rebuild=False,
+        )
+        if eval_clf._zs_text_features is None:
+            raise RuntimeError(f"Could not build source text features for cross-task LMC task '{task}'.")
+        text_features_by_task[task] = eval_clf._zs_text_features.detach().cpu()
+
+    average_accuracy: list[float] = []
+    average_loss: list[float] = []
+    per_task_accuracy: dict[str, list[float]] = {str(ctx["task"]): [] for ctx in task_contexts}
+    per_task_loss: dict[str, list[float]] = {str(ctx["task"]): [] for ctx in task_contexts}
+    try:
+        for alpha in alphas:
+            interpolated = {
+                key: (torch.lerp(value_a, endpoint_b_sd[key], float(alpha)) if torch.is_floating_point(value_a) else value_a)
+                for key, value_a in endpoint_a_sd.items()
+            }
+            load_into_model(model, interpolated, strict=True)
+            del interpolated
+
+            alpha_accuracies: list[float] = []
+            alpha_losses: list[float] = []
+            for ctx in task_contexts:
+                task = str(ctx["task"])
+                eval_clf._zs_text_features = text_features_by_task[task].to(dev)
+                loader = resolve_eval_split_loader(ctx["source_loaders"], split)
+                if first_n_batches is not None:
+                    loader = itertools.islice(iter(loader), max(1, int(first_n_batches)))
+                total = 0
+                correct = 0
+                loss_sum = 0.0
+                for images, labels in loader:
+                    images = images.to(dev, non_blocking=True)
+                    labels = labels.to(dev, non_blocking=True)
+                    logits = eval_clf(images)
+                    loss_sum += float(F.cross_entropy(logits, labels, reduction="sum").item())
+                    correct += int((logits.argmax(dim=-1) == labels).sum().item())
+                    total += int(labels.numel())
+                acc = float(correct / max(1, total))
+                loss = float(loss_sum / max(1, total))
+                per_task_accuracy[task].append(acc)
+                per_task_loss[task].append(loss)
+                alpha_accuracies.append(acc)
+                alpha_losses.append(loss)
+            average_accuracy.append(float(sum(alpha_accuracies) / len(alpha_accuracies)))
+            average_loss.append(float(sum(alpha_losses) / len(alpha_losses)))
+            print(
+                f"    cross-task source LMC alpha={float(alpha):.3f} "
+                f"avg_acc={average_accuracy[-1]:.6f} avg_loss={average_loss[-1]:.6f}"
+            )
+    finally:
+        load_into_model(model, restore_sd, strict=True)
+
+    idx0 = min(range(len(alphas)), key=lambda i: abs(float(alphas[i])))
+    idx1 = min(range(len(alphas)), key=lambda i: abs(float(alphas[i]) - 1.0))
+    loss_chord = [
+        (1.0 - float(alpha)) * average_loss[idx0] + float(alpha) * average_loss[idx1]
+        for alpha in alphas
+    ]
+    loss_gaps = [average_loss[i] - loss_chord[i] for i in range(len(alphas))]
+    in_unit = [i for i, alpha in enumerate(alphas) if 0.0 <= float(alpha) <= 1.0]
+    max_gap_idx = max(in_unit, key=lambda i: loss_gaps[i])
+    min_gap_idx = min(in_unit, key=lambda i: loss_gaps[i])
+    area_below = sum(
+        max(0.0, -0.5 * (loss_gaps[left] + loss_gaps[right])) * (float(alphas[right]) - float(alphas[left]))
+        for left, right in zip(in_unit, in_unit[1:], strict=False)
+    )
+    return {
+        "alphas": [float(alpha) for alpha in alphas],
+        "average_accuracy": average_accuracy,
+        "average_loss": average_loss,
+        "per_task_accuracy": per_task_accuracy,
+        "per_task_loss": per_task_loss,
+        "loss_chord_gap": loss_gaps,
+        "max_loss_barrier": float(loss_gaps[max_gap_idx]),
+        "max_loss_barrier_alpha": float(alphas[max_gap_idx]),
+        "min_loss_chord_gap": float(loss_gaps[min_gap_idx]),
+        "min_loss_chord_gap_alpha": float(alphas[min_gap_idx]),
+        "area_below_loss_chord": float(area_below),
         "split": split,
         "first_n_batches": first_n_batches,
     }
@@ -800,6 +925,28 @@ def main() -> None:
             source_lmc_alpha_max + source_lmc_alpha_step * 0.5,
             source_lmc_alpha_step,
         ).tolist()
+        cross_task_lmc_pairs_raw = cfg.get("cross_task_lmc_pairs", [])
+        if cross_task_lmc_pairs_raw is None:
+            cross_task_lmc_pairs_raw = []
+        if not isinstance(cross_task_lmc_pairs_raw, (list, tuple)):
+            raise ValueError("cross_task_lmc_pairs must be a list of two-task lists.")
+        cross_task_lmc_pairs: list[tuple[str, str]] = []
+        for pair in cross_task_lmc_pairs_raw:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError("Each cross_task_lmc_pairs item must contain exactly two task names.")
+            task_a, task_b = str(pair[0]), str(pair[1])
+            if task_a == task_b:
+                raise ValueError("cross_task_lmc_pairs cannot interpolate a task with itself.")
+            cross_task_lmc_pairs.append((task_a, task_b))
+        cross_task_lmc_split = str(cfg.get("cross_task_lmc_eval_split", source_lmc_eval_split)).strip().lower()
+        if cross_task_lmc_split not in {"val", "test"}:
+            raise ValueError("cross_task_lmc_eval_split must be one of: val, test")
+        cross_task_lmc_first_n_batches_raw = cfg.get(
+            "cross_task_lmc_first_n_batches", source_lmc_first_n_batches
+        )
+        cross_task_lmc_first_n_batches = (
+            int(cross_task_lmc_first_n_batches_raw) if cross_task_lmc_first_n_batches_raw is not None else None
+        )
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
 
@@ -1026,6 +1173,9 @@ def main() -> None:
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
         source_lmc_rows: list[dict[str, Any]] = []
+        cross_task_lmc_rows: list[dict[str, Any]] = []
+        corrected_ft_states: dict[str, dict[str, torch.Tensor]] = {}
+        corrected_ft_templates: dict[str, torch.nn.Module] = {}
 
         transfusion_prepared: dict[str, Any] | None = None
 
@@ -1202,6 +1352,10 @@ def main() -> None:
                     strict=False,
                     key_filter=_visual_only_filter,
                 ).delta
+
+                if cross_task_lmc_pairs:
+                    corrected_ft_states[task] = task_source_ft_sd
+                    corrected_ft_templates[task] = deepcopy(source_ft_model_task).cpu()
 
                 if source_lmc_row is not None:
                     print(f"  {task}: evaluating source LMC after block extension")
@@ -1439,6 +1593,46 @@ def main() -> None:
             else:
                 original_deltas.append(task_delta)
                 print(f"  {task}: delta collected for merge_then_rebase ({len(task_delta)} params)")
+
+        if cross_task_lmc_pairs:
+            contexts_by_task = {str(item["task"]): item for item in per_task}
+            for task_a, task_b in cross_task_lmc_pairs:
+                if task_a not in contexts_by_task or task_b not in contexts_by_task:
+                    raise ValueError(
+                        f"cross-task LMC pair ({task_a}, {task_b}) must be selected in tasks={tasks}."
+                    )
+                if task_a not in corrected_ft_states or task_b not in corrected_ft_states:
+                    raise RuntimeError(
+                        f"cross-task LMC pair ({task_a}, {task_b}) requires BRACE-corrected source endpoints."
+                    )
+                if set(corrected_ft_states[task_a]) != set(corrected_ft_states[task_b]):
+                    raise RuntimeError(
+                        f"cross-task LMC pair ({task_a}, {task_b}) has incompatible corrected endpoint keyspaces."
+                    )
+                print(f"\n--- Cross-task source LMC: {task_a} -> {task_b} ---")
+                metrics = _evaluate_cross_task_source_lmc(
+                    model=deepcopy(corrected_ft_templates[task_a]),
+                    restore_sd=corrected_ft_states[task_a],
+                    endpoint_a_sd=corrected_ft_states[task_a],
+                    endpoint_b_sd=corrected_ft_states[task_b],
+                    clf_source=clf_source,
+                    task_contexts=[contexts_by_task[task_a], contexts_by_task[task_b]],
+                    split=cross_task_lmc_split,
+                    first_n_batches=cross_task_lmc_first_n_batches,
+                    alphas=source_lmc_alphas,
+                    device=device,
+                )
+                row = {"tasks": [task_a, task_b], "lmc_mode": block_extension_cfg.lmc_mode, **metrics}
+                cross_task_lmc_rows.append(row)
+                run_logger.log_event(
+                    "cross_task_source_lmc",
+                    metrics={
+                        f"cross_task_lmc/{task_a}__{task_b}/max_loss_barrier": row["max_loss_barrier"],
+                        f"cross_task_lmc/{task_a}__{task_b}/min_loss_chord_gap": row["min_loss_chord_gap"],
+                        f"cross_task_lmc/{task_a}__{task_b}/area_below_loss_chord": row["area_below_loss_chord"],
+                    },
+                    context={"tasks": [task_a, task_b], "lmc_mode": block_extension_cfg.lmc_mode},
+                )
 
         can_eval_untransported_by_task: list[bool] = []
         if merge_mode == "none":
@@ -2170,6 +2364,7 @@ def main() -> None:
             },
             "block_extension_target_dataset_eval": block_extension_eval_rows,
             "source_lmc": source_lmc_rows,
+            "cross_task_source_lmc": cross_task_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
             "saved_merged_path": saved_merged_path,
