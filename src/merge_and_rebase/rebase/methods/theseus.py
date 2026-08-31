@@ -404,7 +404,7 @@ def _activation_cache_fingerprint(
             digest.update(name.encode())
             digest.update(str(tensor.dtype).encode())
             digest.update(repr(tuple(tensor.shape)).encode())
-            digest.update(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+            digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     for loader in (source_dataloader, target_dataloader):
         dataset = getattr(loader, "dataset", None)
         digest.update(f"{type(loader).__qualname__}:{type(dataset).__qualname__}".encode())

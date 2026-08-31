@@ -7,6 +7,7 @@ from merge_and_rebase.rebase.methods.theseus import TheseusRebase
 def test_theseus_reuses_activation_cache(tmp_path, monkeypatch) -> None:
     source = nn.Linear(2, 2, bias=False)
     target = nn.Linear(2, 2, bias=False)
+    source.register_parameter("scalar", nn.Parameter(torch.tensor(1.0)))
     batches = [(torch.ones(2, 2),)]
     method = TheseusRebase()
     calls = 0
