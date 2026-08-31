@@ -361,6 +361,16 @@ def _evaluate_cross_task_source_lmc(
     ]
     loss_gaps = [average_loss[i] - loss_chord[i] for i in range(len(alphas))]
     in_unit = [i for i, alpha in enumerate(alphas) if 0.0 <= float(alpha) <= 1.0]
+    per_task_loss_chord_gap = {
+        task: [
+            loss - ((1.0 - float(alpha)) * losses[idx0] + float(alpha) * losses[idx1])
+            for alpha, loss in zip(alphas, losses, strict=True)
+        ]
+        for task, losses in per_task_loss.items()
+    }
+    per_task_max_loss_barrier = {
+        task: float(max(gaps[i] for i in in_unit)) for task, gaps in per_task_loss_chord_gap.items()
+    }
     max_gap_idx = max(in_unit, key=lambda i: loss_gaps[i])
     min_gap_idx = min(in_unit, key=lambda i: loss_gaps[i])
     area_below = sum(
@@ -373,6 +383,9 @@ def _evaluate_cross_task_source_lmc(
         "average_loss": average_loss,
         "per_task_accuracy": per_task_accuracy,
         "per_task_loss": per_task_loss,
+        "per_task_loss_chord_gap": per_task_loss_chord_gap,
+        "per_task_max_loss_barrier": per_task_max_loss_barrier,
+        "max_per_task_loss_barrier": float(max(per_task_max_loss_barrier.values())),
         "loss_chord_gap": loss_gaps,
         "max_loss_barrier": float(loss_gaps[max_gap_idx]),
         "max_loss_barrier_alpha": float(alphas[max_gap_idx]),

@@ -107,6 +107,8 @@ def test_cross_task_source_lmc_evaluates_both_task_contexts(monkeypatch) -> None
 
     assert set(result["per_task_loss"]) == {"task_a", "task_b"}
     assert len(result["average_loss"]) == 3
+    assert set(result["per_task_loss_chord_gap"]) == {"task_a", "task_b"}
+    assert result["max_per_task_loss_barrier"] >= 0.0
     assert torch.equal(model.state_dict()["bias"], endpoint_a["bias"])
 
 
