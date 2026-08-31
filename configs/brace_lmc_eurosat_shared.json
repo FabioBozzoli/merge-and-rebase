@@ -13,6 +13,8 @@
     "seq_align": "interpolate2d",
     "split_qkv": true,
     "center_acts": false,
+    "activation_cache_dir": "results/brace_lmc_corrected/theseus_activation_cache",
+    "activation_cache_mode": "auto",
     "transform_granularity": "param",
     "device_transform": "cpu"
   },

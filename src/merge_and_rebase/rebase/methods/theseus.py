@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -378,6 +381,72 @@ class ActivationStore:
         if epsilon > 0 and gram.shape[0] == gram.shape[1]:
             gram = gram + epsilon * torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
         return gram
+
+
+def _activation_cache_fingerprint(
+    *,
+    source_model: nn.Module,
+    target_model: nn.Module,
+    source_dataloader: Iterable[Any],
+    target_dataloader: Iterable[Any],
+    seq_align: str,
+    n_batches: int | None,
+    seed: int,
+    batch_size: int | None,
+    cache_key: str | None,
+) -> str:
+    """Fingerprint every input that affects streamed activation statistics."""
+    digest = sha256()
+    for value in (seq_align, n_batches, seed, batch_size, cache_key):
+        digest.update(repr(value).encode())
+    for model in (source_model, target_model):
+        for name, tensor in sorted(model.state_dict().items()):
+            digest.update(name.encode())
+            digest.update(str(tensor.dtype).encode())
+            digest.update(repr(tuple(tensor.shape)).encode())
+            digest.update(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+    for loader in (source_dataloader, target_dataloader):
+        dataset = getattr(loader, "dataset", None)
+        digest.update(f"{type(loader).__qualname__}:{type(dataset).__qualname__}".encode())
+        for value in (loader, dataset):
+            try:
+                digest.update(str(len(value)).encode())
+            except TypeError:
+                digest.update(b"unknown-length")
+    return digest.hexdigest()
+
+
+def _activation_registry_payload(registry: Mapping[str, ActivationStore]) -> dict[str, dict[str, Any]]:
+    return {
+        key: {
+            "store_raw": store.store_raw,
+            "store_a_gram": store.store_a_gram,
+            "store_b_gram": store.store_b_gram,
+            "at_b": store.at_b,
+            "at_a": store.at_a,
+            "bt_b": store.bt_b,
+            "sum_a": store.sum_a,
+            "sum_b": store.sum_b,
+            "n_samples": store.n_samples,
+            "h_a_list": store.h_a_list,
+            "h_b_list": store.h_b_list,
+        }
+        for key, store in registry.items()
+    }
+
+
+def _activation_registry_from_payload(payload: Mapping[str, Mapping[str, Any]]) -> dict[str, ActivationStore]:
+    registry: dict[str, ActivationStore] = {}
+    for key, values in payload.items():
+        store = ActivationStore(
+            store_raw=bool(values["store_raw"]),
+            store_a_gram=bool(values["store_a_gram"]),
+            store_b_gram=bool(values["store_b_gram"]),
+        )
+        for name in ("at_b", "at_a", "bt_b", "sum_a", "sum_b", "n_samples", "h_a_list", "h_b_list"):
+            setattr(store, name, values[name])
+        registry[key] = store
+    return registry
 
 
 class _ActivationHook:
@@ -1155,6 +1224,13 @@ class TheseusRebase:
         covariance_mode: str = "activations",
         **kwargs,
     ) -> dict[str, Any]:
+        activation_cache_dir = kwargs.pop("activation_cache_dir", None)
+        activation_cache_mode = str(kwargs.pop("activation_cache_mode", "off")).lower()
+        activation_cache_key = kwargs.pop("activation_cache_key", None)
+        if activation_cache_mode not in {"off", "auto", "load", "refresh"}:
+            raise ValueError("activation_cache_mode must be one of: off, auto, load, refresh")
+        if activation_cache_mode != "off" and not activation_cache_dir:
+            raise ValueError("activation_cache_dir is required when activation_cache_mode is enabled")
         split_qkv = kwargs.pop("split_qkv", None)
         if split_qkv is not None:
             patch_qkv = bool(split_qkv)
@@ -1209,21 +1285,51 @@ class TheseusRebase:
         unpatched_target = 0
         try:
             if covariance_mode == "activations":
-                if verbose:
-                    print(f"{log_prefix} prepare: collecting activations")
+                cache_path: Path | None = None
+                if activation_cache_mode != "off":
+                    fingerprint = _activation_cache_fingerprint(
+                        source_model=source_model,
+                        target_model=target_model,
+                        source_dataloader=source_dataloader,
+                        target_dataloader=target_dataloader,
+                        seq_align=seq_align,
+                        n_batches=n_batches,
+                        seed=int(seed),
+                        batch_size=batch_size,
+                        cache_key=activation_cache_key,
+                    )
+                    cache_path = Path(activation_cache_dir) / f"theseus_activations_{fingerprint}.pt"
+                    if activation_cache_mode != "refresh" and cache_path.exists():
+                        activation_registry = _activation_registry_from_payload(
+                            torch.load(cache_path, map_location="cpu", weights_only=True)
+                        )
+                        if verbose:
+                            print(f"{log_prefix} prepare: loaded activations from {cache_path}")
+                    elif activation_cache_mode == "load":
+                        raise FileNotFoundError(f"Theseus activation cache not found: {cache_path}")
 
-                activation_registry = collect_activations(
-                    source_model,
-                    target_model,
-                    source_dataloader,
-                    target_dataloader,
-                    device=device,
-                    seq_align=seq_align,
-                    n_batches=n_batches,
-                    seed=int(seed),
-                    batch_size=batch_size,
-                    family_adapter=family_adapter,
-                )
+                if not activation_registry:
+                    if verbose:
+                        print(f"{log_prefix} prepare: collecting activations")
+                    activation_registry = collect_activations(
+                        source_model,
+                        target_model,
+                        source_dataloader,
+                        target_dataloader,
+                        device=device,
+                        seq_align=seq_align,
+                        n_batches=n_batches,
+                        seed=int(seed),
+                        batch_size=batch_size,
+                        family_adapter=family_adapter,
+                    )
+                    if cache_path is not None:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        temporary_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+                        torch.save(_activation_registry_payload(activation_registry), temporary_path)
+                        temporary_path.replace(cache_path)
+                        if verbose:
+                            print(f"{log_prefix} prepare: saved activations to {cache_path}")
                 if verbose:
                     print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
             elif verbose:
