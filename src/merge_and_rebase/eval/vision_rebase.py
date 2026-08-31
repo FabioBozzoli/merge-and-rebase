@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from merge_and_rebase.utils.helpers import load_json, parse_csv
 
@@ -121,6 +122,141 @@ def _evaluate_source_model_top1(
         force_rebuild=False,
     )
     return float(eval_clf.top1(eval_loader, device=device))
+
+
+@torch.no_grad()
+def _evaluate_source_lmc(
+    *,
+    model: torch.nn.Module,
+    restore_sd: dict[str, torch.Tensor],
+    endpoint_a_sd: dict[str, torch.Tensor],
+    endpoint_b_sd: dict[str, torch.Tensor],
+    clf_source: OpenClipClassifier,
+    loaders_obj: Any,
+    classnames_task: list[str],
+    source_build_cfg_task: OpenClipBuildConfig,
+    split: str,
+    first_n_batches: int | None,
+    alphas: list[float],
+    device: str,
+) -> dict[str, Any]:
+    """Evaluate the parameter chord between two source endpoints.
+
+    This is deliberately evaluated in the source architecture, before width
+    transport, so a low barrier can be compared with downstream transport
+    quality. The caller supplies ``restore_sd`` because the interpolation is
+    loaded into a live model in order to avoid another full model copy.
+    """
+    if not alphas or not any(abs(float(a)) < 1e-8 for a in alphas) or not any(
+        abs(float(a) - 1.0) < 1e-8 for a in alphas
+    ):
+        raise ValueError("source LMC alphas must include both 0 and 1")
+    if set(endpoint_a_sd) != set(endpoint_b_sd):
+        raise ValueError("source LMC endpoint keyspaces differ")
+
+    eval_clf = OpenClipClassifier(
+        model=model,
+        tokenizer=clf_source.tokenizer,
+        preprocess=clf_source.preprocess,
+        normalize=clf_source.normalize,
+        logit_scale=clf_source.logit_scale,
+    )
+    eval_clf.build_zeroshot_text_features(
+        classnames_task,
+        source_build_cfg_task,
+        cache_dir="src/.cache/zs_cache",
+        force_rebuild=False,
+    )
+    eval_loader = resolve_eval_split_loader(loaders_obj, split)
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    eval_clf.to(dev)
+    eval_clf.eval()
+
+    accuracies: list[float] = []
+    losses: list[float] = []
+    try:
+        for alpha in alphas:
+            interpolated: dict[str, torch.Tensor] = {}
+            for key, value_a in endpoint_a_sd.items():
+                value_b = endpoint_b_sd[key]
+                if torch.is_floating_point(value_a):
+                    interpolated[key] = torch.lerp(value_a, value_b, float(alpha))
+                else:
+                    interpolated[key] = value_a
+            load_into_model(model, interpolated, strict=False)
+            del interpolated
+
+            loader = eval_loader
+            if first_n_batches is not None:
+                loader = itertools.islice(iter(eval_loader), max(1, int(first_n_batches)))
+            total = 0
+            correct = 0
+            loss_sum = 0.0
+            for images, labels in loader:
+                images = images.to(dev, non_blocking=True)
+                labels = labels.to(dev, non_blocking=True)
+                logits = eval_clf(images)
+                loss_sum += float(F.cross_entropy(logits, labels, reduction="sum").item())
+                correct += int((logits.argmax(dim=-1) == labels).sum().item())
+                total += int(labels.numel())
+            accuracies.append(float(correct / max(1, total)))
+            losses.append(float(loss_sum / max(1, total)))
+            print(
+                f"    source LMC alpha={float(alpha):.3f} "
+                f"acc={accuracies[-1]:.6f} loss={losses[-1]:.6f}"
+            )
+    finally:
+        load_into_model(model, restore_sd, strict=False)
+
+    idx0 = min(range(len(alphas)), key=lambda i: abs(float(alphas[i])))
+    idx1 = min(range(len(alphas)), key=lambda i: abs(float(alphas[i]) - 1.0))
+    loss_chord = [
+        (1.0 - float(alpha)) * losses[idx0] + float(alpha) * losses[idx1]
+        for alpha in alphas
+    ]
+    errors = [1.0 - acc for acc in accuracies]
+    error_chord = [
+        (1.0 - float(alpha)) * errors[idx0] + float(alpha) * errors[idx1]
+        for alpha in alphas
+    ]
+    in_unit = [i for i, alpha in enumerate(alphas) if 0.0 <= float(alpha) <= 1.0]
+    loss_barriers = [losses[i] - loss_chord[i] for i in range(len(alphas))]
+    error_barriers = [errors[i] - error_chord[i] for i in range(len(alphas))]
+    max_loss_idx = max(in_unit, key=lambda i: loss_barriers[i])
+    max_error_idx = max(in_unit, key=lambda i: error_barriers[i])
+    min_loss_idx = min(in_unit, key=lambda i: loss_barriers[i])
+    min_error_idx = min(in_unit, key=lambda i: error_barriers[i])
+
+    def _area_below_chord(gaps: list[float]) -> float:
+        """Trapezoidal integral of the amount the path lies below its chord."""
+        return float(
+            sum(
+                max(0.0, -0.5 * (gaps[left] + gaps[right])) * (float(alphas[right]) - float(alphas[left]))
+                for left, right in zip(in_unit, in_unit[1:], strict=True)
+            )
+        )
+
+    return {
+        "alphas": [float(a) for a in alphas],
+        "accuracy": accuracies,
+        "loss": losses,
+        "loss_barrier_curve": loss_barriers,
+        "error_barrier_curve": error_barriers,
+        "max_loss_barrier": float(loss_barriers[max_loss_idx]),
+        "max_loss_barrier_alpha": float(alphas[max_loss_idx]),
+        "min_loss_chord_gap": float(loss_barriers[min_loss_idx]),
+        "min_loss_chord_gap_alpha": float(alphas[min_loss_idx]),
+        "mean_loss_chord_gap": float(sum(loss_barriers[i] for i in in_unit) / len(in_unit)),
+        "area_below_loss_chord": _area_below_chord(loss_barriers),
+        "max_error_barrier": float(error_barriers[max_error_idx]),
+        "max_error_barrier_alpha": float(alphas[max_error_idx]),
+        "min_error_chord_gap": float(error_barriers[min_error_idx]),
+        "min_error_chord_gap_alpha": float(alphas[min_error_idx]),
+        "mean_error_chord_gap": float(sum(error_barriers[i] for i in in_unit) / len(in_unit)),
+        "area_below_error_chord": _area_below_chord(error_barriers),
+        "split": split,
+        "first_n_batches": first_n_batches,
+    }
 
 
 def _scale_delta(delta_sd: dict[str, torch.Tensor], weight: float) -> dict[str, torch.Tensor]:
@@ -426,9 +562,19 @@ def _build_rebase_prepared(
         )
 
     if theseus_like_method:
-        source_model_for_theseus = deepcopy(clf_source.model)
+        if run_block_extension_prestep:
+            if source_base_model_task is None:
+                raise RuntimeError("Theseus block-extension preprocess requires the corrected source base model.")
+            # ``task_source_base_sd`` contains the expanded/shrunk BRACE state.
+            # Starting from the original source architecture here and loading
+            # non-strictly would silently discard added blocks, causing Theseus
+            # to collect activations from the wrong computation graph.
+            source_model_for_theseus = deepcopy(source_base_model_task)
+            load_into_model(source_model_for_theseus, task_source_base_sd, strict=True)
+        else:
+            source_model_for_theseus = deepcopy(clf_source.model)
+            load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
         target_model_for_theseus = deepcopy(clf_target.model)
-        load_into_model(source_model_for_theseus, task_source_base_sd, strict=False)
         load_into_model(target_model_for_theseus, target_base_sd, strict=False)
 
         return method.prepare(
@@ -636,6 +782,24 @@ def main() -> None:
         if block_extension_eval_split not in {"val", "test"}:
             raise ValueError("block_extension_eval_split must be one of: val, test")
         block_extension_eval_first_n_batches = block_extension_cfg.first_n_eval_batches
+        source_lmc_eval = bool(cfg.get("source_lmc_eval", False))
+        source_lmc_eval_split = str(cfg.get("source_lmc_eval_split", "val")).strip().lower()
+        if source_lmc_eval_split not in {"val", "test"}:
+            raise ValueError("source_lmc_eval_split must be one of: val, test")
+        source_lmc_first_n_batches_raw = cfg.get("source_lmc_first_n_batches", None)
+        source_lmc_first_n_batches = (
+            int(source_lmc_first_n_batches_raw) if source_lmc_first_n_batches_raw is not None else None
+        )
+        source_lmc_alpha_min = float(cfg.get("source_lmc_alpha_min", 0.0))
+        source_lmc_alpha_max = float(cfg.get("source_lmc_alpha_max", 1.0))
+        source_lmc_alpha_step = float(cfg.get("source_lmc_alpha_step", 0.05))
+        if source_lmc_alpha_step <= 0:
+            raise ValueError("source_lmc_alpha_step must be > 0")
+        source_lmc_alphas = torch.arange(
+            source_lmc_alpha_min,
+            source_lmc_alpha_max + source_lmc_alpha_step * 0.5,
+            source_lmc_alpha_step,
+        ).tolist()
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
 
@@ -861,6 +1025,7 @@ def main() -> None:
         transport_timings: dict[str, dict[str, float]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         block_extension_eval_rows: list[dict[str, Any]] = []
+        source_lmc_rows: list[dict[str, Any]] = []
 
         transfusion_prepared: dict[str, Any] | None = None
 
@@ -973,6 +1138,36 @@ def main() -> None:
 
                 block_extension_eval_rows.append(eval_row)
 
+            source_lmc_row: dict[str, Any] | None = None
+            if source_lmc_eval and run_block_extension_prestep:
+                if source_loaders is None or source_base_model_task is None or source_ft_model_task is None:
+                    raise RuntimeError("Source LMC evaluation requires initialized source models and loaders.")
+                source_lmc_row = {
+                    "task": task,
+                    "lmc_mode": block_extension_cfg.lmc_mode,
+                }
+                source_pre_base_sd = to_cpu_fp32(
+                    {key: value for key, value in source_base_model_task.state_dict().items()}
+                )
+                source_pre_ft_sd = to_cpu_fp32(
+                    {key: value for key, value in source_ft_model_task.state_dict().items()}
+                )
+                print(f"  {task}: evaluating source LMC before block extension")
+                source_lmc_row["before_brace"] = _evaluate_source_lmc(
+                    model=source_base_model_task,
+                    restore_sd=source_pre_base_sd,
+                    endpoint_a_sd=source_pre_base_sd,
+                    endpoint_b_sd=source_pre_ft_sd,
+                    clf_source=clf_source,
+                    loaders_obj=source_loaders,
+                    classnames_task=classnames,
+                    source_build_cfg_task=source_build_cfg_task,
+                    split=source_lmc_eval_split,
+                    first_n_batches=source_lmc_first_n_batches,
+                    alphas=source_lmc_alphas,
+                    device=device,
+                )
+
             if run_block_extension_prestep:
                 if source_loaders is None:
                     raise ValueError("Block extension preprocess requires source_loaders for calibration.")
@@ -1007,6 +1202,42 @@ def main() -> None:
                     strict=False,
                     key_filter=_visual_only_filter,
                 ).delta
+
+                if source_lmc_row is not None:
+                    print(f"  {task}: evaluating source LMC after block extension")
+                    source_lmc_row["after_brace"] = _evaluate_source_lmc(
+                        model=source_base_model_task,
+                        restore_sd=task_source_base_sd,
+                        endpoint_a_sd=task_source_base_sd,
+                        endpoint_b_sd=task_source_ft_sd,
+                        clf_source=clf_source,
+                        loaders_obj=source_loaders,
+                        classnames_task=classnames,
+                        source_build_cfg_task=source_build_cfg_task,
+                        split=source_lmc_eval_split,
+                        first_n_batches=source_lmc_first_n_batches,
+                        alphas=source_lmc_alphas,
+                        device=device,
+                    )
+                    source_lmc_rows.append(source_lmc_row)
+                    run_logger.log_event(
+                        "source_lmc",
+                        metrics={
+                            f"source_lmc/{task}/before/max_loss_barrier": source_lmc_row["before_brace"][
+                                "max_loss_barrier"
+                            ],
+                            f"source_lmc/{task}/after/max_loss_barrier": source_lmc_row["after_brace"][
+                                "max_loss_barrier"
+                            ],
+                            f"source_lmc/{task}/before/max_error_barrier": source_lmc_row["before_brace"][
+                                "max_error_barrier"
+                            ],
+                            f"source_lmc/{task}/after/max_error_barrier": source_lmc_row["after_brace"][
+                                "max_error_barrier"
+                            ],
+                        },
+                        context={"task": task, "lmc_mode": block_extension_cfg.lmc_mode},
+                    )
 
                 if block_extension_eval_enabled:
                     zero_post = _evaluate_source_model_top1(
@@ -1938,6 +2169,7 @@ def main() -> None:
                 item["task"]: float(selected_baseline_alpha_by_task[i]) for i, item in enumerate(per_task)
             },
             "block_extension_target_dataset_eval": block_extension_eval_rows,
+            "source_lmc": source_lmc_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
             "saved_merged_path": saved_merged_path,
