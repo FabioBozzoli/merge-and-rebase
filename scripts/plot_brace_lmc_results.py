@@ -1,0 +1,141 @@
+"""Plot completed BRACE/LMC summaries.
+
+Usage: PYTHONPATH=src MPLCONFIGDIR=/tmp/matplotlib .venv/bin/python scripts/plot_brace_lmc_results.py
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+
+ROOT = Path("results/brace_lmc_corrected")
+OUT = ROOT / "plots"
+
+
+def load(name: str) -> dict:
+    return json.loads((ROOT / f"{name}.json").read_text())
+
+
+def main() -> None:
+    OUT.mkdir(parents=True, exist_ok=True)
+    single = {mode: load(f"eurosat_{mode}") for mode in ("independent", "shared")}
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
+    before = single["independent"]["source_lmc"][0]["before_brace"]
+    axes[0].plot(before["alphas"], before["loss"], "--", color="black", label="before BRACE (same for both)")
+    for mode, summary in single.items():
+        after = summary["source_lmc"][0]["after_brace"]
+        axes[0].plot(after["alphas"], after["loss"], label=f"{mode}: after BRACE")
+        axes[1].plot(after["alphas"], after["loss_barrier_curve"], label=mode)
+    axes[1].axhline(0, color="black", linewidth=0.8)
+    axes[0].set(title="EuroSAT source loss", xlabel="Interpolation α", ylabel="Cross-entropy")
+    axes[1].set(title="Corrected loss minus endpoint chord", xlabel="Interpolation α", ylabel="Loss chord gap")
+    axes[0].legend(fontsize=8)
+    axes[1].legend(fontsize=8)
+    fig.suptitle("EuroSAT source LMC: base checkpoint (α=0) → fine-tuned checkpoint (α=1)")
+    fig.savefig(OUT / "eurosat_lmc.png", dpi=180)
+    plt.close(fig)
+
+    cross = load("eurosat_gtsrb_shared")["cross_task_source_lmc"][0]
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
+    axes[0].plot(cross["alphas"], cross["average_loss"], label="average loss")
+    axes[0].plot(cross["alphas"], cross["loss_chord_gap"], label="loss chord gap")
+    axes[0].axhline(0, color="black", linewidth=0.8)
+    axes[0].set(title="Shared EuroSAT↔GTSRB LMC", xlabel="EuroSAT → GTSRB α", ylabel="Loss")
+    for task, values in cross["per_task_accuracy"].items():
+        axes[1].plot(cross["alphas"], values, label=task)
+    axes[1].set(title="Per-task source accuracy along path", xlabel="EuroSAT → GTSRB α", ylabel="Accuracy")
+    axes[0].legend(fontsize=8)
+    axes[1].legend(fontsize=8)
+    fig.suptitle("Shared cross-task source LMC: EuroSAT fine-tuned (α=0) → GTSRB fine-tuned (α=1)")
+    fig.savefig(OUT / "shared_cross_task_lmc.png", dpi=180)
+    plt.close(fig)
+
+    cross_by_mode = {
+        mode: load(f"eurosat_gtsrb_{mode}")["cross_task_source_lmc"][0]
+        for mode in ("shared", "independent")
+    }
+    fig, axes = plt.subplots(4, 2, figsize=(10, 11.0), constrained_layout=True)
+    for mode, values in cross_by_mode.items():
+        axes[0, 0].plot(values["alphas"], values["average_loss"], "-o", markersize=2.5, label=mode)
+        axes[0, 1].plot(values["alphas"], values["loss_chord_gap"], "-o", markersize=2.5, label=mode)
+        for task, losses in values["per_task_loss"].items():
+            chord = [(1 - alpha) * losses[0] + alpha * losses[-1] for alpha in values["alphas"]]
+            axes[1, 0 if task == "EuroSAT" else 1].plot(
+                values["alphas"], [loss - ref for loss, ref in zip(losses, chord, strict=True)], "-o", markersize=2.5, label=mode
+            )
+        for task, accuracy in values["per_task_accuracy"].items():
+            axes[2, 0 if task == "EuroSAT" else 1].plot(values["alphas"], accuracy, "-o", markersize=2.5, label=mode)
+        axes[3, 0].plot(values["alphas"], values["average_accuracy"], "-o", markersize=2.5, label=mode)
+    axes[0, 1].axhline(0, color="black", linewidth=0.8)
+    axes[1, 0].axhline(0, color="black", linewidth=0.8)
+    axes[1, 1].axhline(0, color="black", linewidth=0.8)
+    axes[0, 0].set(title="Average source loss", xlabel="EuroSAT → GTSRB α", ylabel="Cross-entropy")
+    axes[0, 1].set(title="Loss minus endpoint chord", xlabel="EuroSAT → GTSRB α", ylabel="Loss chord gap")
+    axes[1, 0].set(title="EuroSAT loss minus endpoint chord", xlabel="EuroSAT → GTSRB α", ylabel="Loss chord gap")
+    axes[1, 1].set(title="GTSRB loss minus endpoint chord", xlabel="EuroSAT → GTSRB α", ylabel="Loss chord gap")
+    axes[2, 0].set(title="EuroSAT source accuracy", xlabel="EuroSAT → GTSRB α", ylabel="Accuracy")
+    axes[2, 1].set(title="GTSRB source accuracy", xlabel="EuroSAT → GTSRB α", ylabel="Accuracy")
+    axes[3, 0].set(title="Mean source accuracy across EuroSAT and GTSRB", xlabel="EuroSAT → GTSRB α", ylabel="Accuracy")
+    axes[3, 1].set_visible(False)
+    for axis in (axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1], axes[3, 0]):
+        axis.legend(fontsize=8)
+    fig.suptitle("Cross-task source LMC: corrected EuroSAT fine-tuned (α=0) → GTSRB fine-tuned (α=1)")
+    fig.savefig(OUT / "cross_task_lmc_comparison.png", dpi=180)
+    plt.close(fig)
+
+    lambda_runs = (
+        ("λ=0 independent", "gtsrb_independent_lambda0"),
+        ("λ=0 shared", "gtsrb_shared_lambda0"),
+        ("λ=1000 independent", "gtsrb_independent_lambda1000"),
+        ("λ=1000 shared", "gtsrb_shared_lambda1000"),
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
+    for label, name in lambda_runs:
+        lmc = json.loads((ROOT / "lambda_sweep" / f"{name}.json").read_text())["source_lmc"][0]["after_brace"]
+        axes[0].plot(lmc["alphas"], lmc["loss"], "-o", markersize=2.5, label=label)
+        axes[1].plot(lmc["alphas"], lmc["loss_barrier_curve"], "-o", markersize=2.5, label=label)
+    axes[1].axhline(0, color="black", linewidth=0.8)
+    for axis in axes:
+        axis.xaxis.set_minor_locator(MultipleLocator(0.05))
+        axis.grid(axis="x", which="minor", alpha=0.2)
+    axes[0].set(title="Corrected GTSRB source loss", xlabel="Base → fine-tuned α", ylabel="Cross-entropy")
+    axes[1].set(title="Corrected loss minus endpoint chord", xlabel="Base → fine-tuned α", ylabel="Loss chord gap")
+    axes[0].legend(fontsize=8)
+    axes[1].legend(fontsize=8)
+    fig.suptitle("GTSRB source LMC after BRACE correction: completed lambda ablations")
+    fig.savefig(OUT / "gtsrb_lambda_lmc.png", dpi=180)
+    plt.close(fig)
+
+    rows = [("EuroSAT\nindependent", single["independent"]["test_results"]), ("EuroSAT\nshared", single["shared"]["test_results"])]
+    shared_cross = load("eurosat_gtsrb_shared")["test_results"]
+    rows += [
+        ("EuroSAT\nshared cross", {"per_task_rebased": {"x": shared_cross["per_task_rebased"]["EuroSAT"]}, "per_task_baseline": {"x": shared_cross["per_task_baseline"]["EuroSAT"]}}),
+        ("GTSRB\nshared cross", {"per_task_rebased": {"x": shared_cross["per_task_rebased"]["GTSRB"]}, "per_task_baseline": {"x": shared_cross["per_task_baseline"]["GTSRB"]}}),
+    ]
+    for name, label in (
+        ("gtsrb_shared_lambda0", "GTSRB\nλ0 shared"),
+        ("gtsrb_independent_lambda0", "GTSRB\nλ0 independent"),
+        ("gtsrb_shared_lambda1000", "GTSRB\nλ1000 shared"),
+        ("gtsrb_independent_lambda1000", "GTSRB\nλ1000 independent"),
+    ):
+        result = json.loads((ROOT / "lambda_sweep" / f"{name}.json").read_text())["test_results"]
+        rows.append((label, result))
+    labels = [label for label, _ in rows]
+    rebased = [next(iter(item["per_task_rebased"].values())) for _, item in rows]
+    baseline = [next(iter(item["per_task_baseline"].values())) for _, item in rows]
+    x = list(range(len(labels)))
+    fig, ax = plt.subplots(figsize=(11, 3.8), constrained_layout=True)
+    ax.bar([v - 0.2 for v in x], baseline, width=0.4, label="target zero-shot")
+    ax.bar([v + 0.2 for v in x], rebased, width=0.4, label="rebased")
+    ax.set(xticks=x, xticklabels=labels, ylim=(0, 0.8), ylabel="Test accuracy")
+    ax.legend()
+    fig.suptitle("Final target-model test accuracy after validation-selected rebase alpha")
+    fig.savefig(OUT / "completed_test_accuracy.png", dpi=180)
+
+
+if __name__ == "__main__":
+    main()
