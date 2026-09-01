@@ -19,7 +19,7 @@ PAIRS = {
 
 
 def _load(pair: str, mode: str) -> dict:
-    path = MERGE / f"{pair}_{mode}_task_arithmetic.json"
+    path = ROOT / f"{pair}_{mode}.json" if pair == "dtd_svhn" else MERGE / f"{pair}_{mode}_task_arithmetic.json"
     return json.loads(path.read_text())
 
 
