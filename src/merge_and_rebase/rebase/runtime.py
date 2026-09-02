@@ -47,4 +47,8 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
         batches = int(method_params.get("num_batches", 1))
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
         return f"bico_gradin(batches={batches}, align={seq_align}, in=grad)"
+    if method_name == "steer":
+        regime = str(method_params.get("feature_regime", "standard"))
+        stage2 = str(method_params.get("stage_2_strategy", "global_ridge"))
+        return f"steer(regime={regime}, stage2={stage2})"
     return method_name

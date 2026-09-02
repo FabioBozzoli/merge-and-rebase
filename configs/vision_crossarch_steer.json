@@ -1,0 +1,38 @@
+{
+  "suite": "vision8",
+  "tasks": "GTSRB",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-L-14",
+  "target_clip_pretrained": "laion2b_s32b_b82k",
+  "method": "steer",
+  "method_params": {
+    "feature_regime": "linear",
+    "stage_2_strategy": "block_ridge",
+    "block_group_strategy": "concat",
+    "block_ridge_mode": "smoothed_residual",
+    "rho": 0.9,
+    "stage1_lambda": 1.0,
+    "ridge_lambda": 1.0,
+    "few_shot": 16,
+    "feature_cache_dir": "src/.cache/steer_features",
+    "force_recompute_features": false,
+    "seed": 42
+  },
+  "alpha_search": true,
+  "alpha_selection": "shared",
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_patience": 5,
+  "alpha": 1.0,
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "seed": 54,
+  "no_humanize": true,
+  "weights": null,
+  "tuned_ckpts": {
+    "GTSRB": "src/checkpoints/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt"
+  }
+}

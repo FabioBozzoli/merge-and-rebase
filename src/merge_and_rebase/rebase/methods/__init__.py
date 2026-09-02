@@ -4,6 +4,7 @@ from .bico import BiCoGradInRebase, BiCoRebase
 from .gradfix import GradFixRebase
 from .identity import IdentityTransport
 from .orthogonal_shift import OrthogonalShiftTransport
+from .steer import SteerRebase
 from .theseus import TheseusRebase
 from .transfusion import TransFusionRebase
 
@@ -13,6 +14,7 @@ __all__ = [
     "BiCoRebase",
     "IdentityTransport",
     "OrthogonalShiftTransport",
+    "SteerRebase",
     "TheseusRebase",
     "TransFusionRebase",
 ]
