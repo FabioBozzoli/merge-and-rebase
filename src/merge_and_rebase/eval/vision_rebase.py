@@ -864,6 +864,8 @@ def main() -> None:
             elif steer_mode:
                 steer_source_tag = f"{source_cfg.model_name}_{source_cfg.pretrained}"
                 steer_target_tag = f"{target_cfg.model_name}_{target_cfg.pretrained}"
+                steer_method_params = dict(method_params)
+                steer_seed = int(steer_method_params.pop("seed", cfg.get("seed", 42)))
                 prepared = method.prepare(
                     clf_source=clf_source_finetuned,
                     clf_source_pretrained=clf_source,
@@ -877,8 +879,8 @@ def main() -> None:
                     device=device,
                     source_tag=steer_source_tag,
                     target_tag=steer_target_tag,
-                    seed=int(cfg.get("seed", 42)),
-                    **method_params,
+                    seed=steer_seed,
+                    **steer_method_params,
                 )
                 steer_prepared_by_task[task] = prepared
             else:
