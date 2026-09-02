@@ -519,13 +519,19 @@ def _collect_linear_split(
     linmod = LinearizedModule.from_module(source_pretrained_visual, device=device, copy_module=False, param_names=param_names)
     theta0 = dict(zip(linmod.param_names, linmod.theta0, strict=True))
 
-    num_target_blocks = _num_residual_blocks(target_visual)
+    num_target_residual = _num_residual_blocks(target_visual)
 
     features_a: list[torch.Tensor] = []
     delta_a: list[torch.Tensor] = []
     delta_a_blocks: list[torch.Tensor] = []
     features_b: list[torch.Tensor] = []
-    features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_blocks)}
+    # Same numbering as the source side (_parameter_blocks_for_visual): keys
+    # 0..num_target_residual-1 are the residual blocks, key num_target_residual
+    # is the final pooled/output feature -- matching steer4rebase's own
+    # create_activation_hooks convention (a hook on model.visual itself at
+    # index num_blocks - 1) and its saved features_B_blocks.pt layout, so a
+    # cache produced by the original pipeline is directly interchangeable.
+    features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_residual + 1)}
     labels: list[torch.Tensor] = []
 
     for (x_a, y_a), (x_b, _y_b) in zip(_iter_batches(source_loader, device=device), _iter_batches(target_loader, device=device), strict=True):
@@ -559,11 +565,12 @@ def _collect_linear_split(
         delta_a_blocks.append(block_residuals)
         labels.append(y_a.cpu())
 
-        with _BlockActivationCapture(target_visual, list(range(num_target_blocks))) as capture:
+        with _BlockActivationCapture(target_visual, list(range(num_target_residual))) as capture:
             with torch.no_grad():
                 out_b = _l2_normalize(target_visual(x_b))
-        for block_id in range(num_target_blocks):
+        for block_id in range(num_target_residual):
             features_b_blocks[block_id].append(capture.activations[block_id].cpu())
+        features_b_blocks[num_target_residual].append(out_b.detach().cpu())
         features_b.append(out_b.detach().cpu())
 
     return {
@@ -831,37 +838,43 @@ class SteerRebase:
             delta_a_blocks_train = train_data["delta_A_blocks"].double()
             block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T  # [n_sel, num_A_blocks, D_B]
 
-            # The captured per-block activations cover B's residual blocks only
-            # (uniform hidden width). B's global/projected feature (the final
-            # "block", matching A's output-projection block) generally has a
-            # *different* width -- e.g. transformer hidden dim vs. joint CLIP
-            # embed dim -- so it must never be concatenated/averaged together
-            # with the residual blocks. It always stands alone as the last
-            # group, mirroring group_grid.py's make_groups (which keeps B's
-            # final layer alone for exactly this reason).
-            features_b_residual_train = {b: v.double() for b, v in train_data["features_B_blocks"].items()}
-            num_residual_target_blocks = len(features_b_residual_train)
+            # Same numbering on both sides: key num_blocks-1 is the final
+            # pooled/output feature, which has a *different* width than the
+            # uniform residual blocks (e.g. transformer hidden dim vs. joint
+            # CLIP embed dim) -- so it must never be concatenated/averaged
+            # together with the residual blocks. It always stands alone as
+            # its own group, mirroring group_grid.py's make_groups (which
+            # keeps B's final layer alone for exactly this reason). This
+            # dict is either our own _collect_linear_split output or an
+            # externally-cached features_B_blocks.pt from steer4rebase's own
+            # pipeline -- both use this exact layout, so either is accepted.
+            features_b_full_train = {b: v.double() for b, v in train_data["features_B_blocks"].items()}
+            num_target_blocks_total = len(features_b_full_train)
+            num_target_residual = num_target_blocks_total - 1
             num_source_blocks = block_targets.shape[1]
             num_source_residual_blocks = num_source_blocks - 1
             if num_source_residual_blocks < 1:
                 raise ValueError("steer block_ridge: source has no residual blocks to target.")
+            if num_target_residual < 1:
+                raise ValueError("steer block_ridge: target has no residual blocks to target.")
 
-            if num_residual_target_blocks == num_source_residual_blocks:
-                grouped_residual = features_b_residual_train
+            residual_train = {b: features_b_full_train[b] for b in range(num_target_residual)}
+            output_train = features_b_full_train[num_target_residual]
+
+            if num_target_residual == num_source_residual_blocks:
+                grouped_residual = residual_train
                 block_group_size = 1
-            elif num_residual_target_blocks > num_source_residual_blocks:
-                grouped_residual = _BLOCK_GROUP_STRATEGIES[block_group_strategy](
-                    features_b_residual_train, num_source_residual_blocks
-                )
-                block_group_size = num_residual_target_blocks / num_source_residual_blocks
+            elif num_target_residual > num_source_residual_blocks:
+                grouped_residual = _BLOCK_GROUP_STRATEGIES[block_group_strategy](residual_train, num_source_residual_blocks)
+                block_group_size = num_target_residual / num_source_residual_blocks
             else:
                 raise ValueError(
-                    f"steer block_ridge: target has fewer residual blocks ({num_residual_target_blocks}) "
+                    f"steer block_ridge: target has fewer residual blocks ({num_target_residual}) "
                     f"than source ({num_source_residual_blocks}); cannot group."
                 )
 
             grouped_train = dict(grouped_residual)
-            grouped_train[num_source_residual_blocks] = f_b  # final block, standalone, own dim
+            grouped_train[num_source_residual_blocks] = output_train
 
             local_selected = torch.arange(int(selected.numel()))
             local_blocks_train = {b: v[selected] for b, v in grouped_train.items()}
@@ -876,16 +889,16 @@ class SteerRebase:
                 activations: Mapping[str, torch.Tensor],
                 *,
                 _coefficients=coefficients,
-                _num_residual_target_blocks=num_residual_target_blocks,
+                _num_target_residual=num_target_residual,
                 _num_source_residual_blocks=num_source_residual_blocks,
                 _strategy=block_group_strategy,
             ) -> torch.Tensor:
                 coef_device = _coefficients[0].device
-                residual = {b: activations["blocks"][b].double().to(coef_device) for b in range(_num_residual_target_blocks)}
-                if _num_residual_target_blocks != _num_source_residual_blocks:
+                residual = {b: activations["blocks"][b].double().to(coef_device) for b in range(_num_target_residual)}
+                if _num_target_residual != _num_source_residual_blocks:
                     residual = _BLOCK_GROUP_STRATEGIES[_strategy](residual, _num_source_residual_blocks)
                 blocks = dict(residual)
-                blocks[_num_source_residual_blocks] = activations["global"].double().to(coef_device)
+                blocks[_num_source_residual_blocks] = activations["blocks"][_num_target_residual].double().to(coef_device)
                 out = _predict_block_ridge(_coefficients, blocks)
                 return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
@@ -936,14 +949,18 @@ def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, al
     visual = clf_target.model.visual
     original_encode_image = clf_target.model.encode_image
     needs_blocks = prepared["stage_2_strategy"] == "block_ridge"
-    num_target_blocks = _num_residual_blocks(visual) if needs_blocks else 0
+    num_target_residual = _num_residual_blocks(visual) if needs_blocks else 0
 
     def patched_encode_image(images: torch.Tensor) -> torch.Tensor:
         if needs_blocks:
-            with _BlockActivationCapture(visual, list(range(num_target_blocks))) as capture:
+            with _BlockActivationCapture(visual, list(range(num_target_residual))) as capture:
                 out = original_encode_image(images)
             out_norm = _l2_normalize(out)
-            activations = {"global": out_norm, "blocks": dict(capture.activations)}
+            # Same numbering as training (see _collect_linear_split): key
+            # num_target_residual is the final pooled/output feature.
+            blocks = dict(capture.activations)
+            blocks[num_target_residual] = out_norm
+            activations = {"global": out_norm, "blocks": blocks}
         else:
             out = original_encode_image(images)
             out_norm = _l2_normalize(out)
