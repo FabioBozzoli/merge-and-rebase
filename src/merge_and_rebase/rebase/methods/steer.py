@@ -747,18 +747,38 @@ class SteerRebase:
             # correction is scored in, and the live "rebased" numbers are not
             # comparable to the cached-space diagnostics below.
             if w_b.shape != live_w_b.shape or not torch.allclose(w_b, live_w_b, rtol=1e-4, atol=1e-6):
-                delta = (
-                    float("nan")
-                    if w_b.shape != live_w_b.shape
-                    else float((w_b - live_w_b).abs().max())
-                )
-                print(
-                    f"{log_prefix} WARNING: cached head_B differs from the live zero-shot head used at eval "
-                    f"(shapes {tuple(w_b.shape)} vs {tuple(live_w_b.shape)}, max abs diff={delta:.6g}). "
-                    f"Stage 1/2 are fit in the cached head's basis but scored in the live head's basis, "
-                    f"so the live 'rebased' accuracy will understate the method. Delete head_A.pt/head_B.pt "
-                    f"from the cache dir (or set force_recompute_features) to fit against the eval head."
-                )
+                if w_b.shape != live_w_b.shape:
+                    print(
+                        f"{log_prefix} WARNING: cached head_B has shape {tuple(w_b.shape)} but the live "
+                        f"zero-shot head used at eval has shape {tuple(live_w_b.shape)}."
+                    )
+                else:
+                    # A pure scale difference (e.g. task-arithmetic heads carry a
+                    # logit_scale factor while ours are L2-normalized) leaves argmax
+                    # unchanged and cancels out of Stage 1 (logit_map scales with the
+                    # head, pinv(w_b) inversely). A *direction* difference means the
+                    # two heads are genuinely different classifiers, and the live
+                    # 'rebased' score is then measured in the wrong basis.
+                    cos = F.cosine_similarity(w_b, live_w_b, dim=-1)
+                    scale = w_b.norm(dim=-1) / live_w_b.norm(dim=-1).clamp_min(1e-12)
+                    print(
+                        f"{log_prefix} cached head_B differs from the live eval head: "
+                        f"max abs diff={float((w_b - live_w_b).abs().max()):.6g}, "
+                        f"per-class cosine min={float(cos.min()):.6f} mean={float(cos.mean()):.6f}, "
+                        f"norm ratio mean={float(scale.mean()):.4f}"
+                    )
+                    if float(cos.min()) > 0.999:
+                        print(
+                            f"{log_prefix} -> directions match; the heads differ only by scale, which does "
+                            f"not affect argmax or the fitted correction."
+                        )
+                    else:
+                        print(
+                            f"{log_prefix} WARNING: head directions differ, so Stage 1/2 are fit against a "
+                            f"different classifier than the one eval scores with. The live 'rebased' number "
+                            f"is not comparable to the cached-space diagnostics. Regenerate features and "
+                            f"heads from the live models (fresh feature_cache_dir + force_recompute_features)."
+                        )
         else:
             w_a, w_b = live_w_a, live_w_b
             head_cache_dir.mkdir(parents=True, exist_ok=True)
