@@ -958,7 +958,18 @@ class SteerRebase:
         if need_blocks:
             cached_test_activations["blocks"] = {b: v.double() for b, v in test_data["features_B_blocks"].items()}
         stage2_test_acc = _accuracy(f_b_test + correction_fn(cached_test_activations), w_b, test_labels)
+        # Uncorrected zero-shot accuracy of B in cached-tensor space. This must
+        # match the target_zeroshot baseline vision_rebase.py measures with a
+        # live forward pass; a material gap means the cached features/head do
+        # not come from the model being evaluated (e.g. a cache built with the
+        # source/target assignment swapped), which invalidates any comparison
+        # between the cached-space diagnostics and the live "rebased" column.
+        stage0_test_acc = _accuracy(f_b_test, w_b, test_labels)
         if verbose:
+            print(
+                f"{log_prefix} prepare: cached-space B zero-shot test acc = {stage0_test_acc:.4f} "
+                f"(compare with the target_zeroshot baseline below -- they should match)"
+            )
             print(
                 f"{log_prefix} prepare: stage2 ({stage_2_strategy}) cached test acc = {stage2_test_acc:.4f} "
                 f"(predicted from B's cached features, no alpha -- matches run.py's reported metric)"
@@ -970,7 +981,11 @@ class SteerRebase:
             "feature_regime": feature_regime,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
-            "diagnostics": {"stage1_test_acc": stage1_test_acc, "stage2_test_acc": stage2_test_acc},
+            "diagnostics": {
+                "stage0_test_acc": stage0_test_acc,
+                "stage1_test_acc": stage1_test_acc,
+                "stage2_test_acc": stage2_test_acc,
+            },
         }
 
     def apply_correction(self, prepared: Mapping[str, Any], *, activations: Mapping[str, torch.Tensor], alpha: float = 1.0) -> torch.Tensor:
