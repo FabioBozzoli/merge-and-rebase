@@ -35,10 +35,26 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
 from ..registry import register
+
+
+def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    """
+    L2-normalize the final pooled visual feature. Mirrors steer4rebase's
+    LinearizedModelV2.forward_base_with_activations, which explicitly
+    L2-normalizes the model's output before it is ever used in Stage 1/2 --
+    the whole method is fit and evaluated in unit-norm CLIP embedding space,
+    matching the standard zero-shot classification convention (normalize,
+    then dot with the text head). Only the final global feature is
+    normalized this way; intermediate per-block activations (used only as
+    block_ridge regression inputs) are left raw, matching the original.
+    """
+    return F.normalize(x, dim=-1)
 
 # --------------------------------------------------------------------------
 # A. Stage 1 / Stage 2 math, ported near-verbatim from stage1.py / stage2.py
@@ -423,6 +439,36 @@ def _iter_batches(loader: Any, *, device: torch.device) -> Iterable[tuple[torch.
         yield x.to(device), y.to(device)
 
 
+def _aligned_loader_pair(source_loader: Any, target_loader: Any) -> tuple[Any, Any]:
+    """
+    Rebuild A's and B's split loaders with ``shuffle=False`` over their
+    underlying ``.dataset``, so batch ``i`` of A and batch ``i`` of B are
+    guaranteed to be the same example.
+
+    steer's Stage 1/2 fit requires per-example correspondence between A and
+    B (delta_A[i] must be paired with B's activations for the *same* image
+    i) -- exactly what steer4rebase's own feature collection mirrors with
+    "single joint traversal ... to keep pairing". The train-split loaders
+    handed in by vision_rebase.py are built with shuffle=True and no fixed
+    generator (see data/vision_loaders.py), so two independently-constructed
+    DataLoaders over the same dataset shuffle into *different, unrelated*
+    orders -- silently pairing unrelated images and making the whole fit
+    fit noise. Rebuilding both loaders here with shuffle=False bypasses that
+    regardless of how the original loaders were configured.
+    """
+    source_ds = source_loader.dataset
+    target_ds = target_loader.dataset
+    if len(source_ds) != len(target_ds):
+        raise ValueError(
+            f"steer requires source and target datasets to have the same length for pairing, "
+            f"got {len(source_ds)} vs {len(target_ds)}."
+        )
+    batch_size = source_loader.batch_size
+    aligned_source = DataLoader(source_ds, batch_size=batch_size, shuffle=False)
+    aligned_target = DataLoader(target_ds, batch_size=batch_size, shuffle=False)
+    return aligned_source, aligned_target
+
+
 @torch.no_grad()
 def _collect_standard_split(
     *,
@@ -439,11 +485,11 @@ def _collect_standard_split(
     features_b: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
     for (x_a, y_a), (x_b, _y_b) in zip(_iter_batches(source_loader, device=device), _iter_batches(target_loader, device=device), strict=True):
-        f_a_ft = clf_source_finetuned_visual(x_a)
-        f_a_pre = clf_source_pretrained_visual(x_a)
+        f_a_ft = _l2_normalize(clf_source_finetuned_visual(x_a))
+        f_a_pre = _l2_normalize(clf_source_pretrained_visual(x_a))
         features_a.append(f_a_ft.cpu())
         delta_a.append((f_a_ft - f_a_pre).cpu())
-        features_b.append(target_visual(x_b).cpu())
+        features_b.append(_l2_normalize(target_visual(x_b)).cpu())
         labels.append(y_a.cpu())
     return {
         "features_A": torch.cat(features_a, dim=0),
@@ -484,9 +530,9 @@ def _collect_linear_split(
 
     for (x_a, y_a), (x_b, _y_b) in zip(_iter_batches(source_loader, device=device), _iter_batches(target_loader, device=device), strict=True):
         with torch.no_grad():
-            f0 = source_pretrained_visual(x_a)
+            f0 = _l2_normalize(source_pretrained_visual(x_a))
 
-        full_out = linmod.forward(current_params=source_finetuned_params, args=(x_a,))
+        full_out = linmod.forward(current_params=source_finetuned_params, args=(x_a,), output_transform=_l2_normalize)
         delta_full = (full_out - f0).detach()
 
         block_residuals = torch.zeros(x_a.shape[0], num_a_blocks, delta_full.shape[-1], dtype=delta_full.dtype)
@@ -495,7 +541,7 @@ def _collect_linear_split(
                 name: (source_finetuned_params[name] if bid == block_id else theta0[name])
                 for name, bid in zip(param_names, block_ids, strict=True)
             }
-            block_out = linmod.forward(current_params=masked_params, args=(x_a,))
+            block_out = linmod.forward(current_params=masked_params, args=(x_a,), output_transform=_l2_normalize)
             block_residuals[:, block_id, :] = (block_out - f0).detach()
 
         reconstructed = block_residuals.sum(dim=1)
@@ -515,7 +561,7 @@ def _collect_linear_split(
 
         with _BlockActivationCapture(target_visual, list(range(num_target_blocks))) as capture:
             with torch.no_grad():
-                out_b = target_visual(x_b)
+                out_b = _l2_normalize(target_visual(x_b))
         for block_id in range(num_target_blocks):
             features_b_blocks[block_id].append(capture.activations[block_id].cpu())
         features_b.append(out_b.detach().cpu())
@@ -532,6 +578,25 @@ def _collect_linear_split(
 
 def _cache_split_dir(feature_cache_dir: str, source_tag: str, target_tag: str, task: str, regime: str, split: str) -> Path:
     return Path(feature_cache_dir) / f"{source_tag}_to_{target_tag}" / task / regime / split
+
+
+def _load_cached_head(path: Path) -> torch.Tensor | None:
+    """Load a head_A.pt/head_B.pt as steer4rebase's data.py::load_head does.
+
+    steer4rebase saves classification heads as either a raw tensor or a dict
+    with a "weight" key (``bea_utils._head_state``); unwrap the same way.
+    """
+    if not path.exists():
+        return None
+    try:
+        value = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+    if isinstance(value, Mapping):
+        value = value.get("weight")
+    if not isinstance(value, torch.Tensor):
+        return None
+    return value.double()
 
 
 def _load_cached_split(cache_dir: Path, *, need_blocks: bool) -> dict[str, torch.Tensor] | None:
@@ -648,10 +713,27 @@ class SteerRebase:
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         log_prefix = "[steer]"
 
-        clf_source.build_zeroshot_text_features(classnames, source_build_cfg_task, cache_dir="src/.cache/zs_cache")
-        clf_target.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache")
-        w_a = clf_source._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
-        w_b = clf_target._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
+        # steer4rebase's data.py loads head_A.pt/head_B.pt from the train split
+        # directory (a dict with a "weight" key, or a raw tensor) rather than
+        # recomputing them -- honor that cache convention here too, so heads
+        # placed on disk (e.g. from the original steering.py pipeline) are
+        # actually used instead of being silently replaced by a live
+        # zero-shot recomputation that may use a different prompt ensemble.
+        head_cache_dir = _cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, "train")
+        cached_w_a = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_A.pt")
+        cached_w_b = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_B.pt")
+        if cached_w_a is not None and cached_w_b is not None:
+            w_a, w_b = cached_w_a, cached_w_b
+            if verbose:
+                print(f"{log_prefix} using cached heads at {head_cache_dir}")
+        else:
+            clf_source.build_zeroshot_text_features(classnames, source_build_cfg_task, cache_dir="src/.cache/zs_cache")
+            clf_target.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache")
+            w_a = clf_source._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
+            w_b = clf_target._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
+            head_cache_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(w_a, head_cache_dir / "head_A.pt")
+            torch.save(w_b, head_cache_dir / "head_B.pt")
 
         source_finetuned_visual = clf_source.model.visual.to(dev).eval()
         source_pretrained_visual = clf_source_pretrained.model.visual.to(dev).eval()
@@ -659,8 +741,7 @@ class SteerRebase:
         need_blocks = stage_2_strategy == "block_ridge"
 
         def _compute(split: str) -> dict[str, Any]:
-            source_loader = getattr(source_loaders, split)
-            target_loader = getattr(target_loaders, split)
+            source_loader, target_loader = _aligned_loader_pair(getattr(source_loaders, split), getattr(target_loaders, split))
             if feature_regime == "standard":
                 return _collect_standard_split(
                     clf_source_finetuned_visual=source_finetuned_visual,
@@ -845,7 +926,10 @@ def _accuracy(features: torch.Tensor, head: torch.Tensor, labels: torch.Tensor) 
 def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, alpha: float = 1.0):
     """
     Wrap ``clf_target.model.encode_image`` so calls during the ``with`` block
-    return the un-normalized visual feature plus ``alpha * correction``.
+    return the L2-normalized visual feature plus ``alpha * correction``.
+    Stage 1/2 are fit entirely in normalized-feature space (see
+    ``_l2_normalize``), so the correction must be added there too -- not to
+    the raw pooled feature -- to match the scale it was calibrated against.
     Used by vision_rebase.py's steer_mode eval branch in place of
     axpy_state_dict + load_into_model.
     """
@@ -858,13 +942,15 @@ def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, al
         if needs_blocks:
             with _BlockActivationCapture(visual, list(range(num_target_blocks))) as capture:
                 out = original_encode_image(images)
-            activations = {"global": out, "blocks": dict(capture.activations)}
+            out_norm = _l2_normalize(out)
+            activations = {"global": out_norm, "blocks": dict(capture.activations)}
         else:
             out = original_encode_image(images)
-            activations = {"global": out}
+            out_norm = _l2_normalize(out)
+            activations = {"global": out_norm}
         method = _STEER_SINGLETON
         correction = method.apply_correction(prepared, activations=activations, alpha=alpha)
-        return out + correction.to(dtype=out.dtype, device=out.device)
+        return out_norm + correction.to(dtype=out_norm.dtype, device=out_norm.device)
 
     clf_target.model.encode_image = patched_encode_image
     try:
