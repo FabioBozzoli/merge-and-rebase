@@ -773,11 +773,15 @@ class SteerRebase:
                             f"not affect argmax or the fitted correction."
                         )
                     else:
-                        print(
-                            f"{log_prefix} WARNING: head directions differ, so Stage 1/2 are fit against a "
-                            f"different classifier than the one eval scores with. The live 'rebased' number "
-                            f"is not comparable to the cached-space diagnostics. Regenerate features and "
-                            f"heads from the live models (fresh feature_cache_dir + force_recompute_features)."
+                        raise ValueError(
+                            f"steer: cached head_B does not match the zero-shot head this run evaluates with "
+                            f"(per-class cosine mean={float(cos.mean()):.4f}; near-zero means the two heads "
+                            f"live in different embedding spaces, i.e. the cache was built for a different "
+                            f"model than '{target_tag}'). Stage 1/2 would be fit against one classifier and "
+                            f"scored against another, making every reported number meaningless. Either point "
+                            f"feature_cache_dir at a fresh directory and set force_recompute_features=true to "
+                            f"rebuild from the models in this config, or fix source/target in the config to "
+                            f"match the models the cache was generated from."
                         )
         else:
             w_a, w_b = live_w_a, live_w_b
