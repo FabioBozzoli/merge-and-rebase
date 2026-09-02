@@ -37,6 +37,7 @@ from ..merge.methods._common import axpy_state_dict
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
+from ..rebase.methods.steer import steer_correction_context
 from ..rebase.runtime import (
     format_rebase_method_label,
     resolve_rebase_method_config,
@@ -286,6 +287,7 @@ def main() -> None:
         blockext_like_method = method_name in {"theseus", "theseus_reference", "bico", "bico_gradin"}
         transfusion_mode = method_name == "transfusion"
         bico_mode = method_name in ("bico", "bico_gradin")
+        steer_mode = method_name == "steer"
         eval_before_rebase = bool(cfg.get("eval_before_rebase", False))
         block_extension_eval_requested = bool(eval_before_rebase)
         block_extension_eval_enabled = bool(block_extension_eval_requested and blockext_like_method)
@@ -394,8 +396,15 @@ def main() -> None:
         clf_source = OpenClipClassifier.build(source_cfg)
         clf_target = OpenClipClassifier.build(target_cfg)
 
-        source_depth = int(len(clf_source.model.visual.transformer.resblocks))
-        target_depth = int(len(clf_target.model.visual.transformer.resblocks))
+        source_is_vit = hasattr(clf_source.model.visual, "transformer")
+        target_is_vit = hasattr(clf_target.model.visual, "transformer")
+        source_depth = int(len(clf_source.model.visual.transformer.resblocks)) if source_is_vit else 0
+        target_depth = int(len(clf_target.model.visual.transformer.resblocks)) if target_is_vit else 0
+        if blockext_like_method and (not source_is_vit or not target_is_vit):
+            raise ValueError(
+                f"Method '{method_name}' requires ViT source/target visual encoders for its block-extension "
+                "preprocess (ResNet visual encoders are not supported by that path)."
+            )
         run_block_extension_prestep = bool(
             blockext_like_method and block_extension_enabled and source_depth < target_depth
         )
@@ -463,6 +472,7 @@ def main() -> None:
         block_extension_eval_rows: list[dict[str, Any]] = []
 
         transfusion_prepared: dict[str, Any] | None = None
+        steer_prepared_by_task: dict[str, dict[str, Any]] = {}
 
         for task in tasks:
             hf_path, hf_config, split_map = suite.resolver(task)
@@ -514,7 +524,7 @@ def main() -> None:
             )
 
             source_loaders = None
-            if theseus_like_method or transfusion_mode or bico_mode:
+            if theseus_like_method or transfusion_mode or bico_mode or steer_mode:
                 source_loaders = build_vision_loaders(
                     hf_ds=hf_ds,
                     hf_path=hf_path,
@@ -735,6 +745,14 @@ def main() -> None:
                         transfusion_prepared["source_model_unpatched"],
                     )
                     task_delta = method.compute_task_delta(tuned_sd, source_base_sd)
+                elif steer_mode:
+                    # steer never touches weights: it needs a live finetuned source
+                    # classifier (not just a raw state-dict delta) to run forward
+                    # passes through during feature collection.
+                    clf_source_finetuned = deepcopy(clf_source)
+                    load_into_model(clf_source_finetuned.model, load_ckpt(str(tuned_by_task[task])), strict=False)
+                    tuned_sd = {}
+                    task_delta = {}
                 else:
                     ckpt_path = str(tuned_by_task[task])
                     sd = load_ckpt(ckpt_path)
@@ -752,8 +770,11 @@ def main() -> None:
                         key_filter=_visual_only_filter,
                     ).delta
 
-                n_keys = len(tuned_sd)
-                print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
+                if steer_mode:
+                    print(f"Loaded finetuned source classifier for '{task}' (steer feature-space regime)")
+                else:
+                    n_keys = len(tuned_sd)
+                    print(f"Loaded tuned checkpoint for '{task}' ({n_keys} keys)")
 
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
             if torch.cuda.is_available() and device != "cpu":
@@ -840,6 +861,26 @@ def main() -> None:
                     **method_params,
                 )
                 del source_model_for_bico, target_model_for_bico, source_recipe, target_recipe
+            elif steer_mode:
+                steer_source_tag = f"{source_cfg.model_name}_{source_cfg.pretrained}"
+                steer_target_tag = f"{target_cfg.model_name}_{target_cfg.pretrained}"
+                prepared = method.prepare(
+                    clf_source=clf_source_finetuned,
+                    clf_source_pretrained=clf_source,
+                    clf_target=clf_target,
+                    source_loaders=source_loaders,
+                    target_loaders=loaders,
+                    classnames=classnames,
+                    task=task,
+                    source_build_cfg_task=source_build_cfg_task,
+                    build_cfg_task=build_cfg_task,
+                    device=device,
+                    source_tag=steer_source_tag,
+                    target_tag=steer_target_tag,
+                    seed=int(cfg.get("seed", 42)),
+                    **method_params,
+                )
+                steer_prepared_by_task[task] = prepared
             else:
                 prepared = transfusion_prepared
 
@@ -876,7 +917,7 @@ def main() -> None:
             )
 
             save_transport_dir = cfg.get("save_transported_tvs_dir", None)
-            if save_transport_dir:
+            if save_transport_dir and not steer_mode:
                 os.makedirs(save_transport_dir, exist_ok=True)
                 native_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_native.pt")
                 legacy_path = os.path.join(save_transport_dir, f"{task}_{method.name}_transported_legacy_visual.pt")
@@ -897,6 +938,14 @@ def main() -> None:
 
         can_eval_untransported_by_task: list[bool] = []
         for task_name, delta_sd in zip(tasks, untransported_deltas, strict=True):
+            if steer_mode:
+                # steer never produces a weight-space delta, so there is no
+                # "untransported" baseline concept -- always fall back to
+                # target zeroshot (uncorrected B), which is the correct
+                # baseline semantics for feature-space steering.
+                can_eval_untransported_by_task.append(False)
+                print(f"Untransported baseline for '{task_name}': not applicable (steer method).")
+                continue
             enabled, issues = _check_untransported_compatibility(target_base_sd, delta_sd)
             can_eval_untransported_by_task.append(enabled)
             if enabled:
@@ -966,7 +1015,20 @@ def main() -> None:
             return {idx: _eval_baseline_task(split, idx, alpha) for idx in indices}
 
         def _eval_rebased_task_indices(split: str, indices: list[int], alpha: float) -> dict[int, float]:
-            out: dict[int, float] = {}
+            if steer_mode:
+                # No weight-space delta to axpy in: reset to the plain target
+                # base, then apply the learned correction as a forward-pass
+                # wrapper for the duration of each task's evaluation.
+                _load_into_target_model(target_base_sd)
+                out: dict[int, float] = {}
+                for idx in indices:
+                    task_name = per_task[idx]["task"]
+                    prepared = steer_prepared_by_task[task_name]
+                    with steer_correction_context(clf_target, prepared, alpha=float(alpha)):
+                        out[idx] = _eval_task(per_task[idx], split)
+                return out
+
+            out = {}
             for idx in indices:
                 rebase_sd_task = axpy_state_dict(target_base_sd, rebased_deltas[idx], alpha=float(alpha))
                 _load_into_target_model(rebase_sd_task)

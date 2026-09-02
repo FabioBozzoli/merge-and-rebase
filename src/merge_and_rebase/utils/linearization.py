@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any
 
@@ -19,12 +19,11 @@ def forward_ad_safe_attention_context(device: torch.device):
         torch.backends.mha.set_fastpath_enabled(False)
 
     try:
-        if device.type == "cuda":
-            with sdpa_kernel([SDPBackend.MATH], set_priority=True):
-                yield
-        else:
-            with nullcontext():
-                yield
+        # Forward-mode AD (torch.func.jvp) is only implemented for the MATH
+        # SDPA backend; the flash/efficient backends raise NotImplementedError
+        # regardless of device (CPU included), so force MATH unconditionally.
+        with sdpa_kernel([SDPBackend.MATH], set_priority=True):
+            yield
     finally:
         if old_mha_fastpath is not None:
             torch.backends.mha.set_fastpath_enabled(old_mha_fastpath)
