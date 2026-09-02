@@ -729,20 +729,22 @@ class SteerRebase:
         num_source_blocks = None
         block_group_size = None
         if stage_2_strategy == "global_ridge":
-            coefficient = _ridge(f_b[selected], train_target, ridge_lambda)
+            coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
 
             def correction_fn(activations: Mapping[str, torch.Tensor], *, _coef=coefficient) -> torch.Tensor:
-                return (activations["global"].double() @ _coef).to(dtype=activations["global"].dtype)
+                global_act = activations["global"].double().to(_coef.device)
+                return (global_act @ _coef).to(dtype=activations["global"].dtype, device=activations["global"].device)
 
         elif stage_2_strategy == "global_mlp":
             model = _fit_global_mlp(
                 f_b[selected], train_target, seed=10_000 + seed * 100 + int(selected.numel()), epochs=mlp_epochs, hidden_dim=mlp_hidden_dim
-            )
+            ).to(dev)
 
             def correction_fn(activations: Mapping[str, torch.Tensor], *, _model=model) -> torch.Tensor:
+                model_device = next(_model.parameters()).device
                 with torch.no_grad():
-                    out = _model(activations["global"].double())
-                return out.to(dtype=activations["global"].dtype)
+                    out = _model(activations["global"].double().to(model_device))
+                return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
         else:  # block_ridge
             delta_a_blocks_train = train_data["delta_A_blocks"].double()
@@ -782,9 +784,12 @@ class SteerRebase:
 
             local_selected = torch.arange(int(selected.numel()))
             local_blocks_train = {b: v[selected] for b, v in grouped_train.items()}
-            coefficients = _fit_block_ridge(
-                local_blocks_train, block_targets, selected=local_selected, regularization=ridge_lambda, mode=block_ridge_mode, rho=rho
-            )
+            coefficients = [
+                c.to(dev)
+                for c in _fit_block_ridge(
+                    local_blocks_train, block_targets, selected=local_selected, regularization=ridge_lambda, mode=block_ridge_mode, rho=rho
+                )
+            ]
 
             def correction_fn(
                 activations: Mapping[str, torch.Tensor],
@@ -794,13 +799,14 @@ class SteerRebase:
                 _num_source_residual_blocks=num_source_residual_blocks,
                 _strategy=block_group_strategy,
             ) -> torch.Tensor:
-                residual = {b: activations["blocks"][b].double() for b in range(_num_residual_target_blocks)}
+                coef_device = _coefficients[0].device
+                residual = {b: activations["blocks"][b].double().to(coef_device) for b in range(_num_residual_target_blocks)}
                 if _num_residual_target_blocks != _num_source_residual_blocks:
                     residual = _BLOCK_GROUP_STRATEGIES[_strategy](residual, _num_source_residual_blocks)
                 blocks = dict(residual)
-                blocks[_num_source_residual_blocks] = activations["global"].double()
+                blocks[_num_source_residual_blocks] = activations["global"].double().to(coef_device)
                 out = _predict_block_ridge(_coefficients, blocks)
-                return out.to(dtype=activations["global"].dtype)
+                return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
         return {
             "correction_fn": correction_fn,
