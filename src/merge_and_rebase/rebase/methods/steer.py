@@ -729,15 +729,38 @@ class SteerRebase:
         head_cache_dir = _cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, "train")
         cached_w_a = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_A.pt")
         cached_w_b = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_B.pt")
+
+        clf_source.build_zeroshot_text_features(classnames, source_build_cfg_task, cache_dir="src/.cache/zs_cache")
+        clf_target.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache")
+        live_w_a = clf_source._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
+        live_w_b = clf_target._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
+
         if cached_w_a is not None and cached_w_b is not None:
             w_a, w_b = cached_w_a, cached_w_b
             if verbose:
                 print(f"{log_prefix} using cached heads at {head_cache_dir}")
+            # Unlike steer4rebase's run.py -- which both fits *and* evaluates
+            # against data.w_b -- vision_rebase.py evaluates through a live
+            # forward pass classified with clf_target's own zero-shot head
+            # (eval/utils.py::eval_task_top1 rebuilds it). If the cached head
+            # differs, Stage 1/2 are fit in a different basis than the one the
+            # correction is scored in, and the live "rebased" numbers are not
+            # comparable to the cached-space diagnostics below.
+            if w_b.shape != live_w_b.shape or not torch.allclose(w_b, live_w_b, rtol=1e-4, atol=1e-6):
+                delta = (
+                    float("nan")
+                    if w_b.shape != live_w_b.shape
+                    else float((w_b - live_w_b).abs().max())
+                )
+                print(
+                    f"{log_prefix} WARNING: cached head_B differs from the live zero-shot head used at eval "
+                    f"(shapes {tuple(w_b.shape)} vs {tuple(live_w_b.shape)}, max abs diff={delta:.6g}). "
+                    f"Stage 1/2 are fit in the cached head's basis but scored in the live head's basis, "
+                    f"so the live 'rebased' accuracy will understate the method. Delete head_A.pt/head_B.pt "
+                    f"from the cache dir (or set force_recompute_features) to fit against the eval head."
+                )
         else:
-            clf_source.build_zeroshot_text_features(classnames, source_build_cfg_task, cache_dir="src/.cache/zs_cache")
-            clf_target.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache")
-            w_a = clf_source._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
-            w_b = clf_target._zs_text_features.detach().to(device="cpu", dtype=torch.float64)
+            w_a, w_b = live_w_a, live_w_b
             head_cache_dir.mkdir(parents=True, exist_ok=True)
             torch.save(w_a, head_cache_dir / "head_A.pt")
             torch.save(w_b, head_cache_dir / "head_B.pt")
@@ -902,13 +925,32 @@ class SteerRebase:
                 out = _predict_block_ridge(_coefficients, blocks)
                 return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
+        # Stage 2 accuracy in *cached-tensor space*, computed exactly the way
+        # steer4rebase's run.py reports it:
+        #     accuracy(f_b_test + prediction, w_b, test_labels)
+        # i.e. predicted from the cached test features/blocks, with no alpha
+        # and no live forward pass. This is the number directly comparable to
+        # the original repo's reported results; the "rebased" column printed
+        # by vision_rebase.py instead goes through the live eval path
+        # (activation hooks + alpha sweep), so comparing the two isolates a
+        # Stage 1/2 problem from a live-integration problem.
+        cached_test_activations: dict[str, Any] = {"global": f_b_test}
+        if need_blocks:
+            cached_test_activations["blocks"] = {b: v.double() for b, v in test_data["features_B_blocks"].items()}
+        stage2_test_acc = _accuracy(f_b_test + correction_fn(cached_test_activations), w_b, test_labels)
+        if verbose:
+            print(
+                f"{log_prefix} prepare: stage2 ({stage_2_strategy}) cached test acc = {stage2_test_acc:.4f} "
+                f"(predicted from B's cached features, no alpha -- matches run.py's reported metric)"
+            )
+
         return {
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
-            "diagnostics": {"stage1_test_acc": stage1_test_acc},
+            "diagnostics": {"stage1_test_acc": stage1_test_acc, "stage2_test_acc": stage2_test_acc},
         }
 
     def apply_correction(self, prepared: Mapping[str, Any], *, activations: Mapping[str, torch.Tensor], alpha: float = 1.0) -> torch.Tensor:
