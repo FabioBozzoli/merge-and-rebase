@@ -37,7 +37,11 @@ from ..merge.methods._common import axpy_state_dict
 from ..merge.task_vectors import TaskVector
 from ..models.openclip_classifier import OpenClipBuildConfig, OpenClipClassifier
 from ..rebase import get_method, list_methods
-from ..rebase.methods.steer import steer_correction_context
+from ..rebase.methods.steer import (
+    is_linearized_checkpoint,
+    reconstruct_linearized_checkpoint,
+    steer_correction_context,
+)
 from ..rebase.runtime import (
     format_rebase_method_label,
     resolve_rebase_method_config,
@@ -757,7 +761,15 @@ def main() -> None:
                     ckpt_path = str(tuned_by_task[task])
                     clf_source_finetuned = deepcopy(clf_source)
                     source_model_sd = clf_source_finetuned.model.state_dict()
-                    aligned = align_to_base_keys(load_ckpt(ckpt_path), source_model_sd)
+                    raw_ckpt = load_ckpt(ckpt_path)
+                    aligned = align_to_base_keys(raw_ckpt, source_model_sd)
+                    if not aligned and is_linearized_checkpoint(raw_ckpt):
+                        # steer4rebase saves tangent-space finetunes as
+                        # LinearizedModelV2: positionally-indexed params0/delta
+                        # ParameterLists, not a CLIP state dict. Rebuild the
+                        # absolute weights as params0[i] + delta[i].
+                        aligned = reconstruct_linearized_checkpoint(raw_ckpt, clf_source_finetuned.model)
+                        print(f"  {task}: reconstructed {len(aligned)} weights from a linearized (params0+delta) checkpoint")
                     if not aligned:
                         raise ValueError(
                             f"No tensors from tuned checkpoint aligned to source model keys for task '{task}': {ckpt_path}."
