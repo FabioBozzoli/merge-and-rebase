@@ -43,6 +43,76 @@ from ..base import TensorDict
 from ..registry import register
 
 
+_LINEARIZED_PARAM_PATTERN = re.compile(r"(?:^|.*\.)(params0|delta)\.(\d+)$")
+
+
+def is_linearized_checkpoint(state_dict: Mapping[str, Any]) -> bool:
+    """True for a steer4rebase LinearizedModelV2 checkpoint.
+
+    Such a checkpoint stores weights as two positionally-indexed
+    ``nn.ParameterList``s -- ``params0`` (frozen pretrained weights) and
+    ``delta`` (the trained tangent directions) -- instead of a normal CLIP
+    state dict, so key-based alignment cannot load it.
+    """
+    return any(_LINEARIZED_PARAM_PATTERN.match(str(k)) for k in state_dict)
+
+
+def reconstruct_linearized_checkpoint(
+    state_dict: Mapping[str, Any], pretrained_model: nn.Module
+) -> dict[str, torch.Tensor]:
+    """
+    Rebuild absolute finetuned weights from a LinearizedModelV2 checkpoint.
+
+    ``LinearizedModelV2`` keeps ``parameter_names`` as a plain tuple attribute,
+    so it is absent from the saved state dict and the index -> parameter-name
+    mapping has to be recovered. ``params0`` holds the pretrained weights, so
+    each index is resolved by matching it exactly against the pretrained
+    model's parameters (unique tensors, hence unambiguous), and the finetuned
+    weight is ``params0[i] + delta[i]``. Indices that match nothing (e.g. text
+    tower parameters absent from this model) are skipped.
+    """
+    params0: dict[int, torch.Tensor] = {}
+    deltas: dict[int, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        match = _LINEARIZED_PARAM_PATTERN.match(str(key))
+        if match is None or not isinstance(value, torch.Tensor):
+            continue
+        (params0 if match.group(1) == "params0" else deltas)[int(match.group(2))] = value
+
+    if not params0:
+        raise ValueError("steer: no 'params0' entries found in the linearized checkpoint.")
+    if set(params0) != set(deltas):
+        raise ValueError(
+            f"steer: linearized checkpoint has mismatched params0/delta indices "
+            f"({len(params0)} vs {len(deltas)})."
+        )
+
+    named = list(pretrained_model.named_parameters())
+    by_shape: dict[tuple[int, ...], list[int]] = {}
+    for position, (_, param) in enumerate(named):
+        by_shape.setdefault(tuple(param.shape), []).append(position)
+
+    out: dict[str, torch.Tensor] = {}
+    used: set[int] = set()
+    for index in sorted(params0):
+        base = params0[index]
+        for position in by_shape.get(tuple(base.shape), []):
+            if position in used:
+                continue
+            name, param = named[position]
+            if torch.equal(param.detach().cpu().to(base.dtype), base.cpu()):
+                used.add(position)
+                out[name] = (base + deltas[index]).to(param.dtype)
+                break
+
+    if not out:
+        raise ValueError(
+            "steer: could not match any linearized checkpoint parameter against the pretrained model. "
+            "The checkpoint's params0 do not correspond to this source model's pretrained weights."
+        )
+    return out
+
+
 def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
     """
     L2-normalize the final pooled visual feature. Mirrors steer4rebase's
