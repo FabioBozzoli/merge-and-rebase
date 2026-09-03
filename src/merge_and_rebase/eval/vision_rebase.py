@@ -748,9 +748,32 @@ def main() -> None:
                 elif steer_mode:
                     # steer never touches weights: it needs a live finetuned source
                     # classifier (not just a raw state-dict delta) to run forward
-                    # passes through during feature collection.
+                    # passes through during feature collection. Align the checkpoint
+                    # to the source keyspace first and verify it actually loaded:
+                    # a silent strict=False no-op would leave the "finetuned" source
+                    # identical to the pretrained one, making delta_A zero and every
+                    # steer result meaningless.
+                    ckpt_path = str(tuned_by_task[task])
                     clf_source_finetuned = deepcopy(clf_source)
-                    load_into_model(clf_source_finetuned.model, load_ckpt(str(tuned_by_task[task])), strict=False)
+                    source_model_sd = clf_source_finetuned.model.state_dict()
+                    aligned = align_to_base_keys(load_ckpt(ckpt_path), source_model_sd)
+                    if not aligned:
+                        raise ValueError(
+                            f"No tensors from tuned checkpoint aligned to source model keys for task '{task}': {ckpt_path}."
+                        )
+                    load_into_model(clf_source_finetuned.model, aligned, strict=False)
+                    changed = sum(
+                        1
+                        for k, v in aligned.items()
+                        if not torch.equal(v.to(source_model_sd[k].dtype), source_model_sd[k])
+                    )
+                    if changed == 0:
+                        raise ValueError(
+                            f"Tuned checkpoint for task '{task}' is identical to the source base model "
+                            f"({len(aligned)} keys aligned, none differ): {ckpt_path}. steer would transport "
+                            f"a zero delta."
+                        )
+                    print(f"  {task}: source finetuned checkpoint aligned ({len(aligned)} keys, {changed} differ from base)")
                     tuned_sd = {}
                     task_delta = {}
                 else:

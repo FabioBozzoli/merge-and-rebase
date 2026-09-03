@@ -792,6 +792,24 @@ class SteerRebase:
         source_finetuned_visual = clf_source.model.visual.to(dev).eval()
         source_pretrained_visual = clf_source_pretrained.model.visual.to(dev).eval()
         target_visual = clf_target.model.visual.to(dev).eval()
+
+        # The whole method transports A's fine-tuning delta, so an A whose visual
+        # weights equal the pretrained ones yields delta_A == 0 and silently
+        # degenerate results. This happens whenever the finetuned checkpoint fails
+        # to load (mismatched keyspace under a non-strict load), so check rather
+        # than trust the caller.
+        finetuned_params = dict(source_finetuned_visual.named_parameters())
+        pretrained_params = dict(source_pretrained_visual.named_parameters())
+        if all(
+            torch.equal(v.detach(), pretrained_params[k].detach())
+            for k, v in finetuned_params.items()
+            if k in pretrained_params
+        ):
+            raise ValueError(
+                "steer: the finetuned source visual encoder is identical to the pretrained one, so "
+                "delta_A would be zero. The tuned checkpoint most likely failed to load into the source "
+                "model (mismatched keyspace)."
+            )
         need_blocks = stage_2_strategy == "block_ridge"
 
         def _compute(split: str) -> dict[str, Any]:
