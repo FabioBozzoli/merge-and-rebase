@@ -726,6 +726,7 @@ class SteerRebase:
         # placed on disk (e.g. from the original steering.py pipeline) are
         # actually used instead of being silently replaced by a live
         # zero-shot recomputation that may use a different prompt ensemble.
+        eval_basis_mismatch = False
         head_cache_dir = _cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, "train")
         cached_w_a = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_A.pt")
         cached_w_b = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_B.pt")
@@ -773,15 +774,17 @@ class SteerRebase:
                             f"not affect argmax or the fitted correction."
                         )
                     else:
-                        raise ValueError(
-                            f"steer: cached head_B does not match the zero-shot head this run evaluates with "
-                            f"(per-class cosine mean={float(cos.mean()):.4f}; near-zero means the two heads "
-                            f"live in different embedding spaces, i.e. the cache was built for a different "
-                            f"model than '{target_tag}'). Stage 1/2 would be fit against one classifier and "
-                            f"scored against another, making every reported number meaningless. Either point "
-                            f"feature_cache_dir at a fresh directory and set force_recompute_features=true to "
-                            f"rebuild from the models in this config, or fix source/target in the config to "
-                            f"match the models the cache was generated from."
+                        eval_basis_mismatch = True
+                        print(
+                            f"{log_prefix} WARNING: cached head_B does not match the zero-shot head this run "
+                            f"evaluates with (per-class cosine mean={float(cos.mean()):.4f}; near-zero means "
+                            f"the two heads live in different embedding spaces, i.e. the cache was built for a "
+                            f"different model than '{target_tag}'). The cached-space diagnostics below remain "
+                            f"valid and are the numbers comparable to steer4rebase's run.py, but the live "
+                            f"'rebased' column is measured against a different classifier and is meaningless. "
+                            f"To get valid live numbers, point feature_cache_dir at a fresh directory with "
+                            f"force_recompute_features=true, or align source/target in the config with the "
+                            f"models the cache was generated from."
                         )
         else:
             w_a, w_b = live_w_a, live_w_b
@@ -1003,6 +1006,7 @@ class SteerRebase:
             "feature_regime": feature_regime,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
+            "eval_basis_mismatch": eval_basis_mismatch,
             "diagnostics": {
                 "stage0_test_acc": stage0_test_acc,
                 "stage1_test_acc": stage1_test_acc,

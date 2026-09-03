@@ -473,6 +473,7 @@ def main() -> None:
 
         transfusion_prepared: dict[str, Any] | None = None
         steer_prepared_by_task: dict[str, dict[str, Any]] = {}
+        steer_eval_basis_mismatch = False
 
         for task in tasks:
             hf_path, hf_config, split_map = suite.resolver(task)
@@ -906,6 +907,8 @@ def main() -> None:
                     **steer_method_params,
                 )
                 steer_prepared_by_task[task] = prepared
+                if prepared.get("eval_basis_mismatch"):
+                    steer_eval_basis_mismatch = True
             else:
                 prepared = transfusion_prepared
 
@@ -1008,6 +1011,15 @@ def main() -> None:
         metric_col = max(12, len(baseline_label) + 2, len(result_label) + 2, len("norm") + 2)
 
         baseline_cache_zeroshot: dict[str, list[float]] = {}
+
+        if steer_eval_basis_mismatch:
+            print(
+                "\n"
+                "!!! steer: the cached features/head come from a different model than the one evaluated here.\n"
+                "!!! The 'rebased' column below is measured against a different classifier and is MEANINGLESS.\n"
+                "!!! Use the cached-space diagnostics printed above (they are what run.py reports), or rebuild\n"
+                "!!! the cache from this config's models with force_recompute_features=true.\n"
+            )
 
         if baseline_label == "untransported":
             print("Using untransported baseline evaluation for all tasks.")
