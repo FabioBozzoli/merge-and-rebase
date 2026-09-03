@@ -774,7 +774,10 @@ def main() -> None:
                         raise ValueError(
                             f"No tensors from tuned checkpoint aligned to source model keys for task '{task}': {ckpt_path}."
                         )
-                    load_into_model(clf_source_finetuned.model, aligned, strict=False)
+                    # Count differences *before* loading: state_dict() hands back
+                    # references to the live parameters, which load_into_model
+                    # overwrites in place, so comparing afterwards would compare
+                    # the loaded values against themselves and always find zero.
                     changed = sum(
                         1
                         for k, v in aligned.items()
@@ -789,6 +792,7 @@ def main() -> None:
                             f"({len(aligned)} keys aligned, none differ): {ckpt_path}. steer would transport "
                             f"a zero delta."
                         )
+                    load_into_model(clf_source_finetuned.model, aligned, strict=False)
                     print(f"  {task}: source finetuned checkpoint aligned ({len(aligned)} keys, {changed} differ from base)")
                     tuned_sd = {}
                     task_delta = {}
