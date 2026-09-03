@@ -778,7 +778,10 @@ def main() -> None:
                     changed = sum(
                         1
                         for k, v in aligned.items()
-                        if not torch.equal(v.to(source_model_sd[k].dtype), source_model_sd[k])
+                        if not torch.equal(
+                            v.detach().cpu().to(source_model_sd[k].dtype),
+                            source_model_sd[k].detach().cpu(),
+                        )
                     )
                     if changed == 0:
                         raise ValueError(
