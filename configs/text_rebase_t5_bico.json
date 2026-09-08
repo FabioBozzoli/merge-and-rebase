@@ -1,0 +1,57 @@
+{
+  "_comment": "BiCo rebase across model widths (t5-v1_1-small -> t5-v1_1-base). BiCo pairs input activations with output gradients, so unlike Theseus it drives its forward through a gradient recipe -- text_rebase.py injects seq_classification_recipe for both sides automatically. bico_gradin is NOT supported for text (it marks the model input as requiring grad, which integer input_ids cannot).",
+
+  "suite": "nli6",
+  "tasks": "all",
+
+  "source_model_name_or_path": "google/t5-v1_1-small",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/t5-v1_1-base",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "source_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-small/heads.pt",
+  "target_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-base/heads.pt",
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 8,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 42,
+
+  "method": "bico",
+  "method_params": {
+    "seq_align": "interpolate",
+    "num_batches": 8,
+    "center_acts": false,
+    "whiten_power": 0.0,
+    "patch_qkv": false
+  },
+
+  "alpha_search": true,
+  "alpha_selection": "shared",
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_patience": 5,
+  "alpha_search_split": "val",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "src/checkpoints/finetune_text/google__t5-v1_1-small/snli/full_best_ep.pt",
+    "mnli": "src/checkpoints/finetune_text/google__t5-v1_1-small/mnli/full_best_ep.pt",
+    "sick": "src/checkpoints/finetune_text/google__t5-v1_1-small/sick/full_best_ep.pt",
+    "qnli": "src/checkpoints/finetune_text/google__t5-v1_1-small/qnli/full_best_ep.pt",
+    "rte": "src/checkpoints/finetune_text/google__t5-v1_1-small/rte/full_best_ep.pt",
+    "scitail": "src/checkpoints/finetune_text/google__t5-v1_1-small/scitail/full_best_ep.pt"
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "_comment": "Theseus rebase across model *widths*: t5-v1_1-small (d_model 512, 8+8 blocks) -> t5-v1_1-base (d_model 768, 12+12 blocks). This is the interesting cross-architecture case; shapes differ, so the 'untransported' baseline is automatically disabled and the reported baseline becomes target_zeroshot (B with its own head), exactly as vision_rebase does for a cross-arch pair.",
+  "_depth_note": "8 -> 12 blocks means only name-matching blocks are transported; there is no text equivalent of the ViT-only block-extension preprocess. text_rebase.py prints the depth and the delta key coverage at startup.",
+  "_seq_align": "interpolate (linear over the token axis). The vision default interpolate2d assumes a square patch grid and is wrong for text; text_rebase.py sets this default itself if omitted.",
+
+  "suite": "nli6",
+  "tasks": "all",
+
+  "source_model_name_or_path": "google/t5-v1_1-small",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/t5-v1_1-base",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "source_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-small/heads.pt",
+  "target_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-base/heads.pt",
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 42,
+
+  "method": "theseus",
+  "method_params": {
+    "seq_align": "interpolate",
+    "num_batches": 8,
+    "center_acts": false,
+    "covariance_mode": "activations",
+    "patch_qkv": false
+  },
+
+  "alpha_search": true,
+  "alpha_selection": "shared",
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_patience": 5,
+  "alpha_search_split": "val",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "src/checkpoints/finetune_text/google__t5-v1_1-small/snli/full_best_ep.pt",
+    "mnli": "src/checkpoints/finetune_text/google__t5-v1_1-small/mnli/full_best_ep.pt",
+    "sick": "src/checkpoints/finetune_text/google__t5-v1_1-small/sick/full_best_ep.pt",
+    "qnli": "src/checkpoints/finetune_text/google__t5-v1_1-small/qnli/full_best_ep.pt",
+    "rte": "src/checkpoints/finetune_text/google__t5-v1_1-small/rte/full_best_ep.pt",
+    "scitail": "src/checkpoints/finetune_text/google__t5-v1_1-small/scitail/full_best_ep.pt"
+  }
+}

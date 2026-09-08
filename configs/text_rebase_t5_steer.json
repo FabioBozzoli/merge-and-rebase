@@ -1,0 +1,61 @@
+{
+  "_comment": "steer_text: few-shot feature-space steering for HF text models (rebase/text/steer_text.py). It never writes target weights -- the correction is added to B's pooled feature just before its classification head -- so the reported baseline is always target_zeroshot, exactly as for steer in vision_rebase.py.",
+  "_requirements": "eval_mode must be head_logits (Stage 1 needs a linear head). feature_regime 'standard' + global_ridge/global_mlp is the affordable path; block_ridge requires feature_regime 'linear', which runs one forward-mode jvp per source block per batch through the whole LM.",
+  "_cache": "First run per (source, target, task, regime) computes and caches features under feature_cache_dir; later runs reuse them unless force_recompute_features is true.",
+
+  "suite": "nli6",
+  "tasks": "all",
+
+  "source_model_name_or_path": "google/t5-v1_1-small",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/t5-v1_1-base",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "source_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-small/heads.pt",
+  "target_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-base/heads.pt",
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 42,
+
+  "method": "steer_text",
+  "method_params": {
+    "feature_regime": "standard",
+    "stage_2_strategy": "global_ridge",
+    "few_shot": 16,
+    "stage1_lambda": 1.0,
+    "ridge_lambda": 1.0,
+    "feature_cache_dir": "src/.cache/steer_text_features",
+    "force_recompute_features": false
+  },
+
+  "alpha_search": true,
+  "alpha_selection": "shared",
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_patience": 5,
+  "alpha_search_split": "val",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "src/checkpoints/finetune_text/google__t5-v1_1-small/snli/full_best_ep.pt",
+    "mnli": "src/checkpoints/finetune_text/google__t5-v1_1-small/mnli/full_best_ep.pt",
+    "sick": "src/checkpoints/finetune_text/google__t5-v1_1-small/sick/full_best_ep.pt",
+    "qnli": "src/checkpoints/finetune_text/google__t5-v1_1-small/qnli/full_best_ep.pt",
+    "rte": "src/checkpoints/finetune_text/google__t5-v1_1-small/rte/full_best_ep.pt",
+    "scitail": "src/checkpoints/finetune_text/google__t5-v1_1-small/scitail/full_best_ep.pt"
+  }
+}

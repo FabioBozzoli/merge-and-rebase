@@ -64,6 +64,7 @@ nav:
       - Fine-Tuning: fine-tuning.md
       - Merging: merging.md
       - Rebasin: rebasin.md
+      - Text Rebasin: text-rebasin.md
   - Reference:
       - Methods Overview: methods.md
       - Merge Methods API: api/merge-methods.md

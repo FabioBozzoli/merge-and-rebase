@@ -26,3 +26,5 @@ Useful starter configurations include:
 | `transport_method` | Registered transport method. |
 
 `identity` and `orthogonal_shift` are data-free. `gradfix`, `theseus`, `transfusion`, and `bico` use method-specific model or data inputs during preparation. See [methods.md](methods.md) for behavior and parameters.
+
+For HuggingFace text models (T5, Qwen, Llama, ...) instead of CLIP, see [Text Rebasin](text-rebasin.md), which drives the same rebase methods through `eval/text_rebase.py`.

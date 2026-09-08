@@ -1,0 +1,59 @@
+{
+  "_comment": "TEMPLATE. Qwen2.5 pair for text rebase: A = Qwen2.5-0.5B, B = Qwen2.5-0.5B-Instruct (identical architecture, different post-training), which is the decoder-only analogue of the ViT-B-32 openai -> laion2b vision pair: shapes match, so the 'untransported' baseline is available.",
+  "_todo": "No Qwen finetunes ship with this repo. Produce them first with `python -m merge_and_rebase.finetune.train_text --text-config <your config>` (backbone.model_name_or_path: Qwen/Qwen2.5-0.5B, strategy.name: full or peft_lora, output.extract_heads: true), then fill tuned_ckpts / source_task_heads / target_task_heads below.",
+  "_cross_size_note": "For a cross-size run (0.5B -> 1.5B: 24 vs 28 layers, hidden 896 vs 1536) just swap target_model_name_or_path. The untransported baseline disables itself and the report falls back to target_zeroshot.",
+
+  "suite": "nli6",
+  "tasks": "all",
+
+  "source_model_name_or_path": "Qwen/Qwen2.5-0.5B",
+  "source_model_arch": "auto",
+  "target_model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+  "target_model_arch": "auto",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "bf16",
+
+  "eval_mode": "head_logits",
+  "source_task_heads": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/heads.pt",
+  "target_task_heads": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B-Instruct/heads.pt",
+  "head_key_pattern": "score",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 1000,
+  "max_train_samples": 2000,
+  "batch_size": 4,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 42,
+
+  "method": "theseus",
+  "method_params": {
+    "seq_align": "interpolate",
+    "num_batches": 8,
+    "center_acts": false,
+    "covariance_mode": "activations",
+    "patch_qkv": false
+  },
+
+  "alpha_search": true,
+  "alpha_selection": "shared",
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.2,
+  "alpha_patience": 3,
+  "alpha_search_split": "val",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/snli/full_best_ep.pt",
+    "mnli": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/mnli/full_best_ep.pt",
+    "sick": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/sick/full_best_ep.pt",
+    "qnli": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/qnli/full_best_ep.pt",
+    "rte": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/rte/full_best_ep.pt",
+    "scitail": "src/checkpoints/finetune_text/Qwen__Qwen2.5-0.5B/scitail/full_best_ep.pt"
+  }
+}

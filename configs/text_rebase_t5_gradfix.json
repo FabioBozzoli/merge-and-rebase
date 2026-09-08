@@ -1,0 +1,57 @@
+{
+  "_comment": "GradFix rebase on HF text models. Same-architecture pair (t5-v1_1-base -> flan-t5-base, which is a further-trained t5-v1_1-base), so shapes match and the 'untransported' baseline is available -- the text analogue of the ViT-B-32 openai -> laion2b vision pair. GradFix only masks a delta, so a same-shape pair is mandatory here.",
+  "_checkpoints": "tuned_ckpts are A's per-task finetunes (finetune.train_text with --text-config configs/text.yaml). target_task_heads must be heads for B: linear-probe B per task (strategy.name: linear_probe in the text config) -- that is B's no-backbone-training head, the text analogue of CLIP's zero-shot head.",
+
+  "suite": "nli6",
+  "tasks": "all",
+
+  "source_model_name_or_path": "google/t5-v1_1-base",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/flan-t5-base",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "source_task_heads": "src/checkpoints/finetune_text/google__t5-v1_1-base/heads.pt",
+  "target_task_heads": "src/checkpoints/finetune_text/google__flan-t5-base/heads.pt",
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 42,
+
+  "method": "gradfix",
+  "method_params": {
+    "mask_mode": "normal",
+    "vote": "mean"
+  },
+  "grad_examples_per_class": 32,
+  "grad_batch_size": 8,
+
+  "alpha_search": true,
+  "alpha_selection": "shared",
+  "alpha_min": 0.0,
+  "alpha_max": 2.0,
+  "alpha_step": 0.1,
+  "alpha_patience": 5,
+  "alpha_search_split": "val",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "src/checkpoints/finetune_text/google__t5-v1_1-base/snli/full_best_ep.pt",
+    "mnli": "src/checkpoints/finetune_text/google__t5-v1_1-base/mnli/full_best_ep.pt",
+    "sick": "src/checkpoints/finetune_text/google__t5-v1_1-base/sick/full_best_ep.pt",
+    "qnli": "src/checkpoints/finetune_text/google__t5-v1_1-base/qnli/full_best_ep.pt",
+    "rte": "src/checkpoints/finetune_text/google__t5-v1_1-base/rte/full_best_ep.pt",
+    "scitail": "src/checkpoints/finetune_text/google__t5-v1_1-base/scitail/full_best_ep.pt"
+  }
+}
