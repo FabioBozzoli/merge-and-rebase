@@ -112,6 +112,7 @@ def collect_bilinear_statistics(
     n_batches: int | None,
     seed: int = 0,
     batch_size: int | None = None,
+    shots_per_class: int | None = None,
     store_grams: bool = False,
 ) -> dict[str, _t.ActivationStore]:
     """
@@ -142,12 +143,22 @@ def collect_bilinear_statistics(
             n_batches=n_batches,
             seed=seed,
             batch_size=batch_size,
+            shots_per_class=shots_per_class,
         )
         if iterator is None:
+            if shots_per_class is not None:
+                raise ValueError(
+                    "BiCo shots_per_class requires class-balanced batch construction, which needs direct "
+                    "dataset/collate_fn access on source_dataloader/target_dataloader; the provided "
+                    "dataloaders don't expose it (see _iter_random_dataset_batches)."
+                )
             iterator = zip(source_dataloader, target_dataloader, strict=True)
 
+        # shots_per_class fixes the calibration set size itself (all of it,
+        # every batch); n_batches only caps the uniform-random path above.
+        batch_cap = n_batches if shots_per_class is None else None
         for idx, (source_batch, target_batch) in enumerate(iterator):
-            if n_batches is not None and idx >= n_batches:
+            if batch_cap is not None and idx >= batch_cap:
                 break
 
             source_imgs = _t._extract_model_inputs(source_batch).to(dev)
@@ -218,6 +229,7 @@ def collect_gradin_statistics(
     n_batches: int | None,
     seed: int = 0,
     batch_size: int | None = None,
+    shots_per_class: int | None = None,
     store_grams: bool = False,
 ) -> dict[str, _t.ActivationStore]:
     """
@@ -248,12 +260,20 @@ def collect_gradin_statistics(
             n_batches=n_batches,
             seed=seed,
             batch_size=batch_size,
+            shots_per_class=shots_per_class,
         )
         if iterator is None:
+            if shots_per_class is not None:
+                raise ValueError(
+                    "BiCo shots_per_class requires class-balanced batch construction, which needs direct "
+                    "dataset/collate_fn access on source_dataloader/target_dataloader; the provided "
+                    "dataloaders don't expose it (see _iter_random_dataset_batches)."
+                )
             iterator = zip(source_dataloader, target_dataloader, strict=True)
 
+        batch_cap = n_batches if shots_per_class is None else None
         for idx, (source_batch, target_batch) in enumerate(iterator):
-            if n_batches is not None and idx >= n_batches:
+            if batch_cap is not None and idx >= batch_cap:
                 break
 
             source_imgs = _t._extract_model_inputs(source_batch).to(dev)
@@ -357,6 +377,7 @@ class BiCoRebase:
         num_batches: int | None = None,
         seed: int = 0,
         batch_size: int | None = None,
+        shots_per_class: int | None = None,
         patch_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
@@ -372,6 +393,8 @@ class BiCoRebase:
 
         if n_batches is None:
             n_batches = num_batches
+        if shots_per_class is not None and int(shots_per_class) <= 0:
+            raise ValueError("BiCo shots_per_class must be a positive integer.")
         whiten_power = float(whiten_power)
         whiten_eps = float(whiten_eps)
         if not (0.0 <= whiten_power <= 0.5):
@@ -384,7 +407,8 @@ class BiCoRebase:
             print(
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
-                f"whiten_power={whiten_power}, n_batches={n_batches}, seed={int(seed)})"
+                f"whiten_power={whiten_power}, n_batches={n_batches}, "
+                f"shots_per_class={shots_per_class}, seed={int(seed)})"
             )
 
         patched_source = 0
@@ -426,6 +450,7 @@ class BiCoRebase:
                 n_batches=n_batches,
                 seed=int(seed),
                 batch_size=batch_size,
+                shots_per_class=shots_per_class,
                 store_grams=whiten_power > 0.0,
             )
             if verbose:
@@ -484,6 +509,7 @@ class BiCoRebase:
             "transforms_by_key": transforms_by_key,
             "split_fused_qkv": split_fused_qkv,
             "n_batches": n_batches,
+            "shots_per_class": shots_per_class,
             "patched_source_blocks": patched_source,
             "patched_target_blocks": patched_target,
             "unpatched_source_blocks": unpatched_source,

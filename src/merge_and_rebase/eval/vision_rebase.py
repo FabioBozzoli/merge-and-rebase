@@ -154,6 +154,10 @@ def _norm_acc(result_acc: float, baseline_acc: float) -> float:
     return normalized_accuracy_ratio(result_acc, baseline_acc)
 
 
+# Fixed independently of cfg["seed"] -- see build_vision_loaders call site.
+_VAL_TEST_SPLIT_SEED = 0
+
+
 def _average_defined(values: list[float]) -> float:
     defined = [float(v) for v in values if float(v) == float(v)]
     return average_scores(defined) if defined else float("nan")
@@ -493,7 +497,13 @@ def main() -> None:
                 num_workers=int(cfg.get("num_workers", 6)),
                 pin_memory=True,
                 val_fraction=float(cfg.get("val_fraction", 0.1)),
-                seed=int(cfg.get("seed", 42)),
+                # Fixed on purpose, independent of cfg["seed"]: the val/test carve
+                # must stay identical across a seed sweep (e.g. gradfix's
+                # grad_imgs_per_class few-shot draws, or theseus/steer's own
+                # method_params.seed calibration draws) so runs are only
+                # comparing different calibration samples against the same
+                # held-out data, not also reshuffling what's held out.
+                seed=_VAL_TEST_SPLIT_SEED,
             )
 
             classnames = list(loaders.classnames)
@@ -540,7 +550,7 @@ def main() -> None:
                     num_workers=int(cfg.get("num_workers", 6)),
                     pin_memory=True,
                     val_fraction=float(cfg.get("val_fraction", 0.1)),
-                    seed=int(cfg.get("seed", 42)),
+                    seed=_VAL_TEST_SPLIT_SEED,
                 )
 
             task_source_base_sd = source_base_sd

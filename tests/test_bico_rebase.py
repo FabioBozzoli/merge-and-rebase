@@ -249,3 +249,59 @@ def test_bico_gradin_deterministic() -> None:
     assert set(result_a.keys()) == set(result_b.keys())
     for key in result_a:
         assert torch.allclose(result_a[key], result_b[key]), f"Mismatch for key {key}"
+
+
+def _make_class_balanced_loader(
+    *, n_classes: int = 5, per_class: int = 4, in_dim: int = 6, batch_size: int = 4
+) -> DataLoader:
+    x = torch.randn(n_classes * per_class, in_dim)
+    y = torch.arange(n_classes).repeat_interleave(per_class)
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+
+def test_bico_prepare_shots_per_class_smoke() -> None:
+    source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
+    target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
+    loader = _make_class_balanced_loader(n_classes=5, per_class=4, in_dim=6, batch_size=4)
+    method = get_method("bico")
+
+    prepared = method.prepare(
+        source_model=source_model,
+        target_model=target_model,
+        source_dataloader=loader,
+        target_dataloader=loader,
+        source_recipe=_simple_recipe,
+        target_recipe=_simple_recipe,
+        device="cpu",
+        seq_align="mean",
+        shots_per_class=2,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert prepared["shots_per_class"] == 2
+    assert prepared["activation_registry"]
+
+
+def test_bico_gradin_prepare_shots_per_class_smoke() -> None:
+    source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
+    target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
+    loader = _make_class_balanced_loader(n_classes=5, per_class=4, in_dim=6, batch_size=4)
+    method = get_method("bico_gradin")
+
+    prepared = method.prepare(
+        source_model=source_model,
+        target_model=target_model,
+        source_dataloader=loader,
+        target_dataloader=loader,
+        source_recipe=_simple_recipe,
+        target_recipe=_simple_recipe,
+        device="cpu",
+        seq_align="mean",
+        shots_per_class=2,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert prepared["shots_per_class"] == 2
+    assert prepared["activation_registry"]

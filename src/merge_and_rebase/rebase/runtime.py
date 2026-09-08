@@ -44,11 +44,15 @@ def format_rebase_method_label(method_name: str, method_params: dict[str, Any]) 
     if method_name == "bico":
         batches = int(method_params.get("num_batches", 1))
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        return f"bico(batches={batches}, align={seq_align})"
+        shots_per_class = method_params.get("shots_per_class")
+        calib = f"shots_per_class={int(shots_per_class)}" if shots_per_class is not None else f"batches={batches}"
+        return f"bico({calib}, align={seq_align})"
     if method_name == "bico_gradin":
         batches = int(method_params.get("num_batches", 1))
         seq_align = str(method_params.get("seq_align", "interpolate2d"))
-        return f"bico_gradin(batches={batches}, align={seq_align}, in=grad)"
+        shots_per_class = method_params.get("shots_per_class")
+        calib = f"shots_per_class={int(shots_per_class)}" if shots_per_class is not None else f"batches={batches}"
+        return f"bico_gradin({calib}, align={seq_align}, in=grad)"
     if method_name == "steer":
         regime = str(method_params.get("feature_regime", "standard"))
         stage2 = str(method_params.get("stage_2_strategy", "global_ridge"))
