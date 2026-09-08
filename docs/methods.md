@@ -155,9 +155,10 @@ Identity has no method-specific parameters. Orthogonal Shift accepts `beta` (def
 | Theseus / BiCo | `center_acts` | `false` | Boolean | Center activation features before computing transforms. |
 | Theseus / BiCo | `whiten_power` | `0.0` | `[0, 0.5]` | Strength of covariance whitening in transform estimation. |
 | Theseus / BiCo | `whiten_eps` | `1e-6` | `> 0` | Numerical floor used by whitening. |
-| Theseus / BiCo | `n_batches` | `null` | Positive integer or `null` | Number of batches used for statistics; `num_batches` is an alias. |
-| Theseus / BiCo | `seed` | `0` | Integer | Controls deterministic batch sampling. |
+| Theseus / BiCo | `n_batches` | `null` | Positive integer or `null` | Number of batches used for statistics; `num_batches` is an alias. Ignored when `shots_per_class` is set. |
+| Theseus / BiCo | `seed` | `0` | Integer | Controls deterministic batch sampling (and class-balanced shot selection when `shots_per_class` is set). |
 | Theseus / BiCo | `batch_size` | `null` | Positive integer or `null` | Optional per-batch cap during statistic collection. |
+| Theseus / BiCo | `shots_per_class` | `null` | Positive integer or `null` | Use exactly this many examples per class for the calibration set instead of a uniform-random subsample of `n_batches * batch_size` examples. Requires a dataset exposing cheap label access (an `HFVisionDataset`-shaped `.split`/`.label_key`, or a `TensorDataset`). |
 | Theseus / BiCo | `patch_qkv` | `true` | Boolean | Split fused QKV blocks while calculating and applying transforms. `split_qkv` is an alias. |
 | Theseus | `covariance_mode` | `"activations"` | `"activations"`, `"data_free"` | Estimate transforms from loaders or use data-free base-model covariance. |
 | BiCo | `transform_granularity` | `"param"` | `"param"` | Granularity supported by the current implementation. |

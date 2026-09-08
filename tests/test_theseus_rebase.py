@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -274,3 +275,80 @@ def test_random_dataset_subsampling_uses_randperm_seed() -> None:
     g2.manual_seed(124)
     expected_other_seed = torch.randperm(20, generator=g2)[:12].tolist()
     assert seen != expected_other_seed
+
+
+def _make_class_balanced_loader(
+    *, n_classes: int = 5, per_class: int = 6, in_dim: int = 6, batch_size: int = 4
+) -> DataLoader:
+    x = torch.randn(n_classes * per_class, in_dim)
+    y = torch.arange(n_classes).repeat_interleave(per_class)
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+
+def test_dataset_labels_reads_tensor_dataset() -> None:
+    loader = _make_class_balanced_loader(n_classes=3, per_class=4)
+    labels = theseus_mod._dataset_labels(loader.dataset)
+    assert labels is not None
+    assert labels.tolist() == loader.dataset.tensors[1].tolist()
+
+
+def test_class_balanced_indices_exact_shots_per_class() -> None:
+    loader = _make_class_balanced_loader(n_classes=5, per_class=6)
+    indices = theseus_mod._class_balanced_indices(loader.dataset, shots_per_class=2, seed=0)
+    assert indices.numel() == 5 * 2
+
+    labels = loader.dataset.tensors[1]
+    selected_labels = labels[indices]
+    for class_id in range(5):
+        assert int((selected_labels == class_id).sum()) == 2
+
+
+def test_class_balanced_indices_raises_when_a_class_is_too_small() -> None:
+    loader = _make_class_balanced_loader(n_classes=2, per_class=3)
+    with pytest.raises(ValueError, match="shots_per_class"):
+        theseus_mod._class_balanced_indices(loader.dataset, shots_per_class=4, seed=0)
+
+
+def test_iter_random_dataset_batches_shots_per_class_is_class_balanced() -> None:
+    loader = _make_class_balanced_loader(n_classes=4, per_class=5, batch_size=3)
+
+    iterator = theseus_mod._iter_random_dataset_batches(
+        loader,
+        loader,
+        n_batches=None,
+        seed=7,
+        batch_size=3,
+        shots_per_class=2,
+    )
+    assert iterator is not None
+
+    seen_labels: list[int] = []
+    for source_batch, target_batch in iterator:
+        seen_labels.extend(int(v) for v in source_batch[1].tolist())
+        assert source_batch[1].tolist() == target_batch[1].tolist()
+
+    assert len(seen_labels) == 4 * 2
+    for class_id in range(4):
+        assert seen_labels.count(class_id) == 2
+
+
+def test_theseus_prepare_shots_per_class_smoke() -> None:
+    source_model = _TinyModel(in_dim=6, hid_dim=8, out_dim=5)
+    target_model = _TinyModel(in_dim=6, hid_dim=7, out_dim=5)
+    loader = _make_class_balanced_loader(n_classes=5, per_class=4, in_dim=6, batch_size=4)
+    method = get_method("theseus")
+
+    prepared = method.prepare(
+        source_model=source_model,
+        target_model=target_model,
+        source_dataloader=loader,
+        target_dataloader=loader,
+        device="cpu",
+        seq_align="mean",
+        shots_per_class=2,
+        verbose=False,
+        show_progress=False,
+    )
+
+    assert prepared["shots_per_class"] == 2
+    assert prepared["activation_registry"]

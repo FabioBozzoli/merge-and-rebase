@@ -423,6 +423,7 @@ def collect_activations(
     n_batches: int | None,
     seed: int = 0,
     batch_size: int | None = None,
+    shots_per_class: int | None = None,
     store_raw: bool = False,
     store_a_gram: bool = False,
     store_b_gram: bool = False,
@@ -439,12 +440,22 @@ def collect_activations(
             n_batches=n_batches,
             seed=seed,
             batch_size=batch_size,
+            shots_per_class=shots_per_class,
         )
         if iterator is None:
+            if shots_per_class is not None:
+                raise ValueError(
+                    "Theseus shots_per_class requires class-balanced batch construction, which needs "
+                    "direct dataset/collate_fn access on source_dataloader/target_dataloader; the "
+                    "provided dataloaders don't expose it (see _iter_random_dataset_batches)."
+                )
             iterator = zip(source_dataloader, target_dataloader, strict=True)
 
+        # shots_per_class fixes the calibration set size itself (all of it,
+        # every batch); n_batches only caps the uniform-random path above.
+        batch_cap = n_batches if shots_per_class is None else None
         for idx, (source_batch, target_batch) in enumerate(iterator):
-            if n_batches is not None and idx >= n_batches:
+            if batch_cap is not None and idx >= batch_cap:
                 break
 
             source_imgs = _extract_model_inputs(source_batch).to(dev)
@@ -618,6 +629,60 @@ def _iter_with_progress(iterable: Any, *, total: int, desc: str, enabled: bool) 
     return tqdm(iterable, total=total, desc=desc, leave=False)
 
 
+def _dataset_labels(dataset: Any) -> torch.Tensor | None:
+    """
+    Cheap, decode-free label read for an HFVisionDataset-shaped dataset
+    (a ``.split`` HF Dataset column plus ``.label_key``, and optionally a
+    ``._map_label`` remapper). Returns None if the dataset doesn't expose
+    this, so callers can raise a clear, actionable error instead of
+    silently decoding every image just to read its label.
+    """
+    split = getattr(dataset, "split", None)
+    label_key = getattr(dataset, "label_key", None)
+    if split is not None and label_key is not None:
+        try:
+            raw_labels = split[label_key]
+            map_label = getattr(dataset, "_map_label", None)
+            if callable(map_label):
+                return torch.tensor([int(map_label(y)) for y in raw_labels], dtype=torch.long)
+            return torch.tensor([int(y) for y in raw_labels], dtype=torch.long)
+        except Exception:
+            return None
+
+    # torch.utils.data.TensorDataset(x, y): labels are the second tensor.
+    tensors = getattr(dataset, "tensors", None)
+    if isinstance(tensors, (tuple, list)) and len(tensors) >= 2 and torch.is_tensor(tensors[1]):
+        return tensors[1].detach().to(dtype=torch.long, device="cpu")
+
+    return None
+
+
+def _class_balanced_indices(dataset: Any, *, shots_per_class: int, seed: int) -> torch.Tensor:
+    """
+    Exactly ``shots_per_class`` examples per class, selected without running
+    any forward pass. Mirrors steer.py's ``_few_shot`` (same seeding/sampling
+    logic), ported here so Theseus's calibration set can be class-balanced
+    instead of a uniform random subsample.
+    """
+    labels = _dataset_labels(dataset)
+    if labels is None:
+        raise ValueError(
+            "Theseus shots_per_class requires a dataset exposing cheap label access "
+            "(an HFVisionDataset-shaped `.split`/`.label_key`); got an unsupported dataset type."
+        )
+    generator = torch.Generator().manual_seed(int(seed))
+    classes = int(labels.max().item()) + 1
+    selected = []
+    for class_id in range(classes):
+        indices = torch.where(labels == class_id)[0]
+        if len(indices) < shots_per_class:
+            raise ValueError(
+                f"Theseus shots_per_class={shots_per_class} but class {class_id} only has {len(indices)} examples."
+            )
+        selected.append(indices[torch.randperm(len(indices), generator=generator)[:shots_per_class]])
+    return torch.cat(selected)
+
+
 def _iter_random_dataset_batches(
     source_dataloader: Iterable[Any],
     target_dataloader: Iterable[Any],
@@ -625,6 +690,7 @@ def _iter_random_dataset_batches(
     n_batches: int | None,
     seed: int,
     batch_size: int | None,
+    shots_per_class: int | None = None,
 ) -> Iterable[tuple[Any, Any]] | None:
     source_dataset = getattr(source_dataloader, "dataset", None)
     target_dataset = getattr(target_dataloader, "dataset", None)
@@ -660,11 +726,18 @@ def _iter_random_dataset_batches(
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
-    perm = torch.randperm(n_samples, generator=generator)
 
-    if n_batches is not None:
-        max_items = min(n_samples, int(n_batches) * batch_size)
-        perm = perm[:max_items]
+    if shots_per_class is not None:
+        # Class-balanced selection defines the calibration set outright;
+        # n_batches is not used to size it (unlike the uniform-random path
+        # below, where it caps a plain permutation of the whole dataset).
+        perm = _class_balanced_indices(source_dataset, shots_per_class=int(shots_per_class), seed=int(seed))
+        perm = perm[torch.randperm(perm.numel(), generator=generator)]
+    else:
+        perm = torch.randperm(n_samples, generator=generator)
+        if n_batches is not None:
+            max_items = min(n_samples, int(n_batches) * batch_size)
+            perm = perm[:max_items]
 
     def _iterator() -> Iterable[tuple[Any, Any]]:
         for start in range(0, int(perm.numel()), batch_size):
@@ -944,6 +1017,7 @@ class TheseusRebase:
         num_batches: int | None = None,
         seed: int = 0,
         batch_size: int | None = None,
+        shots_per_class: int | None = None,
         patch_qkv: bool = True,
         verbose: bool = True,
         show_progress: bool = True,
@@ -956,6 +1030,8 @@ class TheseusRebase:
         # Config fallbacks num_batches -> n_batches
         if n_batches is None:
             n_batches = num_batches
+        if shots_per_class is not None and int(shots_per_class) <= 0:
+            raise ValueError("Theseus shots_per_class must be a positive integer.")
         log_prefix = f"[{self.name}]"
         covariance_mode = _resolve_covariance_mode(covariance_mode)
         whiten_power = float(whiten_power)
@@ -970,7 +1046,7 @@ class TheseusRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
-                f"n_batches={n_batches}, seed={int(seed)})"
+                f"n_batches={n_batches}, shots_per_class={shots_per_class}, seed={int(seed)})"
             )
 
         patched_source = 0
@@ -1014,6 +1090,7 @@ class TheseusRebase:
                     n_batches=n_batches,
                     seed=int(seed),
                     batch_size=batch_size,
+                    shots_per_class=shots_per_class,
                     store_a_gram=whiten_power > 0.0,
                     store_b_gram=whiten_power > 0.0,
                 )
@@ -1088,6 +1165,7 @@ class TheseusRebase:
             "covariance_mode": covariance_mode,
             "split_fused_qkv": split_fused_qkv,
             "n_batches": n_batches,
+            "shots_per_class": shots_per_class,
             "patched_source_blocks": patched_source,
             "patched_target_blocks": patched_target,
             "unpatched_source_blocks": unpatched_source,
