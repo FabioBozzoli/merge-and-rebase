@@ -665,7 +665,20 @@ def main() -> None:
                 ).delta
                 matched, total, unmatched = describe_key_coverage(task_delta, target_base_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({len(tuned_sd)} keys)")
-                print(f"  {task}: delta has {total} keys, {matched} match the target base by name and shape")
+                if shim_mode:
+                    # theseus/bico transport across shape-mismatched same-name
+                    # layers via their own per-layer activation alignment, so
+                    # a low (even zero) exact-match count here is expected on
+                    # a cross-width pair and does not mean nothing will
+                    # transport -- see "matched" below only as "transported
+                    # without any alignment step".
+                    print(
+                        f"  {task}: delta has {total} keys, {matched} match the target base by name AND shape "
+                        f"exactly (transported as-is); the rest are aligned per-layer by {method_name} if the "
+                        "names still match"
+                    )
+                else:
+                    print(f"  {task}: delta has {total} keys, {matched} match the target base by name and shape")
                 if unmatched:
                     print(f"  {task}: first unmatched delta keys: {unmatched}")
 

@@ -18,6 +18,12 @@ almost nothing:
   ``theseus._extract_model_inputs`` only looks for image-ish batch keys.
 
 :class:`TextEncoderShim` and :func:`alias_inputs_loader` close exactly that gap.
+
+Importing this module also applies :func:`_patch_theseus_bico_embedding_hooks`,
+a small runtime patch (not a file edit) needed because ``theseus``/``bico``'s
+activation hooks assume every parameterized submodule captures a
+``[batch, token, hidden]`` tensor. T5's relative-position bias is an
+``nn.Embedding`` that breaks that assumption; see the function's docstring.
 """
 
 from __future__ import annotations
@@ -235,3 +241,63 @@ def describe_key_coverage(delta: Mapping[str, torch.Tensor], target_base: Mappin
     """``(matched, total, first unmatched keys)`` for the source-delta / target-base overlap."""
     unmatched = [k for k, v in delta.items() if k not in target_base or tuple(target_base[k].shape) != tuple(v.shape)]
     return len(delta) - len(unmatched), len(delta), unmatched[:5]
+
+
+def _patch_theseus_bico_embedding_hooks() -> None:
+    """
+    Make ``theseus._ActivationHook`` / ``bico._BiCoHook`` skip ``nn.Embedding``
+    submodules when they register activation hooks.
+
+    Both classes hook *every* submodule that owns parameters directly
+    (``if list(module.parameters(recurse=False))``), with no assumption
+    weaker than "captures a ``[batch, token, hidden]`` tensor" -- see
+    ``theseus._standardize_tokens``/``_align_features``. No CLIP submodule
+    that logic was written against looks like anything else.
+
+    T5 breaks that assumption: its relative-position bias
+    (``SelfAttention.relative_attention_bias``, present once per
+    encoder/decoder on block 0) is an ``nn.Embedding`` whose captured
+    input/output has no fixed hidden dimension -- its trailing dimension is
+    the *token count of the current batch*. Two calibration batches with
+    different token counts (ordinary dynamic padding) then produce
+    differently-shaped captures for the very same hook key, and
+    ``ActivationStore.update``'s cross-batch covariance accumulation
+    (``self.at_b += a.T @ b``) crashes with a shape mismatch.
+
+    ``theseus.py``/``bico.py`` are not to be edited, so this patches the two
+    hook classes' ``_register_hooks`` in place instead of the file on disk.
+    It is applied once, at import time of this module -- i.e. only when
+    ``eval/text_rebase.py`` runs; ``eval/vision_rebase.py`` never imports
+    ``rebase.text`` and is completely unaffected.
+    """
+    from ..methods import bico as _bico
+    from ..methods import theseus as _theseus
+
+    if getattr(_theseus._ActivationHook, "_skips_embeddings", False):
+        return  # idempotent: harmless if this module is imported more than once
+
+    def _register_hooks_no_embeddings(self: Any) -> None:
+        self.handles.append(self.model.register_forward_hook(self._make_hook("")))
+        for name, module in self.model.named_modules():
+            if name == "" or isinstance(module, nn.Embedding):
+                continue
+            if list(module.parameters(recurse=False)):
+                self.handles.append(module.register_forward_hook(self._make_hook(name)))
+
+    def _register_bico_hooks_no_embeddings(self: Any) -> None:
+        self._forward_handles.append(self.model.register_forward_hook(self._make_forward_hook("")))
+        self._backward_handles.append(self.model.register_full_backward_hook(self._make_backward_hook("")))
+        for name, module in self.model.named_modules():
+            if name == "" or isinstance(module, nn.Embedding):
+                continue
+            if list(module.parameters(recurse=False)):
+                self._forward_handles.append(module.register_forward_hook(self._make_forward_hook(name)))
+                self._backward_handles.append(module.register_full_backward_hook(self._make_backward_hook(name)))
+
+    _theseus._ActivationHook._register_hooks = _register_hooks_no_embeddings
+    _theseus._ActivationHook._skips_embeddings = True
+    _bico._BiCoHook._register_hooks = _register_bico_hooks_no_embeddings
+    _bico._BiCoHook._skips_embeddings = True
+
+
+_patch_theseus_bico_embedding_hooks()
