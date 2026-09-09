@@ -140,6 +140,23 @@ def test_unsupported_methods_are_named_with_a_reason() -> None:
         assert len(text_rebase._UNSUPPORTED_METHODS[name]) > 40
 
 
+def test_is_hub_model_reference_distinguishes_hub_ids_from_local_paths(tmp_path) -> None:
+    # A full HF Hub checkpoint (e.g. varun-v-rao/t5-base-snli): no local file,
+    # has a slash, no weight-file extension.
+    assert text_rebase._is_hub_model_reference("varun-v-rao/t5-base-snli")
+    # A local delta file living alongside a shared base -- even one that
+    # happens to contain a slash in its path -- is never a Hub reference.
+    local = tmp_path / "sub" / "full_best_ep.pt"
+    local.parent.mkdir()
+    local.write_bytes(b"not a real checkpoint, just needs to exist")
+    assert not text_rebase._is_hub_model_reference(str(local))
+    # A hub-style path string that ends in a weight extension is a filename,
+    # not a bare repo id, even though it wasn't found on disk.
+    assert not text_rebase._is_hub_model_reference("someorg/somerepo/full_best_ep.pt")
+    # No slash at all: neither shape.
+    assert not text_rebase._is_hub_model_reference("full_best_ep.pt")
+
+
 # --------------------------------------------------------------------------
 # val/test carve
 # --------------------------------------------------------------------------

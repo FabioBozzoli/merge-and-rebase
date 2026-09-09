@@ -125,6 +125,15 @@ key-coverage report at the start of each task so the actual overlap is visible e
 - **`target_task_heads` must be heads trained *for B*.** The example configs use a
   linear-probe of B per task (`strategy.name: linear_probe`) — B's no-backbone-training head,
   the text analogue of CLIP's free zero-shot head.
+- **`tuned_ckpts` can also name a full HF Hub model instead of a local checkpoint file.** A
+  bare repo id with no local file and no weight-file extension (e.g.
+  `"snli": "varun-v-rao/t5-base-snli"`) is loaded as a complete, already fine-tuned
+  `AutoModelForSequenceClassification` in its own right — useful for testing the rebase
+  methods against a checkpoint known to have actually learned its task, without waiting on a
+  local fine-tuning run. `source_model_name_or_path` must then be the **exact pretrained base**
+  that Hub checkpoint was fine-tuned from (matching tokenizer/vocab size and architecture), or
+  the computed task delta mixes the real fine-tuning delta with a spurious cross-pretraining
+  offset — this cannot be verified from the config alone, check the Hub model card.
 
 ## Head-free baseline: nearest-class-mean (cosine) head
 

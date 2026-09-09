@@ -35,6 +35,7 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -338,7 +339,9 @@ def _evaluate_source_finetuned(
     """
     out: dict[str, Any] = {"task": task, "split": split}
     recorded: dict[str, Any] = {}
-    if ckpt_path is not None:
+    if ckpt_path is not None and _is_hub_model_reference(ckpt_path):
+        print(f"  [A checkpoint] '{ckpt_path}' is a full HF Hub model, not a local checkpoint file -- no training metadata to read.")
+    elif ckpt_path is not None:
         recorded = _checkpoint_training_metadata(ckpt_path)
         out["checkpoint_recorded"] = recorded
         if "error" in recorded:
@@ -408,6 +411,69 @@ def _evaluate_source_finetuned(
             "     bug upstream, worth fixing before any conclusion about the rebase methods."
         )
     return out
+
+
+def _is_hub_model_reference(ref: str) -> bool:
+    """Whether ``ref`` names a full HF Hub model repo rather than a local checkpoint file.
+
+    Distinguishes ``varun-v-rao/t5-base-snli`` (a complete, already fine-tuned
+    ``AutoModelForSequenceClassification`` checkpoint, loadable on its own via
+    ``from_pretrained``) from a local ``.pt``/``.bin`` file holding a task
+    delta relative to a shared local base. Anything that exists on disk is a
+    local file, never a Hub reference, even if its name happens to contain a
+    slash.
+    """
+    if Path(ref).exists():
+        return False
+    return "/" in ref and not ref.lower().endswith((".pt", ".bin", ".safetensors", ".ckpt", ".pth"))
+
+
+def _load_tuned_source_state_dict(
+    ref: str,
+    *,
+    base_sd: dict[str, torch.Tensor],
+    source_cfg: TextBuildConfig,
+    model_kind: str,
+) -> dict[str, torch.Tensor]:
+    """A task's fine-tuned state dict, aligned to A's base key space.
+
+    Two shapes of ``tuned_ckpts`` entry are supported: a local file (the
+    existing convention -- a delta-shaped checkpoint alongside a shared local
+    base, read with ``load_ckpt``), or a bare HF Hub model id, which is loaded
+    as a complete, already fine-tuned ``AutoModelForSequenceClassification``/
+    ``AutoModelForSeq2SeqLM`` in its own right (e.g. a community checkpoint
+    such as ``varun-v-rao/t5-base-snli``) -- there is no local delta file for
+    these at all, the Hub repo *is* the fine-tuned model.
+
+    For the Hub case, ``source_model_name_or_path`` in the config must be the
+    actual pretrained base that checkpoint was fine-tuned from (tokenizer
+    vocab size and architecture must match, or key alignment below silently
+    drops every mismatched tensor) -- this function has no way to verify that
+    against the Hub repo's own model card, so a task_delta computed from a
+    wrong guess is a silent correctness risk, not just a missed transport.
+    """
+    if _is_hub_model_reference(ref):
+        print(f"  Loading '{ref}' as a full HF Hub sequence-classification checkpoint (not a local delta file).")
+        hub_cfg = TextBuildConfig(
+            model_name_or_path=ref,
+            model_arch=source_cfg.model_arch,
+            device=source_cfg.device,
+            dtype=source_cfg.dtype,
+            model_kind=model_kind,
+            num_labels=source_cfg.num_labels,
+            trust_remote_code=source_cfg.trust_remote_code,
+            use_fast_tokenizer=source_cfg.use_fast_tokenizer,
+        )
+        hub_llm = TextLM.build(hub_cfg)
+        tuned_raw: dict[str, torch.Tensor] = dict(hub_llm.model.state_dict())
+        del hub_llm
+    else:
+        tuned_raw = dict(load_ckpt(ref))
+
+    aligned = align_to_base_keys(tuned_raw, base_sd)
+    if not aligned:
+        raise ValueError(f"No tensors from '{ref}' aligned to the source model's keys.")
+    return aligned
 
 
 def _build_llm(cfg: dict[str, Any], *, role: str, model_kind: str, device: str) -> tuple[TextLM, TextBuildConfig]:
@@ -789,11 +855,9 @@ def main() -> None:
                 # delta_A zero and every steer result meaningless.
                 llm_source_finetuned = deepcopy(llm_source)
                 source_model_sd = llm_source_finetuned.model.state_dict()
-                aligned = align_to_base_keys(load_ckpt(ckpt_path), source_model_sd)
-                if not aligned:
-                    raise ValueError(
-                        f"No tensors from tuned checkpoint aligned to source model keys for task '{task}': {ckpt_path}."
-                    )
+                aligned = _load_tuned_source_state_dict(
+                    ckpt_path, base_sd=source_model_sd, source_cfg=source_cfg, model_kind=model_kind
+                )
                 # Count differences *before* loading: state_dict() hands back
                 # references to the live parameters, which load_into_model
                 # overwrites in place.
@@ -822,11 +886,9 @@ def main() -> None:
                 tuned_sd: dict[str, torch.Tensor] = {}
                 task_delta: dict[str, torch.Tensor] = {}
             else:
-                aligned = align_to_base_keys(load_ckpt(ckpt_path), source_base_sd)
-                if not aligned:
-                    raise ValueError(
-                        f"No tensors from tuned checkpoint aligned to source base keys for task '{task}': {ckpt_path}."
-                    )
+                aligned = _load_tuned_source_state_dict(
+                    ckpt_path, base_sd=source_base_sd, source_cfg=source_cfg, model_kind=model_kind
+                )
                 tuned_sd = to_cpu_fp32(aligned)
                 task_delta = TaskVector.from_checkpoints(
                     source_base_sd, tuned_sd, strict=False, key_filter=delta_key_filter
