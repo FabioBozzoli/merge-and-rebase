@@ -921,11 +921,9 @@ def main() -> None:
                 a_finetuned = llm_source_finetuned
                 if a_finetuned is None:
                     a_finetuned = deepcopy(llm_source)
-                    a_aligned = align_to_base_keys(load_ckpt(ckpt_path), a_finetuned.model.state_dict())
-                    if not a_aligned:
-                        raise ValueError(
-                            f"No tensors from tuned checkpoint aligned to source model keys for task '{task}': {ckpt_path}."
-                        )
+                    a_aligned = _load_tuned_source_state_dict(
+                        ckpt_path, base_sd=a_finetuned.model.state_dict(), source_cfg=source_cfg, model_kind=model_kind
+                    )
                     load_into_model(a_finetuned.model, a_aligned, strict=False)
                     if source_task_heads is not None:
                         _inject_task_head(
