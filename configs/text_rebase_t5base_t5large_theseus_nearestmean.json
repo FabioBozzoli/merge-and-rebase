@@ -1,0 +1,48 @@
+{
+  "_comment": "Test run: theseus rebase from A=google/t5-v1_1-base to B=google/t5-v1_1-large on MNLI only. B's classification head is NOT trained -- it is the nearest-class-mean (cosine) head built by scripts/build_nearest_mean_head.py, pointed to via target_task_heads. See scripts/sbatch_text_rebase_theseus_t5base_t5large.sh for the two-step run (build head, then this config).",
+  "_todo_tuned_ckpts": "Path below follows the naming convention finetune/train_text.py already uses (google__t5-v1_1-base/mnli/full_best_ep.pt) but is NOT verified against your cluster storage -- update it to wherever A's MNLI fine-tune actually lives, or produce it first with: python -m merge_and_rebase.finetune.train_text --text-config <your config> --tasks mnli.",
+
+  "suite": "nli6",
+  "tasks": "mnli",
+
+  "source_model_name_or_path": "google/t5-v1_1-base",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/t5-v1_1-large",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "target_task_heads": "REPLACE_WITH_NEAREST_MEAN_HEAD_PATH",
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 33,
+
+  "method": "theseus",
+  "method_params": {
+    "seq_align": "interpolate",
+    "shots_per_class": 8,
+    "center_acts": false,
+    "covariance_mode": "activations",
+    "patch_qkv": false
+  },
+
+  "alpha_search": false,
+  "alpha": 1.0,
+  "alpha_selection": "shared",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "mnli": "src/checkpoints/finetune_text/google__t5-v1_1-base/mnli/full_best_ep.pt"
+  }
+}
