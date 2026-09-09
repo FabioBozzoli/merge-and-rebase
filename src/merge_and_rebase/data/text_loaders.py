@@ -49,7 +49,7 @@ class _TaskSpec:
 
 _TASK_SPECS: dict[str, _TaskSpec] = {
     "snli": _TaskSpec(
-        hf_path="snli",
+        hf_path="stanfordnlp/snli",
         hf_configs=(None,),
         split_map={"train": ("train",), "validation": ("validation",), "test": ("test",)},
         premise_keys=("premise",),
@@ -60,7 +60,7 @@ _TASK_SPECS: dict[str, _TaskSpec] = {
         label_int_map={0: "entailment", 1: "neutral", 2: "contradiction"},
     ),
     "mnli": _TaskSpec(
-        hf_path="glue",
+        hf_path="nyu-mll/glue",
         hf_configs=("mnli",),
         split_map={
             "train": ("train",),
@@ -97,7 +97,7 @@ _TASK_SPECS: dict[str, _TaskSpec] = {
         },
     ),
     "qnli": _TaskSpec(
-        hf_path="glue",
+        hf_path="nyu-mll/glue",
         hf_configs=("qnli",),
         # GLUE test labels are unavailable; use validation for eval.
         split_map={"train": ("train",), "validation": ("validation",), "test": ("validation",)},
@@ -114,7 +114,7 @@ _TASK_SPECS: dict[str, _TaskSpec] = {
         },
     ),
     "rte": _TaskSpec(
-        hf_path="glue",
+        hf_path="nyu-mll/glue",
         hf_configs=("rte",),
         # GLUE test labels are unavailable; use validation for eval.
         split_map={"train": ("train",), "validation": ("validation",), "test": ("validation",)},
@@ -131,7 +131,7 @@ _TASK_SPECS: dict[str, _TaskSpec] = {
         },
     ),
     "scitail": _TaskSpec(
-        hf_path="scitail",
+        hf_path="allenai/scitail",
         hf_configs=("tsv_format", None),
         split_map={"train": ("train",), "validation": ("validation", "dev"), "test": ("test",)},
         premise_keys=("sentence1", "premise"),

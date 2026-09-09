@@ -23,6 +23,7 @@ Starter configs:
 - [`configs/text_rebase_t5_bico.json`](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/text_rebase_t5_bico.json)
 - [`configs/text_rebase_t5_steer.json`](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/text_rebase_t5_steer.json)
 - [`configs/text_rebase_qwen_theseus.json`](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/text_rebase_qwen_theseus.json) — decoder-only template (checkpoints not included).
+- [`configs/text_rebase_t5base_t5large_theseus_nearestmean.json`](https://github.com/apanariello4/merge-and-rebase/blob/main/configs/text_rebase_t5base_t5large_theseus_nearestmean.json) — cross-width pair (t5-v1_1-base → t5-v1_1-large) where B's head is *not* trained, but a nearest-class-mean head built by `scripts/build_nearest_mean_head.py` (see below).
 
 ## Which methods it drives
 
@@ -90,11 +91,30 @@ way `data/vision_loaders.py` carves val out of test — val and test are always 
 
 ## Cross-architecture pairs
 
-There is no text equivalent of the ViT-only block-extension preprocess. If A and B have a
-different number of transformer blocks, only name-matching parameters are transported and
-the target's extra blocks keep their pretrained weights; `text_rebase.py` prints both depths
-and a delta/target key-coverage report at the start of each task so this is visible, not
-silent.
+There is no text equivalent of the ViT-only block-extension preprocess, and what happens on a
+depth mismatch (e.g. t5-v1_1-base, 12 layers → t5-v1_1-large, 24 layers) differs **per method**
+— it is not one blanket rule. `text_rebase.py` prints both depths and a delta/target
+key-coverage report at the start of each task so the actual overlap is visible either way.
+
+- **`theseus` / `bico`** — width mismatches (different `d_model`) are exactly what these
+  methods are built to handle: they compute per-layer alignment maps from activation
+  statistics (procrustes/whitening) and transport across dimensions. Depth mismatches are a
+  separate problem they do *not* solve: matching is by **exact block name**, so A's block `i`
+  aligns only to B's block `i`. If B has more blocks than A, B's extra trailing blocks have no
+  source block to align against and are transported **zero delta** — they keep their
+  pretrained weights. This is a partial transport, not a failure: it runs, but only touches
+  the first `len(A's blocks)` of B's blocks.
+- **`gradfix`** — has no per-layer alignment at all. It masks A's raw delta against B's own
+  gradient signs key-by-key, which requires the two tensors for the same parameter name to
+  have the **same shape**. Any width mismatch (not just depth) raises immediately
+  (`torch.where` on incompatible shapes). gradfix therefore only works for same-architecture
+  pairs (e.g. `t5-v1_1-base` → `flan-t5-base`), never across model sizes.
+- **`steer_text`** — never touches weights, so it is largely immune to this. `global_ridge` /
+  `global_mlp` fit Stage 1/2 from A's feature dimension to B's, whatever those are. `block_ridge`
+  explicitly handles a depth mismatch instead of dropping it: when B has more residual blocks
+  than A, `block_group_strategy` (`concat` / `sum_avg`) groups B's blocks down to A's block
+  count first, so every one of B's blocks participates in the fit — not just a name-matching
+  prefix.
 
 ## Producing the inputs
 
@@ -105,6 +125,43 @@ silent.
 - **`target_task_heads` must be heads trained *for B*.** The example configs use a
   linear-probe of B per task (`strategy.name: linear_probe`) — B's no-backbone-training head,
   the text analogue of CLIP's free zero-shot head.
+
+## Head-free baseline: nearest-class-mean (cosine) head
+
+When B has no fine-tune to linear-probe from at all, `scripts/build_nearest_mean_head.py`
+builds a `target_task_heads`-compatible `heads.pt` without training anything:
+
+```bash
+python -m scripts.build_nearest_mean_head \
+  --model-name-or-path google/t5-v1_1-large --model-arch t5 \
+  --task mnli --few-shot 8 --seed 33 --num-labels 3 \
+  --output /path/to/t5-v1_1-large_mnli_nearest_mean.pt
+```
+
+Each class row is the L2-normalized centroid of B's own pooled features (the tensor B's real
+head would consume — post-dense-tanh for T5, the last non-pad hidden state for a decoder-only
+model) over a small few-shot support set, with the bias forced to zero:
+
+```
+mu_c = normalize( mean_{x in support(c)} normalize(pooled_feature(x)) )
+```
+
+No custom "cosine head" module is needed at eval time: for a fixed query `x`,
+`cos_sim(x, mu_c) = (x · mu_c) / (|x| |mu_c|)`. Every `mu_c` is unit-norm, so this reduces to
+`(x · mu_c) / |x|`, and `|x|` is the same positive scalar for every class — it cannot change
+which class scores highest. So the raw dot product `feature @ weight.T` that `head_logits`
+evaluation already computes (`TextLM.sequence_classification_accuracy`) is argmax-equivalent
+to nearest-cosine classification once the weight rows are unit-norm and the bias is zero.
+
+The pooled feature is extracted the same way `rebase/text/steer_text.py` already does it
+(swap the head's final `nn.Linear` for `nn.Identity`, read what would have been its input),
+and the script finishes by injecting the built head back into the live model and scoring it
+on its own support set through `TextLM.sequence_classification_accuracy` — the exact function
+`text_rebase.py` calls in `eval_mode="head_logits"` — as an end-to-end sanity check before the
+file is written.
+
+Point `target_task_heads` at the resulting file exactly as you would a trained one; nothing
+else in the pipeline needs to know the head wasn't trained.
 
 ## Limits
 
