@@ -172,6 +172,23 @@ def subset_loader(loader: DataLoader, indices: Sequence[int], *, batch_size: int
     )
 
 
+def _head_root_and_linears(model: nn.Module) -> tuple[str, list[tuple[str, nn.Linear]]]:
+    for root in _HEAD_ROOTS:
+        module = getattr(model, root, None)
+        if module is None:
+            continue
+        if isinstance(module, nn.Linear):
+            return root, [(root, module)]
+        linears = [(f"{root}.{n}", m) for n, m in module.named_modules() if isinstance(m, nn.Linear)]
+        if linears:
+            return root, linears
+    raise ValueError(
+        "Could not locate a classification head on this model. Expected one of "
+        f"{list(_HEAD_ROOTS)} holding an nn.Linear (an AutoModelForSequenceClassification). "
+        "Methods needing a head (steer_text) require model_kind='sequence_classification'."
+    )
+
+
 def head_linear(model: nn.Module) -> tuple[str, nn.Linear]:
     """Return ``(qualified_name, module)`` of the final classification ``nn.Linear``.
 
@@ -180,21 +197,37 @@ def head_linear(model: nn.Module) -> tuple[str, nn.Linear]:
     the decoder's eos position, Qwen/Llama the last non-pad token). Capturing it
     with a forward pre-hook is therefore architecture-independent, which is why
     ``steer_text`` never has to reimplement per-model pooling.
+
+    Note this is the input to the *final* Linear only. Some heads (T5's, see
+    :func:`head_intermediate_linears`) insert randomly-initialized layers
+    before it, so "input to the final Linear" is not the same as "the model's
+    own pretrained representation" -- ``steer_text`` doesn't care (it fits and
+    evaluates in that same space consistently either way), but a method that
+    wants the model's actual pretrained features does.
     """
-    for root in _HEAD_ROOTS:
-        module = getattr(model, root, None)
-        if module is None:
-            continue
-        if isinstance(module, nn.Linear):
-            return root, module
-        linears = [(f"{root}.{n}", m) for n, m in module.named_modules() if isinstance(m, nn.Linear)]
-        if linears:
-            return linears[-1]
-    raise ValueError(
-        "Could not locate a classification head on this model. Expected one of "
-        f"{list(_HEAD_ROOTS)} holding an nn.Linear (an AutoModelForSequenceClassification). "
-        "Methods needing a head (steer_text) require model_kind='sequence_classification'."
-    )
+    _, linears = _head_root_and_linears(model)
+    return linears[-1]
+
+
+def head_intermediate_linears(model: nn.Module) -> list[tuple[str, nn.Linear]]:
+    """Every ``nn.Linear`` under the classification head *except* the final one.
+
+    An encoder-decoder head like T5's ``T5ClassificationHead`` is
+    ``dense -> tanh -> out_proj``: ``dense`` has no pretrained weights (a
+    fresh ``AutoModelForSequenceClassification.from_pretrained`` always
+    initializes it randomly -- there is nothing in the base checkpoint to
+    load it from), so whatever ``head_linear`` captures as "the pooled
+    feature" for T5 is actually that pretrained representation passed
+    through an untrained random rotation, not the representation itself. A
+    decoder-only head (a bare ``score`` Linear) has no such layer -- this
+    returns ``[]`` for it.
+
+    Callers that want to build a classifier directly on the model's own
+    pretrained features (e.g. a nearest-mean head) should neutralize these
+    to the identity transform first; see ``scripts/build_nearest_mean_head.py``.
+    """
+    _, linears = _head_root_and_linears(model)
+    return linears[:-1]
 
 
 def text_param_filter(*, exclude_head: bool = True):

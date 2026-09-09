@@ -59,8 +59,46 @@ from merge_and_rebase.data.text_loaders import (
 )
 from merge_and_rebase.eval.llm_merge import _inject_task_head
 from merge_and_rebase.models.text_lm import TextBuildConfig, TextLM
-from merge_and_rebase.rebase.text import balanced_indices, head_linear
+from merge_and_rebase.rebase.text import balanced_indices, head_intermediate_linears, head_linear
 from merge_and_rebase.rebase.text.steer_text import _head_as_identity, _pooled_features
+
+
+def _neutralize_intermediate_head_layers(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """
+    Overwrite every ``nn.Linear`` between the model's pretrained representation
+    and the final classification ``nn.Linear`` (see
+    :func:`~merge_and_rebase.rebase.text.head_intermediate_linears`) with an
+    identity transform, in place, and return the tensors written.
+
+    Necessary for a nearest-mean head: T5's ``T5ClassificationHead`` inserts a
+    ``dense`` Linear + ``tanh`` between the decoder's pretrained eos-pooled
+    hidden state and ``out_proj``. ``dense`` is never present in a base
+    checkpoint (``AutoModelForSequenceClassification`` always initializes it
+    randomly), so centroids built from its output are class means of a
+    pretrained representation passed through an untrained random rotation --
+    not of the representation itself. Setting it to the identity (square
+    layers only; T5's is d_model -> d_model) makes the feature space
+    ``pooled_feature(x)`` actually captures equal to ``tanh(pretrained_hidden)``,
+    and doing it *before* feature extraction (not just at save time) keeps
+    centroid construction and later injection in the same space. A no-op for
+    architectures with no such layer (e.g. a bare decoder-only ``score``
+    Linear): :func:`head_intermediate_linears` returns ``[]`` for those.
+    """
+    written: dict[str, torch.Tensor] = {}
+    for name, module in head_intermediate_linears(model):
+        if module.weight.shape[0] != module.weight.shape[1]:
+            raise ValueError(
+                f"Cannot neutralize non-square intermediate head layer '{name}' "
+                f"(shape {tuple(module.weight.shape)}) to an identity transform."
+            )
+        eye = torch.eye(module.weight.shape[0], dtype=module.weight.dtype, device=module.weight.device)
+        with torch.no_grad():
+            module.weight.copy_(eye)
+            written[f"{name}.weight"] = eye.detach().cpu()
+            if module.bias is not None:
+                module.bias.zero_()
+                written[f"{name}.bias"] = module.bias.detach().cpu().clone()
+    return written
 
 
 def _select_few_shot(task_data: NLITaskData, *, per_class: int, seed: int, max_candidates: int | None) -> NLITaskData:
@@ -123,6 +161,13 @@ def build_head(
     )
     llm = TextLM.build(build_cfg)
 
+    neutralized = _neutralize_intermediate_head_layers(llm.model)
+    if neutralized:
+        print(
+            f"Neutralized {len(neutralized) // 2} untrained intermediate head layer(s) to identity "
+            f"before feature extraction: {sorted({k.rsplit('.', 1)[0] for k in neutralized})}"
+        )
+
     head_class_ids = default_head_class_ids_for_task(task, num_labels=num_labels)
     task_data = build_nli_task_data(task=task, split="train")
     print(f"Loaded {len(task_data.examples)} '{task}' train examples ({task_data.labels}).")
@@ -173,6 +218,10 @@ def build_head(
     payload: dict[str, torch.Tensor] = {f"{head_name}.weight": weight}
     if head_module.bias is not None:
         payload[f"{head_name}.bias"] = torch.zeros(num_labels, dtype=head_module.bias.dtype)
+    # Bake the same neutralization into the saved head: injecting it at eval
+    # time (_inject_task_head) must reproduce the exact feature space the
+    # centroids above were computed in, or the two disagree again.
+    payload.update(neutralized)
 
     meta = {
         "model_name_or_path": model_name_or_path,
@@ -183,11 +232,14 @@ def build_head(
         "num_labels": num_labels,
         "head_class_ids": head_class_ids,
         "head_param_prefix": head_name,
+        "neutralized_intermediate_layers": sorted({k.rsplit(".", 1)[0] for k in neutralized}),
         "construction": "nearest_class_mean_cosine",
         "note": (
             "weight rows are L2-normalized class centroids of the model's own pooled "
-            "features over the support set; bias is zero. A raw dot product against "
-            "these rows is argmax-equivalent to cosine nearest-mean classification."
+            "features over the support set, computed after neutralizing any untrained "
+            "intermediate head layers (see neutralized_intermediate_layers) to identity; "
+            "bias is zero throughout. A raw dot product against these rows is "
+            "argmax-equivalent to cosine nearest-mean classification."
         ),
     }
 

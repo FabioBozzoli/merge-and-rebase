@@ -17,6 +17,7 @@ from merge_and_rebase.rebase.text import (
     balanced_indices,
     block_index_of,
     block_modules,
+    head_intermediate_linears,
     num_residual_blocks,
     steer_text_correction_context,
     text_param_filter,
@@ -340,6 +341,25 @@ def test_head_as_identity_yields_the_pooled_feature(factory, dim) -> None:
     # The swap is exact: re-applying the head reproduces the real logits.
     expected = pooled @ head.weight.T + (head.bias if head.bias is not None else 0.0)
     assert torch.allclose(expected, before, atol=1e-4)
+
+
+def test_head_intermediate_linears_flags_t5s_untrained_dense_layer() -> None:
+    # T5ForSequenceClassification's head is dense -> tanh -> out_proj; `dense`
+    # has no pretrained weights (always randomly initialized), so a nearest-mean
+    # head built on its output is class means of a random rotation of the
+    # model's real representation unless dense is neutralized first.
+    model = _tiny_t5()
+    intermediate = head_intermediate_linears(model)
+    assert [name for name, _ in intermediate] == ["classification_head.dense"]
+    dense = intermediate[0][1]
+    assert dense.weight.shape == (dense.weight.shape[0], dense.weight.shape[0]), "must be square to neutralize to identity"
+
+
+def test_head_intermediate_linears_empty_for_a_bare_decoder_only_head() -> None:
+    # Qwen/Llama-style sequence classification heads are a single Linear
+    # straight on the pooled feature -- nothing to neutralize.
+    model = _tiny_qwen()
+    assert head_intermediate_linears(model) == []
 
 
 # --------------------------------------------------------------------------
