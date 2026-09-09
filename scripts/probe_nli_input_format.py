@@ -119,7 +119,13 @@ def score_candidate(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-name-or-path", type=str, required=True)
-    p.add_argument("--task", type=str, default="snli", help="HF datasets id with premise/hypothesis/label fields.")
+    p.add_argument(
+        "--task",
+        type=str,
+        default="stanfordnlp/snli",
+        help="HF datasets id with premise/hypothesis/label fields. Must be namespaced "
+        "('org/name') -- newer `datasets` versions no longer resolve legacy bare ids like 'snli'.",
+    )
     p.add_argument("--num-examples", type=int, default=300)
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--max-length", type=int, default=256)
@@ -141,7 +147,12 @@ def main() -> None:
     print(f"Model config id2label: {id2label}")
     if id2label is not None:
         recovered = tuple(str(id2label[i]).lower() for i in sorted(id2label, key=int))
-        if recovered != _LABEL_NAMES:
+        if all(name.startswith("label_") for name in recovered):
+            print(
+                "  (generic transformers placeholders, not real names -- whoever uploaded this checkpoint never\n"
+                "  set id2label; this tells us nothing about the true label order, only that it wasn't recorded.)"
+            )
+        elif recovered != _LABEL_NAMES:
             print(
                 f"  NOTE: this differs from this repo's assumed order {_LABEL_NAMES} -- if it differs only by\n"
                 "  permutation, that alone would produce a near-chance result independent of input format."
