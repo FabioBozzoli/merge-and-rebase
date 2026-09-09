@@ -1,0 +1,54 @@
+{
+  "_comment": "Same transfer as text_rebase_t5base_t5large_theseus_nearestmean.json (A=google/t5-v1_1-base -> B=google/t5-v1_1-large), method=steer_text instead of theseus. steer_text never writes B's backbone weights -- it fits a feature-space correction and adds it at eval time -- so B's backbone is identical (pretrained, untouched) for both the target_zeroshot baseline and the corrected condition. This avoids the head/backbone-consistency issue theseus has here: the nearest-mean head for B is built once on B's pretrained backbone, and that backbone never changes under steer_text, so the same head is always evaluated against the state it was calibrated on.",
+  "_source_head": "Unlike the theseus config, source_task_heads is NOT set here on purpose: A's tuned_ckpts (a 'full' checkpoint) already contains A's real fine-tuned classification_head.* weights, which align_to_base_keys loads automatically when the checkpoint is read -- steer_text.prepare() reads w_a straight off that live head. Set source_task_heads explicitly only if A's checkpoint format does NOT already include head weights (e.g. a head-only or peft-adapter checkpoint).",
+  "_block_ridge_note": "feature_regime=linear + stage_2_strategy=block_ridge directly exercises the depth-mismatch handling theseus doesn't have: B's 24 residual blocks get grouped down (block_group_strategy=concat) to match A's 12, so every one of B's blocks participates in the fit, not just a name-matching prefix. The forward-mode jvp this needs is linearizing A (t5-v1_1-base, ~220M params, 12 layers), NOT B -- affordable, well under steer_text's own 500M-parameter warning threshold. If this is too slow/memory-heavy on your allocation, fall back to feature_regime=standard + stage_2_strategy=global_ridge (see configs/text_rebase_t5_steer.json), which is architecture-mismatch-agnostic but does not use per-block correspondence at all.",
+
+  "suite": "nli6",
+  "tasks": "snli",
+
+  "source_model_name_or_path": "google/t5-v1_1-base",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/t5-v1_1-large",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "target_task_heads": "REPLACE_WITH_NEAREST_MEAN_HEAD_PATH",
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 33,
+
+  "method": "steer_text",
+  "method_params": {
+    "feature_regime": "linear",
+    "stage_2_strategy": "block_ridge",
+    "block_group_strategy": "concat",
+    "block_ridge_mode": "independent",
+    "few_shot": 300,
+    "stage1_lambda": 1.0,
+    "ridge_lambda": 1.0,
+    "feature_cache_dir": "src/.cache/steer_text_features",
+    "force_recompute_features": false
+  },
+
+  "alpha_search": false,
+  "alpha": 1.0,
+  "alpha_selection": "shared",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "/work/intesasanpaolo_phd/checkpoints_text/google__t5-v1_1-base/snli/full_best_ep.pt",
+    "mnli": "/work/intesasanpaolo_phd/checkpoints_text/google__t5-v1_1-base/mnli/full_best_ep.pt"
+  }
+}
