@@ -276,6 +276,35 @@ def describe_key_coverage(delta: Mapping[str, torch.Tensor], target_base: Mappin
     return len(delta) - len(unmatched), len(delta), unmatched[:5]
 
 
+def feature_separability(normed: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
+    """How much class signal a pooled-feature matrix carries, before any classifier.
+
+    ``normed`` must be L2-normalized rows, one per example; ``labels`` their
+    class ids. Returns mean cosine similarity among same-class pairs, among
+    different-class pairs, their gap, and the spread of all pairwise
+    similarities.
+
+    Reading it: ``gap`` near zero means examples resemble same-class ones no
+    more than different-class ones -- there is no signal for *any* linear or
+    cosine classifier to find, so a near-chance result says nothing about the
+    classifier and everything about the representation. ``pairwise_std`` near
+    zero additionally means every example maps to nearly the same feature,
+    i.e. the pooled value barely responds to the input at all.
+    """
+    sim = (normed @ normed.T).clamp(-1.0, 1.0)
+    off_diag = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+    same = (labels.unsqueeze(0) == labels.unsqueeze(1)) & off_diag
+    diff = (labels.unsqueeze(0) != labels.unsqueeze(1)) & off_diag
+    within = float(sim[same].mean())
+    between = float(sim[diff].mean())
+    return {
+        "within_class_cosine": within,
+        "between_class_cosine": between,
+        "gap": within - between,
+        "pairwise_std": float(sim[off_diag].std()),
+    }
+
+
 def _patch_theseus_bico_embedding_hooks() -> None:
     """
     Make ``theseus._ActivationHook`` / ``bico._BiCoHook`` skip ``nn.Embedding``

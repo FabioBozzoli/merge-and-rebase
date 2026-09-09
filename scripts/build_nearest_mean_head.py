@@ -59,7 +59,12 @@ from merge_and_rebase.data.text_loaders import (
 )
 from merge_and_rebase.eval.llm_merge import _inject_task_head
 from merge_and_rebase.models.text_lm import TextBuildConfig, TextLM
-from merge_and_rebase.rebase.text import balanced_indices, head_intermediate_linears, head_linear
+from merge_and_rebase.rebase.text import (
+    balanced_indices,
+    feature_separability,
+    head_intermediate_linears,
+    head_linear,
+)
 from merge_and_rebase.rebase.text.steer_text import _head_as_identity, _pooled_features
 
 
@@ -101,7 +106,7 @@ def _neutralize_intermediate_head_layers(model: torch.nn.Module) -> dict[str, to
     return written
 
 
-def _diagnose_pooled_features(normed: torch.Tensor, labels: torch.Tensor, num_labels: int) -> None:
+def _diagnose_pooled_features(normed: torch.Tensor, labels: torch.Tensor) -> None:
     """
     Print whether the pooled features carry *any* class signal at all, before
     centroids are even computed.
@@ -124,20 +129,14 @@ def _diagnose_pooled_features(normed: torch.Tensor, labels: torch.Tensor, num_la
       not actually varying with content (padding/attention_mask/eos-position
       handling), not evidence about whether nearest-mean is a good classifier.
     """
-    sim = (normed @ normed.T).clamp(-1.0, 1.0)
-    n = sim.shape[0]
-    off_diag = ~torch.eye(n, dtype=torch.bool)
-    same_class = (labels.unsqueeze(0) == labels.unsqueeze(1)) & off_diag
-    diff_class = (labels.unsqueeze(0) != labels.unsqueeze(1)) & off_diag
-    within = sim[same_class].mean().item()
-    between = sim[diff_class].mean().item()
-    pairwise_std = sim[off_diag].std().item()
+    stats = feature_separability(normed, labels)
+    within, between, pairwise_std = stats["within_class_cosine"], stats["between_class_cosine"], stats["pairwise_std"]
     print(
         f"Pooled-feature diagnostic: within_class_cosine={within:.4f} "
-        f"between_class_cosine={between:.4f} gap={within - between:+.4f} "
+        f"between_class_cosine={between:.4f} gap={stats['gap']:+.4f} "
         f"pairwise_cosine_std={pairwise_std:.4f}"
     )
-    if abs(within - between) < 0.02 or pairwise_std < 0.02:
+    if abs(stats["gap"]) < 0.02 or pairwise_std < 0.02:
         print(
             "  WARNING: within-class and between-class similarity are nearly identical "
             "and/or barely vary across example pairs. This means the pooled feature carries "
@@ -251,7 +250,7 @@ def build_head(
     labels = torch.cat(label_chunks, dim=0)
 
     normed = torch.nn.functional.normalize(features, dim=-1)
-    _diagnose_pooled_features(normed, labels, num_labels)
+    _diagnose_pooled_features(normed, labels)
     centroids = torch.zeros(num_labels, features.shape[-1], dtype=torch.float64)
     for class_id in range(num_labels):
         rows = normed[labels == class_id]

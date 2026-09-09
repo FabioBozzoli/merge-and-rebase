@@ -163,6 +163,29 @@ file is written.
 Point `target_task_heads` at the resulting file exactly as you would a trained one; nothing
 else in the pipeline needs to know the head wasn't trained.
 
+## Diagnosing a near-chance result
+
+A near-chance accuracy through B's head is ambiguous on its own: it could be the
+rebase method, the head, or the representation underneath both. Two controls
+separate them.
+
+`eval_source_finetuned: true` (or `--eval-source-finetuned`) scores **A's own
+fine-tuned checkpoint with its own trained head** on the same task split, and
+reports pooled-feature class separability for A fine-tuned, A pretrained, and
+(via `scripts/build_nearest_mean_head.py`) B pretrained. Separability is the mean
+cosine similarity among same-class pairs minus that among different-class pairs:
+
+| Reading | Means |
+|---|---|
+| A fine-tuned gap large, A pretrained gap ~0 | Pooling and tokenization are fine. Class structure is created by fine-tuning, so a head built on B's *untrained* features has nothing to work with. |
+| A fine-tuned gap ~0 but A still classifies well | The tensor being read as "the pooled feature" is not the one the classifier uses -- a pooling-position bug upstream. |
+| Every gap ~0 and A classifies poorly too | The checkpoint, tokenization or task wiring is wrong, not the rebase method. |
+
+This matters because every method here reads through B's head: `steer_text` fits
+its Stage 2 correction as a function of B's pooled feature, so if that feature
+carries no class signal the correction cannot be class-dependent either, and no
+Stage 1 quality can recover it.
+
 ## Limits
 
 - `steer_text` requires `eval_mode="head_logits"`.

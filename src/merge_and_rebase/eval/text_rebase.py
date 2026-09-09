@@ -74,10 +74,12 @@ from ..rebase.text import (  # noqa: F401  -- import registers "steer_text"
     balanced_indices,
     count_transformer_blocks,
     describe_key_coverage,
+    feature_separability,
     steer_text_correction_context,
     subset_loader,
     text_param_filter,
 )
+from ..rebase.text.steer_text import _head_as_identity, _pooled_features
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from .llm_merge import (
@@ -252,6 +254,99 @@ def _average_defined(values: list[float]) -> float:
     return average_scores(defined) if defined else float("nan")
 
 
+@torch.no_grad()
+def _pooled_feature_report(
+    *,
+    llm: TextLM,
+    loaders: TextLoaders,
+    split: str,
+    device: str,
+    label: str,
+) -> dict[str, float]:
+    """Pooled-feature class separability for one model, on one split.
+
+    Answers the question a bare accuracy number cannot: is a near-chance
+    result caused by the *classifier* on top of the features, or by the
+    features themselves carrying no class signal to begin with? Run on the
+    source and the target with the same metric and the numbers are directly
+    comparable -- if A's fine-tuned features separate and B's pretrained ones
+    do not, the pooling machinery works and the gap is what fine-tuning built.
+    """
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    chunks: list[torch.Tensor] = []
+    llm.model.eval()
+    with _head_as_identity(llm.model):
+        for batch in _resolve_eval_loader(loaders, split):
+            chunks.append(_pooled_features(llm.model, batch, dev).cpu().double())
+    features = torch.cat(chunks, dim=0)
+    labels = torch.as_tensor([int(y) for y in loaders.local_labels[split]], dtype=torch.long)[: features.shape[0]]
+
+    stats = feature_separability(torch.nn.functional.normalize(features, dim=-1), labels)
+    print(
+        f"  [{label}] pooled-feature separability on '{split}': "
+        f"within={stats['within_class_cosine']:.4f} between={stats['between_class_cosine']:.4f} "
+        f"gap={stats['gap']:+.4f} pairwise_std={stats['pairwise_std']:.4f}"
+    )
+    return stats
+
+
+def _evaluate_source_finetuned(
+    *,
+    llm_source_finetuned: TextLM,
+    llm_source_pretrained: TextLM,
+    source_loaders: TextLoaders,
+    task: str,
+    device: str,
+    eval_mode: str,
+    split: str = "test",
+) -> dict[str, Any]:
+    """Score A's own fine-tuned checkpoint, plus feature diagnostics for A and A-pretrained.
+
+    This is the control the rest of the run is missing. Every reported number
+    (target_zeroshot, rebased) is read through B's head, so a near-chance
+    result there is ambiguous on its own. A's fine-tuned accuracy is measured
+    with A's own trained head on the same task split, so it isolates whether
+    the architecture, tokenization and pooling can support this task *at all*
+    once something has actually been trained through them.
+    """
+    out: dict[str, Any] = {"task": task, "split": split}
+    if eval_mode == "head_logits":
+        acc = float(
+            llm_source_finetuned.sequence_classification_accuracy(
+                _resolve_eval_loader(source_loaders, split),
+                device=device,
+                mask_class=source_loaders.mask_class,
+            )
+        )
+        out["source_finetuned_accuracy"] = acc
+        print(f"  [A finetuned] accuracy on '{split}' with its own trained head: {acc:.4f}")
+
+    out["source_finetuned_features"] = _pooled_feature_report(
+        llm=llm_source_finetuned, loaders=source_loaders, split=split, device=device, label="A finetuned"
+    )
+    out["source_pretrained_features"] = _pooled_feature_report(
+        llm=llm_source_pretrained, loaders=source_loaders, split=split, device=device, label="A pretrained"
+    )
+    a_ft_gap = out["source_finetuned_features"]["gap"]
+    a_pre_gap = out["source_pretrained_features"]["gap"]
+    if a_ft_gap > 0.05 and abs(a_pre_gap) < 0.02:
+        print(
+            "  => A's pooled features separate the classes only AFTER fine-tuning. The pooling position and\n"
+            "     tokenization are therefore fine: the class structure is something training creates, not\n"
+            "     something a pretrained-only checkpoint already has. A target head built from B's untrained\n"
+            "     features (nearest-mean) has nothing to latch onto -- train a linear probe on B instead, or\n"
+            "     start from an instruction-tuned/LM-adapted B."
+        )
+    elif a_ft_gap < 0.02:
+        print(
+            "  => A's features do NOT separate the classes even after fine-tuning, while A still classifies\n"
+            "     well. That combination means the tensor being read as 'the pooled feature' is not the one\n"
+            "     the classifier actually uses -- a pooling-position bug upstream, worth fixing before any\n"
+            "     conclusion about the rebase methods."
+        )
+    return out
+
+
 def _build_llm(cfg: dict[str, Any], *, role: str, model_kind: str, device: str) -> tuple[TextLM, TextBuildConfig]:
     name_key = f"{role}_model_name_or_path"
     if not cfg.get(name_key):
@@ -329,6 +424,13 @@ def main() -> None:
         p.add_argument("--alpha-patience", type=int, default=None)
         p.add_argument("--alpha-search-split", type=str, default=None, choices=["val", "test"])
         p.add_argument("--save-transported-tvs-dir", type=str, default=None)
+        p.add_argument(
+            "--eval-source-finetuned",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Also score A's own fine-tuned checkpoint (with its own trained head) on each task, "
+            "as a control for whether the architecture/tokenization/pooling support the task at all.",
+        )
         add_logging_args(p)
 
         args = p.parse_args()
@@ -379,6 +481,7 @@ def main() -> None:
             "alpha_step": args.alpha_step,
             "alpha": args.alpha,
             "save_transported_tvs_dir": args.save_transported_tvs_dir,
+            "eval_source_finetuned": args.eval_source_finetuned,
         }
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
@@ -403,6 +506,7 @@ def main() -> None:
 
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
+        eval_source_finetuned = bool(cfg.get("eval_source_finetuned", False))
 
         grad_batch_size = int(cfg["grad_batch_size"]) if cfg.get("grad_batch_size") is not None else None
         grad_examples_per_class = (
@@ -557,6 +661,7 @@ def main() -> None:
         transport_timings: dict[str, dict[str, float]] = {}
         transported_artifacts: dict[str, list[str]] = {}
         steer_prepared_by_task: dict[str, dict[str, Any]] = {}
+        source_eval_rows: list[dict[str, Any]] = []
 
         for task in tasks:
             splits = _build_task_splits(
@@ -581,7 +686,7 @@ def main() -> None:
                 head_class_ids=head_class_ids,
             )
             source_loaders: TextLoaders | None = None
-            if shim_mode or steer_mode:
+            if shim_mode or steer_mode or eval_source_finetuned:
                 source_loaders = _tokenize_splits(
                     splits=splits,
                     tokenizer=llm_source.tokenizer,
@@ -681,6 +786,43 @@ def main() -> None:
                     print(f"  {task}: delta has {total} keys, {matched} match the target base by name and shape")
                 if unmatched:
                     print(f"  {task}: first unmatched delta keys: {unmatched}")
+
+            if eval_source_finetuned:
+                if source_loaders is None:
+                    raise RuntimeError("eval_source_finetuned requires source loaders.")
+                # steer already built a live finetuned A; every other method only
+                # needs A's weights as a state dict, so build one here just for
+                # this control.
+                a_finetuned = llm_source_finetuned
+                if a_finetuned is None:
+                    a_finetuned = deepcopy(llm_source)
+                    a_aligned = align_to_base_keys(load_ckpt(ckpt_path), a_finetuned.model.state_dict())
+                    if not a_aligned:
+                        raise ValueError(
+                            f"No tensors from tuned checkpoint aligned to source model keys for task '{task}': {ckpt_path}."
+                        )
+                    load_into_model(a_finetuned.model, a_aligned, strict=False)
+                    if source_task_heads is not None:
+                        _inject_task_head(
+                            model=a_finetuned.model,
+                            task=task,
+                            task_heads=source_task_heads,
+                            head_key_pattern=head_key_pattern,
+                            head_class_ids=head_class_ids,
+                        )
+                print(f"\n--- Source control: evaluating A's own finetuned checkpoint on '{task}' ---")
+                source_eval_rows.append(
+                    _evaluate_source_finetuned(
+                        llm_source_finetuned=a_finetuned,
+                        llm_source_pretrained=llm_source,
+                        source_loaders=source_loaders,
+                        task=task,
+                        device=device,
+                        eval_mode=eval_mode,
+                    )
+                )
+                if a_finetuned is not llm_source_finetuned:
+                    del a_finetuned
 
             if eval_mode == "head_logits" and target_task_heads is not None:
                 # steer_text reads w_b off the live head at prepare() time, so the
@@ -1262,6 +1404,7 @@ def main() -> None:
                 item["task"]: float(selected_baseline_alpha_by_task[i]) for i, item in enumerate(per_task)
             },
             "steer_diagnostics": {t: p.get("diagnostics", {}) for t, p in steer_prepared_by_task.items()},
+            "source_finetuned_control": source_eval_rows,
             "transported_artifacts": transported_artifacts,
             "transport_timings": transport_timings,
             "saved_merged_path": None,
