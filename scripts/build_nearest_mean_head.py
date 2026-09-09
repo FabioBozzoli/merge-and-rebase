@@ -107,6 +107,7 @@ def build_head(
     dtype: str | None,
     trust_remote_code: bool,
     use_fast_tokenizer: bool,
+    batch_size: int = 16,
 ) -> tuple[dict[str, torch.Tensor], dict[str, object], TextLM]:
     torch.manual_seed(seed)
 
@@ -132,7 +133,7 @@ def build_head(
     tokenized = build_nli_tokenized_loader(
         task_data=few_shot_data,
         tokenizer=llm.tokenizer,
-        batch_size=len(few_shot_data.examples),
+        batch_size=int(batch_size),
         num_workers=0,
         max_length=max_length,
         shuffle=False,
@@ -141,10 +142,23 @@ def build_head(
 
     dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
     llm.model.eval()
+    # Mini-batched on purpose: a single forward pass over the whole support
+    # set (previously batch_size=len(support), i.e. everything at once) OOMs
+    # once few_shot grows past a handful of shots -- 300/class on a 3-way
+    # task is a 900-example batch through t5-v1_1-large in one shot. Looping
+    # over torch's own DataLoader batches and concatenating on CPU also fixes
+    # a latent correctness bug: a single next(iter(loader)) call only reads
+    # the *first* batch, silently dropping the rest of the support set for
+    # any batch_size smaller than the whole support.
+    feature_chunks: list[torch.Tensor] = []
+    label_chunks: list[torch.Tensor] = []
     with torch.no_grad(), _head_as_identity(llm.model):
-        batch = next(iter(tokenized.loader))
-        features = _pooled_features(llm.model, batch, dev).double()
-    labels = batch["labels"].to(features.device)
+        for batch in tokenized.loader:
+            feats = _pooled_features(llm.model, batch, dev).cpu().double()
+            feature_chunks.append(feats)
+            label_chunks.append(batch["labels"].cpu())
+    features = torch.cat(feature_chunks, dim=0)
+    labels = torch.cat(label_chunks, dim=0)
 
     normed = torch.nn.functional.normalize(features, dim=-1)
     centroids = torch.zeros(num_labels, features.shape[-1], dtype=torch.float64)
@@ -210,6 +224,7 @@ def main() -> None:
     p.add_argument("--num-labels", type=int, default=3, help="Head width; must match the model_kind='sequence_classification' build used at eval time.")
     p.add_argument("--max-length", type=int, default=256)
     p.add_argument("--max-candidates", type=int, default=20000, help="Cap on train rows loaded before balanced sampling (0 = no cap).")
+    p.add_argument("--batch-size", type=int, default=16, help="Forward-pass batch size for feature extraction and the sanity-check eval; lower this if you hit CUDA OOM with a large --few-shot.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--dtype", type=str, default=None, choices=[None, "fp16", "bf16", "fp32"])
     p.add_argument("--trust-remote-code", action="store_true")
@@ -231,6 +246,7 @@ def main() -> None:
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         use_fast_tokenizer=not args.no_fast_tokenizer,
+        batch_size=args.batch_size,
     )
 
     out_path = Path(args.output)
