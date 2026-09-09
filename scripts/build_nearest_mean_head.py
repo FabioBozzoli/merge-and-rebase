@@ -101,6 +101,51 @@ def _neutralize_intermediate_head_layers(model: torch.nn.Module) -> dict[str, to
     return written
 
 
+def _diagnose_pooled_features(normed: torch.Tensor, labels: torch.Tensor, num_labels: int) -> None:
+    """
+    Print whether the pooled features carry *any* class signal at all, before
+    centroids are even computed.
+
+    Near-chance nearest-mean accuracy has two very different possible causes
+    that look identical from the final accuracy number alone: (a) the model's
+    representation genuinely doesn't separate these classes well under cosine
+    distance, or (b) the pooled feature itself is close to constant / carries
+    no usable signal regardless of input content (e.g. a pooling-position bug
+    upstream, in the HF model's own forward pass). This tells them apart:
+
+    - ``within_class_cosine`` vs. ``between_class_cosine``: if these are
+      close to equal, examples are roughly as similar to same-class examples
+      as to different-class ones -- there is no discriminative signal for
+      *any* linear/cosine method to find, pointing at (b), not at the
+      nearest-mean method being too weak.
+    - ``pairwise_std``: the spread of ALL pairwise cosine similarities. Near
+      zero means every example produces nearly the same feature regardless
+      of its text -- strong evidence of (b), e.g. the encoder/decoder input
+      not actually varying with content (padding/attention_mask/eos-position
+      handling), not evidence about whether nearest-mean is a good classifier.
+    """
+    sim = (normed @ normed.T).clamp(-1.0, 1.0)
+    n = sim.shape[0]
+    off_diag = ~torch.eye(n, dtype=torch.bool)
+    same_class = (labels.unsqueeze(0) == labels.unsqueeze(1)) & off_diag
+    diff_class = (labels.unsqueeze(0) != labels.unsqueeze(1)) & off_diag
+    within = sim[same_class].mean().item()
+    between = sim[diff_class].mean().item()
+    pairwise_std = sim[off_diag].std().item()
+    print(
+        f"Pooled-feature diagnostic: within_class_cosine={within:.4f} "
+        f"between_class_cosine={between:.4f} gap={within - between:+.4f} "
+        f"pairwise_cosine_std={pairwise_std:.4f}"
+    )
+    if abs(within - between) < 0.02 or pairwise_std < 0.02:
+        print(
+            "  WARNING: within-class and between-class similarity are nearly identical "
+            "and/or barely vary across example pairs. This means the pooled feature carries "
+            "little to no signal about the input text, regardless of classifier choice -- "
+            "look upstream (pooling/tokenization/attention_mask), not at the nearest-mean method."
+        )
+
+
 def _select_few_shot(task_data: NLITaskData, *, per_class: int, seed: int, max_candidates: int | None) -> NLITaskData:
     examples = task_data.examples
     if max_candidates is not None and len(examples) > max_candidates:
@@ -206,6 +251,7 @@ def build_head(
     labels = torch.cat(label_chunks, dim=0)
 
     normed = torch.nn.functional.normalize(features, dim=-1)
+    _diagnose_pooled_features(normed, labels, num_labels)
     centroids = torch.zeros(num_labels, features.shape[-1], dtype=torch.float64)
     for class_id in range(num_labels):
         rows = normed[labels == class_id]
