@@ -2,6 +2,7 @@
   "_comment": "Same transfer as text_rebase_t5base_t5large_theseus_nearestmean.json, but A's fine-tune is the real, already-trained community checkpoint varun-v-rao/t5-base-snli instead of retraining -- purely to check whether the rebase methods themselves work, given a source that we know actually learned the task. B's head is still the nearest-mean-cosine head from build_nearest_mean_head.py: that half of the earlier diagnosis (B pretrained never having a reason to separate NLI classes) is untouched by this change and stays an open question.",
   "_source_base_UNVERIFIED": "source_model_name_or_path is set to google-t5/t5-base (the original T5, NOT google/t5-v1_1-base) because varun-v-rao/t5-base-snli's model name implies it was fine-tuned from classic t5-base. THIS IS NOT VERIFIED against the model card from this environment (no internet access here). If wrong, task_delta = tuned - base mixes a real fine-tuning delta with a spurious cross-pretraining offset, and embedding-sized tensors may not even align by shape (t5 vocab_size=32128 vs t5-v1_1 vocab_size=32100) -- check the model card / config.json on the Hub before trusting these numbers.",
   "_hub_checkpoint_mechanism": "tuned_ckpts.snli is a bare HF Hub repo id (contains '/', not a local file, no weight-file extension), which eval/text_rebase.py's _load_tuned_source_state_dict now detects and loads as a full AutoModelForSequenceClassification via TextLM.build (not load_ckpt+align_to_base_keys, since there is no local delta file -- the Hub repo IS the finetuned model).",
+  "_source_input_template": "varun-v-rao/t5-base-snli was fine-tuned on a single formatted string, not this repo's default tokenizer(premise, hypothesis) pair encoding -- confirmed with scripts/probe_nli_input_format.py (pair encoding: 0.35 accuracy / chance; this template: 0.91, matching the model card's claimed 0.8982). source_input_template is A-only: B (t5-v1_1-large) still uses the default pair encoding via target_input_template being unset.",
 
   "suite": "nli6",
   "tasks": "snli",
@@ -19,6 +20,7 @@
   "eval_source_finetuned": true,
   "target_task_heads": "REPLACE_WITH_NEAREST_MEAN_HEAD_PATH",
   "head_key_pattern": "classification_head",
+  "source_input_template": "premise: {premise} hypothesis: {hypothesis}",
 
   "split": "test",
   "val_fraction": 0.1,

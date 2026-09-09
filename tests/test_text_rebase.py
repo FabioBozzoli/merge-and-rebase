@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from merge_and_rebase.data.text_loaders import NLIExample, NLITaskData
+from merge_and_rebase.data.text_loaders import NLIExample, NLITaskData, build_nli_tokenized_loader
 from merge_and_rebase.eval import text_rebase
 from merge_and_rebase.rebase.methods import theseus as theseus_mod
 from merge_and_rebase.rebase.registry import get_method, list_methods
@@ -138,6 +138,56 @@ def test_unsupported_methods_are_named_with_a_reason() -> None:
     for name in ("transfusion", "steer", "bico_gradin"):
         assert name in text_rebase._UNSUPPORTED_METHODS
         assert len(text_rebase._UNSUPPORTED_METHODS[name]) > 40
+
+
+class _RecordingTokenizer:
+    """Fake tokenizer recording the exact positional args it was called with."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        n = len(args[0])
+        return {"input_ids": [[0]] * n, "attention_mask": [[1]] * n}
+
+    def pad(self, features, return_tensors=None):  # pragma: no cover - not exercised here
+        raise NotImplementedError
+
+
+def _tiny_snli_task_data() -> NLITaskData:
+    return NLITaskData(
+        task="snli",
+        examples=[NLIExample(premise="a cat sits", hypothesis="an animal rests", label=0)],
+        labels=["entailment", "neutral", "contradiction"],
+        label_texts=["entailment", "neutral", "contradiction"],
+        meta={},
+    )
+
+
+def test_build_nli_tokenized_loader_defaults_to_pair_encoding() -> None:
+    tokenizer = _RecordingTokenizer()
+    build_nli_tokenized_loader(task_data=_tiny_snli_task_data(), tokenizer=tokenizer, max_length=32)
+    assert len(tokenizer.calls) == 1
+    (premises, hypotheses) = tokenizer.calls[0]
+    assert premises == ["a cat sits"]
+    assert hypotheses == ["an animal rests"]
+
+
+def test_build_nli_tokenized_loader_applies_a_single_string_template() -> None:
+    # A checkpoint fine-tuned on "premise: X hypothesis: Y" as one string
+    # performs at chance under the default pair encoding (see
+    # scripts/probe_nli_input_format.py) -- this is the fix.
+    tokenizer = _RecordingTokenizer()
+    build_nli_tokenized_loader(
+        task_data=_tiny_snli_task_data(),
+        tokenizer=tokenizer,
+        max_length=32,
+        premise_hypothesis_template="premise: {premise} hypothesis: {hypothesis}",
+    )
+    assert len(tokenizer.calls) == 1
+    (texts,) = tokenizer.calls[0]
+    assert texts == ["premise: a cat sits hypothesis: an animal rests"]
 
 
 def test_is_hub_model_reference_distinguishes_hub_ids_from_local_paths(tmp_path) -> None:

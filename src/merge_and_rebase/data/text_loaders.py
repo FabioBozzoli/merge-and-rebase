@@ -322,6 +322,7 @@ def build_nli_tokenized_loader(
     max_length: int = 512,
     shuffle: bool = False,
     head_class_ids: list[int] | None = None,
+    premise_hypothesis_template: str | None = None,
 ) -> NLITokenizedData:
     if int(batch_size) <= 0:
         raise ValueError("batch_size must be > 0.")
@@ -344,13 +345,31 @@ def build_nli_tokenized_loader(
     local_labels = [int(ex.label) for ex in task_data.examples]
     labels = [int(mapped_class_ids[y]) for y in local_labels]
 
-    enc = tokenizer(
-        premises,
-        hypotheses,
-        truncation=True,
-        max_length=int(max_length),
-        padding=False,
-    )
+    if premise_hypothesis_template is None:
+        enc = tokenizer(
+            premises,
+            hypotheses,
+            truncation=True,
+            max_length=int(max_length),
+            padding=False,
+        )
+    else:
+        # Some checkpoints were fine-tuned on a single formatted string
+        # (e.g. "premise: {premise} hypothesis: {hypothesis}") rather than
+        # the tokenizer's own two-segment pair encoding above -- the two are
+        # different token sequences, and a model trained on one performs at
+        # chance on the other (see scripts/probe_nli_input_format.py, which
+        # is how a mismatch here gets diagnosed in the first place).
+        texts = [
+            premise_hypothesis_template.format(premise=p, hypothesis=h)
+            for p, h in zip(premises, hypotheses, strict=True)
+        ]
+        enc = tokenizer(
+            texts,
+            truncation=True,
+            max_length=int(max_length),
+            padding=False,
+        )
     features: list[dict[str, Any]] = []
     n = len(labels)
     for i in range(n):
@@ -388,6 +407,7 @@ def build_nli_tokenized_loader(
             "shuffle": bool(shuffle),
             "mask_class": list(mask_class),
             "head_class_ids": list(mapped_class_ids),
+            "premise_hypothesis_template": premise_hypothesis_template,
         }
     )
     return NLITokenizedData(task=task_data.task, loader=loader, mask_class=mask_class, meta=meta)

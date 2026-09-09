@@ -190,6 +190,7 @@ def _tokenize_splits(
     num_workers: int,
     max_length: int,
     head_class_ids: list[int],
+    premise_hypothesis_template: str | None = None,
 ) -> TextLoaders:
     tokenized = {
         name: build_nli_tokenized_loader(
@@ -200,6 +201,7 @@ def _tokenize_splits(
             max_length=max_length,
             shuffle=False,
             head_class_ids=head_class_ids,
+            premise_hypothesis_template=premise_hypothesis_template,
         )
         for name, task_data in splits.items()
     }
@@ -560,6 +562,19 @@ def main() -> None:
             help="Also score A's own fine-tuned checkpoint (with its own trained head) on each task, "
             "as a control for whether the architecture/tokenization/pooling support the task at all.",
         )
+        p.add_argument(
+            "--source-input-template",
+            type=str,
+            default=None,
+            help="A's fine-tune expects premise/hypothesis as one formatted string, e.g. "
+            "'premise: {premise} hypothesis: {hypothesis}', instead of the tokenizer's own pair encoding.",
+        )
+        p.add_argument(
+            "--target-input-template",
+            type=str,
+            default=None,
+            help="Same as --source-input-template, for B.",
+        )
         add_logging_args(p)
 
         args = p.parse_args()
@@ -611,6 +626,8 @@ def main() -> None:
             "alpha": args.alpha,
             "save_transported_tvs_dir": args.save_transported_tvs_dir,
             "eval_source_finetuned": args.eval_source_finetuned,
+            "source_input_template": args.source_input_template,
+            "target_input_template": args.target_input_template,
         }
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
@@ -636,6 +653,14 @@ def main() -> None:
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
         eval_source_finetuned = bool(cfg.get("eval_source_finetuned", False))
+        # Some checkpoints (e.g. a community Hub upload) were fine-tuned on a
+        # single formatted string ("premise: {premise} hypothesis: {hypothesis}")
+        # rather than the tokenizer's own two-segment pair encoding -- the two
+        # are different token sequences, and a model trained on one performs at
+        # chance on the other. See scripts/probe_nli_input_format.py to find the
+        # right template for a given checkpoint before setting this.
+        source_input_template = cfg.get("source_input_template", None)
+        target_input_template = cfg.get("target_input_template", None)
 
         grad_batch_size = int(cfg["grad_batch_size"]) if cfg.get("grad_batch_size") is not None else None
         grad_examples_per_class = (
@@ -813,6 +838,7 @@ def main() -> None:
                 num_workers=num_workers,
                 max_length=max_length,
                 head_class_ids=head_class_ids,
+                premise_hypothesis_template=target_input_template,
             )
             source_loaders: TextLoaders | None = None
             if shim_mode or steer_mode or eval_source_finetuned:
@@ -823,6 +849,7 @@ def main() -> None:
                     num_workers=num_workers,
                     max_length=max_length,
                     head_class_ids=head_class_ids,
+                    premise_hypothesis_template=source_input_template,
                 )
 
             prompt_template = (

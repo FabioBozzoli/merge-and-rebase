@@ -134,6 +134,14 @@ key-coverage report at the start of each task so the actual overlap is visible e
   that Hub checkpoint was fine-tuned from (matching tokenizer/vocab size and architecture), or
   the computed task delta mixes the real fine-tuning delta with a spurious cross-pretraining
   offset — this cannot be verified from the config alone, check the Hub model card.
+- **`source_input_template` / `target_input_template`** cover a checkpoint fine-tuned on a
+  single formatted string (e.g. `"premise: {premise} hypothesis: {hypothesis}"`) rather than
+  this repo's default `tokenizer(premise, hypothesis)` two-segment pair encoding — the two
+  produce different token sequences, and a model trained on one performs at chance on the
+  other. `scripts/probe_nli_input_format.py` finds the right template empirically for a given
+  checkpoint (scores a fixed sample under several candidates, including this repo's default);
+  whichever clears chance by a wide margin is very likely the one it was trained on. Each
+  field applies only to that model's own tokenization — a template for A does not affect B.
 
 ## Head-free baseline: nearest-class-mean (cosine) head
 
