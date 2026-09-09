@@ -10,14 +10,15 @@ a job on a rebase experiment whose every number is read through that checkpoint.
 
 Usage:
     python -m scripts.inspect_text_checkpoint <ckpt.pt> [<ckpt.pt> ...]
+    python -m scripts.inspect_text_checkpoint <run_summary.json>   # every task at once
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-
-import torch
+from typing import Any
 
 _META_KEYS = (
     "task",
@@ -32,7 +33,9 @@ _META_KEYS = (
 )
 
 
-def _state_dict_of(payload: dict) -> dict[str, torch.Tensor] | None:
+def _state_dict_of(payload: dict) -> dict | None:
+    import torch
+
     for key in ("state_dict", "head", "model", "model_state_dict"):
         value = payload.get(key)
         if isinstance(value, dict) and value and all(torch.is_tensor(v) for v in value.values()):
@@ -41,6 +44,10 @@ def _state_dict_of(payload: dict) -> dict[str, torch.Tensor] | None:
 
 
 def inspect(path: Path) -> None:
+    # Imported here, not at module scope: the run-summary mode below is pure
+    # JSON and stays usable on a machine with no torch installed.
+    import torch
+
     print(f"\n=== {path} ===")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
@@ -79,12 +86,72 @@ def inspect(path: Path) -> None:
         )
 
 
+def _walk_task_entries(node: Any, found: dict[str, dict]) -> None:
+    """Collect every ``{... "metrics": {"test_top1": ...} ...}`` entry in a run summary."""
+    if isinstance(node, dict):
+        metrics = node.get("metrics")
+        if isinstance(metrics, dict) and ("test_top1" in metrics or "val_top1" in metrics):
+            task = str(node.get("task") or node.get("meta", {}).get("task") or f"entry{len(found)}")
+            found.setdefault(task, node)
+        for value in node.values():
+            _walk_task_entries(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _walk_task_entries(value, found)
+
+
+def summarize(path: Path) -> None:
+    """Print every task's recorded accuracy from a ``finetune.train_text`` run summary."""
+    entries: dict[str, dict] = {}
+    _walk_task_entries(json.loads(path.read_text(encoding="utf-8")), entries)
+    if not entries:
+        print(f"{path}: no task entries with recorded metrics found.")
+        return
+
+    print(f"\n=== {path} ===")
+    header = f"  {'task':<10} {'val_top1':>9} {'test_top1':>10} {'classes':>8} {'chance':>7} {'vs chance':>10}  verdict"
+    print(header)
+    print(f"  {'-' * (len(header) - 2)}")
+    for task, node in entries.items():
+        metrics = node.get("metrics", {})
+        val, test = metrics.get("val_top1"), metrics.get("test_top1")
+        labels = node.get("labels") or node.get("meta", {}).get("labels") or []
+        n_classes = len(labels) if labels else 0
+        chance = 1.0 / n_classes if n_classes else float("nan")
+        margin = (float(test) - chance) if (test is not None and n_classes) else float("nan")
+        if margin != margin:
+            verdict = "no class count"
+        elif margin < 0.05:
+            verdict = "AT CHANCE - did not learn"
+        elif margin < 0.15:
+            verdict = "barely above chance"
+        else:
+            verdict = "learned something"
+        print(
+            f"  {task:<10} {_fmt(val):>9} {_fmt(test):>10} {n_classes:>8} "
+            f"{chance:>7.3f} {margin:>+10.3f}  {verdict}"
+        )
+    print(
+        "\n  Caution: 'chance' here is uniform (1/classes). On an imbalanced task the majority-class\n"
+        "  baseline is higher, so a model that collapsed to always predicting the majority label can\n"
+        "  clear uniform chance while still having learned nothing. Compare against the majority\n"
+        "  frequency of the task before calling a run successful."
+    )
+
+
+def _fmt(value: Any) -> str:
+    return f"{float(value):.4f}" if isinstance(value, (int, float)) else "-"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("checkpoints", nargs="+", type=Path)
+    p.add_argument("checkpoints", nargs="+", type=Path, help="Checkpoint .pt files, or a run-summary .json to tabulate every task.")
     args = p.parse_args()
     for path in args.checkpoints:
-        inspect(path)
+        if path.suffix.lower() == ".json":
+            summarize(path)
+        else:
+            inspect(path)
 
 
 if __name__ == "__main__":
