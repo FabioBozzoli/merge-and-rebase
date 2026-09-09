@@ -290,6 +290,32 @@ def _pooled_feature_report(
     return stats
 
 
+def _checkpoint_training_metadata(ckpt_path: str) -> dict[str, Any]:
+    """What the fine-tuning run itself recorded inside the checkpoint.
+
+    ``finetune/train_text.py`` stores the accuracy it measured
+    (``metrics.val_top1`` / ``metrics.test_top1``) plus the label space it
+    trained against. ``io.ckpt.load_ckpt`` unwraps straight to the tensors and
+    drops all of it, so read the raw payload here.
+
+    This is the cheapest possible way to tell "the checkpoint never learned the
+    task" apart from "the checkpoint is fine and our evaluation path disagrees
+    with the one training used" -- the two produce identical downstream
+    symptoms but need opposite fixes.
+    """
+    try:
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as exc:  # pragma: no cover - diagnostic path only
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(payload, dict):
+        return {"error": f"checkpoint is a {type(payload).__name__}, not a payload dict"}
+    return {
+        key: payload[key]
+        for key in ("metrics", "best_epoch", "last_epoch", "strategy", "forward_mode", "num_labels", "labels", "head_class_ids", "format")
+        if key in payload
+    }
+
+
 def _evaluate_source_finetuned(
     *,
     llm_source_finetuned: TextLM,
@@ -298,6 +324,7 @@ def _evaluate_source_finetuned(
     task: str,
     device: str,
     eval_mode: str,
+    ckpt_path: str | None = None,
     split: str = "test",
 ) -> dict[str, Any]:
     """Score A's own fine-tuned checkpoint, plus feature diagnostics for A and A-pretrained.
@@ -310,6 +337,21 @@ def _evaluate_source_finetuned(
     once something has actually been trained through them.
     """
     out: dict[str, Any] = {"task": task, "split": split}
+    recorded: dict[str, Any] = {}
+    if ckpt_path is not None:
+        recorded = _checkpoint_training_metadata(ckpt_path)
+        out["checkpoint_recorded"] = recorded
+        if "error" in recorded:
+            print(f"  [A checkpoint] could not read training metadata: {recorded['error']}")
+        else:
+            metrics = recorded.get("metrics", {}) or {}
+            print(
+                f"  [A checkpoint] as recorded by training: val_top1={metrics.get('val_top1')} "
+                f"test_top1={metrics.get('test_top1')} strategy={recorded.get('strategy')} "
+                f"labels={recorded.get('labels')} head_class_ids={recorded.get('head_class_ids')}"
+            )
+
+    acc: float | None = None
     if eval_mode == "head_logits":
         acc = float(
             llm_source_finetuned.sequence_classification_accuracy(
@@ -329,7 +371,29 @@ def _evaluate_source_finetuned(
     )
     a_ft_gap = out["source_finetuned_features"]["gap"]
     a_pre_gap = out["source_pretrained_features"]["gap"]
-    if a_ft_gap > 0.05 and abs(a_pre_gap) < 0.02:
+    recorded_acc = (recorded.get("metrics") or {}).get("test_top1") if recorded else None
+    chance = 1.0 / max(1, len(source_loaders.mask_class))
+
+    if acc is not None and acc < chance + 0.05:
+        # A cannot classify its own task. Nothing downstream (a head built on
+        # B, a transported delta derived from A) can be judged until this is
+        # resolved, because every one of those numbers is measured through it.
+        if recorded_acc is not None and float(recorded_acc) > chance + 0.15:
+            print(
+                f"  => MISMATCH: training recorded test_top1={float(recorded_acc):.4f} for this checkpoint, but\n"
+                f"     evaluating it here gives {acc:.4f} (chance is {chance:.2f}). The weights learned the task;\n"
+                "     this evaluation path disagrees with the one training used. Compare tokenization\n"
+                "     (max_length, text-pair encoding), head_class_ids and the label order above against the\n"
+                "     finetune config -- the rebase results mean nothing until these agree."
+            )
+        else:
+            print(
+                f"  => A is at chance ({acc:.4f}, chance is {chance:.2f}) on its own fine-tuning task, and the\n"
+                "     checkpoint's own recorded metrics do not contradict that. The checkpoint never learned\n"
+                "     the task, so the delta being transported carries no task signal and every downstream\n"
+                "     number here is measuring noise. Fix or retrain A before interpreting any rebase result."
+            )
+    elif a_ft_gap > 0.05 and abs(a_pre_gap) < 0.02:
         print(
             "  => A's pooled features separate the classes only AFTER fine-tuning. The pooling position and\n"
             "     tokenization are therefore fine: the class structure is something training creates, not\n"
@@ -339,10 +403,9 @@ def _evaluate_source_finetuned(
         )
     elif a_ft_gap < 0.02:
         print(
-            "  => A's features do NOT separate the classes even after fine-tuning, while A still classifies\n"
-            "     well. That combination means the tensor being read as 'the pooled feature' is not the one\n"
-            "     the classifier actually uses -- a pooling-position bug upstream, worth fixing before any\n"
-            "     conclusion about the rebase methods."
+            "  => A classifies well but its pooled features show no class separation. The tensor being read\n"
+            "     as 'the pooled feature' is then not the one the classifier actually uses -- a pooling-position\n"
+            "     bug upstream, worth fixing before any conclusion about the rebase methods."
         )
     return out
 
@@ -819,6 +882,7 @@ def main() -> None:
                         task=task,
                         device=device,
                         eval_mode=eval_mode,
+                        ckpt_path=ckpt_path,
                     )
                 )
                 if a_finetuned is not llm_source_finetuned:
