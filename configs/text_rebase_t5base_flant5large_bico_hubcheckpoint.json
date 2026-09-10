@@ -1,0 +1,52 @@
+{
+  "_comment": "Same test as text_rebase_t5base_t5large_theseus_hubcheckpoint.json / text_rebase_t5base_t5large_steer_hubcheckpoint.json, but method=bico and B=google/flan-t5-large instead of the raw t5-v1_1-large -- flan-t5-large is what made steer_text's Stage 2 work (its instruction-tuned pretraining gives its own pooled features actual class structure, unlike raw t5-v1_1-large). bico shares theseus's TextEncoderShim/activation-hook machinery (rebase/text/adapters.py) and the same name-exact block matching, so it inherits the same depth-mismatch caveat theseus has: only the first 12 of B's 24 blocks receive any transported signal, the rest stay at B's pretrained/instruction-tuned weights untouched. Unlike theseus, bico drives its forward through an injected gradient recipe (seq_classification_recipe), pairing input activations with output gradients rather than pure input/output covariance.",
+  "_source_base_UNVERIFIED": "source_model_name_or_path is google-t5/t5-base (original T5, not t5-v1_1-base) because varun-v-rao/t5-base-snli's model name implies that base -- confirmed by its own model card's training/eval description elsewhere in this conversation, but re-check if you swap the checkpoint.",
+  "_source_input_template": "varun-v-rao/t5-base-snli expects a single formatted string, not this repo's default tokenizer(premise, hypothesis) pair encoding -- confirmed with scripts/probe_nli_input_format.py (pair encoding: ~0.35 accuracy / chance; this template: ~0.91, matching the model card's claimed 0.8982). A-only: B still uses the default pair encoding.",
+  "_target_head_note": "target_task_heads must point to a nearest-mean-cosine head built FOR flan-t5-large specifically (scripts/build_nearest_mean_head.py --model-name-or-path google/flan-t5-large ...) -- the head built earlier for t5-v1_1-large will NOT work here (wrong backbone, wrong feature space).",
+
+  "suite": "nli6",
+  "tasks": "snli",
+
+  "source_model_name_or_path": "google-t5/t5-base",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/flan-t5-large",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "eval_source_finetuned": true,
+  "target_task_heads": "REPLACE_WITH_NEAREST_MEAN_HEAD_PATH",
+  "head_key_pattern": "classification_head",
+  "source_input_template": "premise: {premise} hypothesis: {hypothesis}",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 33,
+
+  "method": "bico",
+  "method_params": {
+    "seq_align": "interpolate",
+    "shots_per_class": 300,
+    "center_acts": false,
+    "whiten_power": 0.0,
+    "patch_qkv": false
+  },
+
+  "alpha_search": false,
+  "alpha": 1.0,
+  "alpha_selection": "shared",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "varun-v-rao/t5-base-snli"
+  }
+}
