@@ -398,6 +398,20 @@ def train_linear_probe_head(
     # ~10 log lines whatever the epoch count, unless the caller says otherwise.
     every = int(log_every) if log_every else max(1, total_epochs // 10)
 
+    def _eval_line(header: str) -> str:
+        parts = [header]
+        for split_name, split_loader in (eval_loaders or {}).items():
+            acc = _probe_accuracy(model, split_loader, device=device, mask=mask, remap=remap)
+            parts.append(f"{split_name}={acc:.4f}")
+        return "  ".join(parts)
+
+    # Epoch 0 = the head exactly as the caller handed it over, before any update.
+    # For steer_text this is the readout its correction was fit against, so this
+    # line is what the probe has to improve on -- if it already sits at chance,
+    # the correction is not reaching the head and nothing below will help.
+    if eval_loaders:
+        print(_eval_line(f"{log_prefix} epoch 0/{total_epochs}  (no update yet)"))
+
     model.train()
     optimizer = torch.optim.Adam(head_params, lr=float(lr))
     try:
@@ -412,11 +426,8 @@ def train_linear_probe_head(
                 epoch_loss += float(loss.detach())
 
             if epoch == 1 or epoch == total_epochs or epoch % every == 0:
-                parts = [f"{log_prefix} epoch {epoch}/{total_epochs}  loss={epoch_loss / len(batches):.4f}"]
-                for split_name, split_loader in (eval_loaders or {}).items():
-                    acc = _probe_accuracy(model, split_loader, device=device, mask=mask, remap=remap)
-                    parts.append(f"{split_name}={acc:.4f}")
-                print("  ".join(parts))
+                header = f"{log_prefix} epoch {epoch}/{total_epochs}  loss={epoch_loss / len(batches):.4f}"
+                print(_eval_line(header) if eval_loaders else header)
     finally:
         model.eval()
         for n, p in model.named_parameters():
