@@ -640,6 +640,28 @@ def text_rebase_head(model):
     return head_linear(model)
 
 
+def test_neutralize_intermediate_head_layers_makes_t5s_dense_an_identity() -> None:
+    from merge_and_rebase.rebase.text import neutralize_intermediate_head_layers
+
+    model = _tiny_t5(seed=0)
+    dense = model.classification_head.dense
+    assert not torch.equal(dense.weight, torch.eye(dense.weight.shape[0]))
+
+    written = neutralize_intermediate_head_layers(model)
+
+    assert torch.equal(dense.weight, torch.eye(dense.weight.shape[0]))
+    assert torch.equal(dense.bias, torch.zeros_like(dense.bias))
+    # The written tensors are what a task-head payload must carry to restore
+    # this same space at injection time.
+    assert set(written) == {"classification_head.dense.weight", "classification_head.dense.bias"}
+
+
+def test_neutralize_intermediate_head_layers_is_a_noop_without_one() -> None:
+    from merge_and_rebase.rebase.text import neutralize_intermediate_head_layers
+
+    assert neutralize_intermediate_head_layers(_tiny_qwen(seed=0)) == {}
+
+
 def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
     from merge_and_rebase.rebase.text import train_linear_probe_head
 

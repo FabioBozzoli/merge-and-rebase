@@ -230,6 +230,44 @@ def head_intermediate_linears(model: nn.Module) -> list[tuple[str, nn.Linear]]:
     return linears[:-1]
 
 
+def neutralize_intermediate_head_layers(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Overwrite every intermediate head ``nn.Linear`` with an identity transform,
+    in place, and return the tensors written.
+
+    T5's ``T5ClassificationHead`` inserts a ``dense`` Linear + ``tanh`` between
+    the decoder's pretrained eos-pooled hidden state and ``out_proj``. ``dense``
+    is never present in a base checkpoint (``AutoModelForSequenceClassification``
+    always initializes it randomly, *per process*), so anything computed from
+    its output lives in a random rotation of the pretrained representation that
+    differs from run to run. That breaks two things at once: features cached to
+    disk by ``steer_text`` (whose cache key does not include the head state)
+    stop matching the live model, and a linear probe ends up fitting
+    ``tanh(random_rotation(feature))`` instead of the feature. Setting it to the
+    identity makes the space deterministic and equal to ``tanh(pretrained_hidden)``.
+
+    Do this *before* extracting or caching any feature, and write the returned
+    tensors into the task-head payload too, so per-evaluation head injection
+    keeps the same space. A no-op for architectures with no such layer (e.g. a
+    bare decoder-only ``score`` Linear), where
+    :func:`head_intermediate_linears` returns ``[]``.
+    """
+    written: dict[str, torch.Tensor] = {}
+    for name, module in head_intermediate_linears(model):
+        if module.weight.shape[0] != module.weight.shape[1]:
+            raise ValueError(
+                f"Cannot neutralize non-square intermediate head layer '{name}' "
+                f"(shape {tuple(module.weight.shape)}) to an identity transform."
+            )
+        eye = torch.eye(module.weight.shape[0], dtype=module.weight.dtype, device=module.weight.device)
+        with torch.no_grad():
+            module.weight.copy_(eye)
+            written[f"{name}.weight"] = eye.detach().cpu()
+            if module.bias is not None:
+                module.bias.zero_()
+                written[f"{name}.bias"] = module.bias.detach().cpu().clone()
+    return written
+
+
 def train_linear_probe_head(
     model: nn.Module,
     loader: DataLoader,

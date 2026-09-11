@@ -76,6 +76,7 @@ from ..rebase.text import (  # noqa: F401  -- import registers "steer_text"
     count_transformer_blocks,
     describe_key_coverage,
     feature_separability,
+    neutralize_intermediate_head_layers,
     steer_text_correction_context,
     subset_loader,
     text_param_filter,
@@ -810,6 +811,23 @@ def main() -> None:
                 "extra blocks keep their pretrained weights."
             )
 
+        # Must happen BEFORE target_base_sd is snapshotted, so every later reload
+        # keeps the identity. Without it B's head keeps a per-process random
+        # `dense` (T5's d_model x d_model layer, absent from every base
+        # checkpoint): steer_text's feature cache is keyed by
+        # source/target/task/regime/split only, so cached features from an
+        # earlier process silently belong to a *different* random rotation than
+        # the live model's, and the probe fits tanh(random_rotation(feature))
+        # rather than the feature. The nearest-mean path avoids this by baking
+        # identity into its head file (scripts/build_nearest_mean_head.py); with
+        # no head file to inject, this is where it has to happen.
+        neutralized_head_layers: dict[str, torch.Tensor] = {}
+        if linear_probe_head:
+            neutralized_head_layers = neutralize_intermediate_head_layers(llm_target.model)
+            if neutralized_head_layers:
+                names = sorted({k.rsplit(".", 1)[0] for k in neutralized_head_layers})
+                print(f"Neutralized {len(names)} intermediate head layer(s) to identity for linear probing: {names}")
+
         source_base_sd = to_cpu_fp32({k: v for k, v in llm_source.model.state_dict().items()})
         target_base_sd = to_cpu_fp32({k: v for k, v in llm_target.model.state_dict().items()})
 
@@ -1210,7 +1228,11 @@ def main() -> None:
                         probe_loader, device=device, mask_class=loaders.mask_class
                     )
                     print(f"  {task}: linear probe support-set accuracy after training = {probe_train_acc:.4f}")
-                target_task_heads[task] = trained_head_sd
+                # Ship the identity intermediate layers alongside the trained
+                # final linear, exactly as build_nearest_mean_head.py does, so
+                # the per-evaluation head injection restores the same feature
+                # space the probe (and steer's correction) were fit in.
+                target_task_heads[task] = {**trained_head_sd, **neutralized_head_layers}
 
             save_transport_dir = cfg.get("save_transported_tvs_dir", None)
             if save_transport_dir and not steer_mode:

@@ -62,48 +62,10 @@ from merge_and_rebase.models.text_lm import TextBuildConfig, TextLM
 from merge_and_rebase.rebase.text import (
     balanced_indices,
     feature_separability,
-    head_intermediate_linears,
     head_linear,
+    neutralize_intermediate_head_layers,
 )
 from merge_and_rebase.rebase.text.steer_text import _head_as_identity, _pooled_features
-
-
-def _neutralize_intermediate_head_layers(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """
-    Overwrite every ``nn.Linear`` between the model's pretrained representation
-    and the final classification ``nn.Linear`` (see
-    :func:`~merge_and_rebase.rebase.text.head_intermediate_linears`) with an
-    identity transform, in place, and return the tensors written.
-
-    Necessary for a nearest-mean head: T5's ``T5ClassificationHead`` inserts a
-    ``dense`` Linear + ``tanh`` between the decoder's pretrained eos-pooled
-    hidden state and ``out_proj``. ``dense`` is never present in a base
-    checkpoint (``AutoModelForSequenceClassification`` always initializes it
-    randomly), so centroids built from its output are class means of a
-    pretrained representation passed through an untrained random rotation --
-    not of the representation itself. Setting it to the identity (square
-    layers only; T5's is d_model -> d_model) makes the feature space
-    ``pooled_feature(x)`` actually captures equal to ``tanh(pretrained_hidden)``,
-    and doing it *before* feature extraction (not just at save time) keeps
-    centroid construction and later injection in the same space. A no-op for
-    architectures with no such layer (e.g. a bare decoder-only ``score``
-    Linear): :func:`head_intermediate_linears` returns ``[]`` for those.
-    """
-    written: dict[str, torch.Tensor] = {}
-    for name, module in head_intermediate_linears(model):
-        if module.weight.shape[0] != module.weight.shape[1]:
-            raise ValueError(
-                f"Cannot neutralize non-square intermediate head layer '{name}' "
-                f"(shape {tuple(module.weight.shape)}) to an identity transform."
-            )
-        eye = torch.eye(module.weight.shape[0], dtype=module.weight.dtype, device=module.weight.device)
-        with torch.no_grad():
-            module.weight.copy_(eye)
-            written[f"{name}.weight"] = eye.detach().cpu()
-            if module.bias is not None:
-                module.bias.zero_()
-                written[f"{name}.bias"] = module.bias.detach().cpu().clone()
-    return written
 
 
 def _diagnose_pooled_features(normed: torch.Tensor, labels: torch.Tensor) -> None:
@@ -205,7 +167,7 @@ def build_head(
     )
     llm = TextLM.build(build_cfg)
 
-    neutralized = _neutralize_intermediate_head_layers(llm.model)
+    neutralized = neutralize_intermediate_head_layers(llm.model)
     if neutralized:
         print(
             f"Neutralized {len(neutralized) // 2} untrained intermediate head layer(s) to identity "
