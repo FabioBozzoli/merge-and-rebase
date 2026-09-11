@@ -673,7 +673,13 @@ def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
     original_out_proj = {n: p.clone() for n, p in model.named_parameters() if "classification_head.out_proj" in n}
 
     trained = train_linear_probe_head(
-        model, loaders.train, device="cpu", mask_class=loaders.mask_class, lr=0.05, steps=50
+        model,
+        loaders.train,
+        device="cpu",
+        mask_class=loaders.mask_class,
+        lr=0.05,
+        steps=50,
+        eval_loaders={"support": loaders.train},
     )
 
     # Backbone must stay untouched -- only the head's final linear is ever trained.

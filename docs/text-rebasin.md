@@ -192,8 +192,15 @@ used — `method_params.shots_per_class` for `theseus`/`bico`, `method_params.fe
 `steer_text`. Supported for `theseus`, `bico`, and `steer_text` only, and requires
 `eval_mode: "head_logits"` set explicitly (`"auto"` resolves to `"prompt"` when no
 `target_task_heads` path is given). `linear_probe_epochs` (default `200`, an epoch here is
-one full pass over the tiny few-shot support set, since training is full-batch) and
-`linear_probe_lr` (default `1e-2`) control the probe's Adam training loop.
+one full pass over the tiny few-shot support set) and `linear_probe_lr` (default
+`1e-2`) control the probe's Adam training loop. While it trains, each logged epoch
+prints the mean training loss plus accuracy on `support` (the probe's own training
+examples), `val` and `test` — all three scored under the same condition the probe is
+fit in, which for `steer_text` means with the correction hook active, so they are not
+the same numbers as the final baseline/rebased table. `support` is the one to watch
+first: if it does not rise, the probe simply is not training (epochs/lr), regardless of
+what the transport did. `linear_probe_log_every` sets the epoch interval (default:
+~10 lines over the run; smaller values cost extra eval passes over `test`).
 
 Mechanically: for `theseus`/`bico`, the backbone is loaded as `target_base + alpha *
 transported_delta` (the same state the eval loop would score); for `steer_text` (which

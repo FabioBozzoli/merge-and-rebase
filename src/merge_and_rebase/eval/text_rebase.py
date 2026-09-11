@@ -737,6 +737,10 @@ def main() -> None:
             raise ValueError("linear_probe_head is only supported for method in {theseus, bico, steer_text}.")
         linear_probe_epochs = int(cfg.get("linear_probe_epochs", 200))
         linear_probe_lr = float(cfg.get("linear_probe_lr", 1e-2))
+        # None -> ~10 log lines over the run. Each line scores support/val/test,
+        # so a small value here buys more curve at the cost of extra eval passes.
+        linear_probe_log_every = cfg.get("linear_probe_log_every", None)
+        linear_probe_log_every = int(linear_probe_log_every) if linear_probe_log_every is not None else None
 
         if eval_mode == "head_logits":
             if model_kind != "sequence_classification":
@@ -1192,6 +1196,13 @@ def main() -> None:
                 probe_loader = subset_loader(loaders.train, probe_indices, batch_size=batch_size)
                 print(f"  {task}: linear-probing the target head from scratch on {len(probe_indices)} support examples")
 
+                # "support" is the probe's own training set: if that one doesn't
+                # rise, the probe simply isn't training (epochs/lr), independently
+                # of anything the transport/correction did upstream. val/test are
+                # scored under the same condition the probe was fit in (for
+                # steer_text, that means with the correction hook active), so they
+                # are not the same numbers as the final baseline/rebased table.
+                probe_eval_loaders = {"support": probe_loader, "val": loaders.val, "test": loaders.test}
                 probe_alpha = float(cfg.get("alpha", 1.0))
                 if steer_mode:
                     load_into_model(llm_target.model, target_base_sd, strict=strict_load)
@@ -1203,15 +1214,10 @@ def main() -> None:
                             mask_class=loaders.mask_class,
                             lr=linear_probe_lr,
                             steps=linear_probe_epochs,
+                            eval_loaders=probe_eval_loaders,
+                            log_every=linear_probe_log_every,
+                            log_prefix=f"  [probe:{task}]",
                         )
-                        # Sanity check, not a generalization estimate: if the probe
-                        # can't even fit the examples it was trained on, the problem
-                        # is the probe's own training (epochs/lr/collapse), not the
-                        # transport/correction mechanism upstream of it.
-                        probe_train_acc = llm_target.sequence_classification_accuracy(
-                            probe_loader, device=device, mask_class=loaders.mask_class
-                        )
-                        print(f"  {task}: linear probe support-set accuracy after training = {probe_train_acc:.4f}")
                 else:
                     probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
                     load_into_model(llm_target.model, probe_backbone_sd, strict=strict_load)
@@ -1223,11 +1229,10 @@ def main() -> None:
                         mask_class=loaders.mask_class,
                         lr=linear_probe_lr,
                         steps=linear_probe_epochs,
+                        eval_loaders=probe_eval_loaders,
+                        log_every=linear_probe_log_every,
+                        log_prefix=f"  [probe:{task}]",
                     )
-                    probe_train_acc = llm_target.sequence_classification_accuracy(
-                        probe_loader, device=device, mask_class=loaders.mask_class
-                    )
-                    print(f"  {task}: linear probe support-set accuracy after training = {probe_train_acc:.4f}")
                 # Ship the identity intermediate layers alongside the trained
                 # final linear, exactly as build_nearest_mean_head.py does, so
                 # the per-evaluation head injection restores the same feature

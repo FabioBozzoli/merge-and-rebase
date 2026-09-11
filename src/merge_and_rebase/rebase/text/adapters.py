@@ -268,6 +268,53 @@ def neutralize_intermediate_head_layers(model: nn.Module) -> dict[str, torch.Ten
     return written
 
 
+def _masked_logits_and_labels(
+    model: nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    device: str,
+    mask: torch.Tensor | None,
+    remap: dict[int, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward one batch, restricted to ``mask``'s classes with labels remapped
+    to the corresponding column positions (so cross-entropy and argmax agree)."""
+    attention_mask = batch.get("attention_mask")
+    logits = model(
+        input_ids=batch["input_ids"].to(device),
+        attention_mask=None if attention_mask is None else attention_mask.to(device),
+    ).logits
+    labels = batch["labels"].to(device).long()
+    if mask is not None and remap is not None:
+        logits = logits.index_select(dim=1, index=mask.to(logits.device))
+        labels = torch.as_tensor(
+            [remap[int(y)] for y in labels.tolist()], device=logits.device, dtype=torch.long
+        )
+    return logits, labels
+
+
+@torch.no_grad()
+def _probe_accuracy(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: str,
+    mask: torch.Tensor | None,
+    remap: dict[int, int] | None,
+) -> float:
+    was_training = model.training
+    model.eval()
+    correct = total = 0
+    try:
+        for batch in loader:
+            logits, labels = _masked_logits_and_labels(model, batch, device=device, mask=mask, remap=remap)
+            correct += int((logits.argmax(dim=-1) == labels).sum())
+            total += int(labels.numel())
+    finally:
+        if was_training:
+            model.train()
+    return float(correct) / float(total) if total else float("nan")
+
+
 def train_linear_probe_head(
     model: nn.Module,
     loader: DataLoader,
@@ -276,6 +323,9 @@ def train_linear_probe_head(
     mask_class: Sequence[int] | None = None,
     lr: float = 1e-2,
     steps: int = 200,
+    eval_loaders: Mapping[str, DataLoader] | None = None,
+    log_every: int | None = None,
+    log_prefix: str = "[probe]",
 ) -> dict[str, torch.Tensor]:
     """Fit *only* the final classification ``nn.Linear`` from scratch, on a
     tiny (few-shot) ``loader``.
@@ -302,6 +352,13 @@ def train_linear_probe_head(
     same few-shot support set used for the rebasin transport itself); this
     is not a general-purpose training loop.
 
+    Pass ``eval_loaders`` (e.g. ``{"support": ..., "val": ..., "test": ...}``)
+    to print mean training loss plus accuracy on each of those splits while
+    training; ``log_every`` controls the epoch interval (default: ~10 lines
+    over the run, first and last epoch always logged). Every split is scored
+    on every log line, so a large ``test`` loader at a small ``log_every`` is
+    the expensive part.
+
     Returns a ``{qualified_param_name: tensor}`` dict in the same shape
     ``scripts/build_nearest_mean_head.py`` writes to disk, so callers can drop
     it straight into ``target_task_heads[task]`` -- note it only contains the
@@ -326,28 +383,29 @@ def train_linear_probe_head(
     mask = None if mask_class is None else torch.as_tensor([int(x) for x in mask_class], dtype=torch.long)
     remap = None if mask is None else {int(c): i for i, c in enumerate(mask.tolist())}
 
+    total_epochs = int(steps)
+    # ~10 log lines whatever the epoch count, unless the caller says otherwise.
+    every = int(log_every) if log_every else max(1, total_epochs // 10)
+
     model.train()
     optimizer = torch.optim.Adam(head_params, lr=float(lr))
     try:
-        for _ in range(int(steps)):
+        for epoch in range(1, total_epochs + 1):
+            epoch_loss = 0.0
             for batch in batches:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch.get("attention_mask")
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(device)
-                labels = batch["labels"].to(device).long()
-
-                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-                if mask is not None:
-                    logits = logits.index_select(dim=1, index=mask.to(logits.device))
-                    labels = torch.as_tensor(
-                        [remap[int(y)] for y in labels.tolist()], device=logits.device, dtype=torch.long
-                    )
-
+                logits, labels = _masked_logits_and_labels(model, batch, device=device, mask=mask, remap=remap)
                 loss = torch.nn.functional.cross_entropy(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                epoch_loss += float(loss.detach())
+
+            if epoch == 1 or epoch == total_epochs or epoch % every == 0:
+                parts = [f"{log_prefix} epoch {epoch}/{total_epochs}  loss={epoch_loss / len(batches):.4f}"]
+                for split_name, split_loader in (eval_loaders or {}).items():
+                    acc = _probe_accuracy(model, split_loader, device=device, mask=mask, remap=remap)
+                    parts.append(f"{split_name}={acc:.4f}")
+                print("  ".join(parts))
     finally:
         model.eval()
         for n, p in model.named_parameters():
