@@ -31,11 +31,18 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from ..models.openclip_classifier import normalize_features
+from ..models.openclip_classifier import normalize_features, zero_shot_logits_from_features
 
 
 def _forward_with_head(clf: Any, images: torch.Tensor, *, head: torch.Tensor) -> torch.Tensor:
     """``clf``'s own forward, with ``head`` swapped in as the zero-shot head.
+
+    Does not call ``clf(images)``: ``OpenClipClassifier.forward`` is decorated
+    ``@torch.no_grad()`` (it is normally an eval-only classifier), which would
+    silently strip every gradient -- including the one this function needs for
+    ``head`` -- and turn training into a no-op that still "runs" without error.
+    Backbone encoding is wrapped in ``torch.no_grad()`` on purpose (it is frozen
+    here regardless); only the head multiplication is left outside it.
 
     Mirrors ``OpenClipClassifier.top1_with_text_features``' swap-and-restore, so
     the row normalization convention is identical to the eval path: rows are
@@ -45,7 +52,10 @@ def _forward_with_head(clf: Any, images: torch.Tensor, *, head: torch.Tensor) ->
     previous = clf._zs_text_features
     clf._zs_text_features = normalize_features(head) if clf.normalize else head
     try:
-        return clf(images)
+        with torch.no_grad():
+            visual_features = clf.model.encode_image(images)
+        image_features = normalize_features(visual_features) if clf.normalize else visual_features
+        return zero_shot_logits_from_features(clf, image_features, normalize_image_features=False)
     finally:
         clf._zs_text_features = previous
 
