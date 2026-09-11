@@ -52,6 +52,7 @@ through an adapter in `rebase/text/`:
 | `tuned_ckpts` | Per-task fine-tuned checkpoints for the **source** model A. |
 | `tasks` | `"all"` or a comma-separated subset of the `nli6` suite (`snli, mnli, sick, qnli, rte, scitail`). |
 | `method` / `method_params` | Registered rebase method and its kwargs. |
+| `feature_cache_dir` | Top-level shortcut for `steer_text`'s `method_params.feature_cache_dir` (its on-disk pooled-feature cache). Set here, not only inside `method_params`, so it survives a `--method-params` override, which replaces that whole dict. |
 | `alpha` / `alpha_search` / `alpha_selection` | Fixed scale, alpha sweep, and `"shared"` vs `"per_task"` selection — identical to vision. |
 | `val_fraction` | Vision carves val out of test with a fixed seed so val/test never leak into each other; text does the same here (see below), since some NLI tasks' HF `test` split is literally their `validation` split. |
 
@@ -190,7 +191,9 @@ run, on the exact same few-shot support set (same count, same seed) the method i
 used — `method_params.shots_per_class` for `theseus`/`bico`, `method_params.few_shot` for
 `steer_text`. Supported for `theseus`, `bico`, and `steer_text` only, and requires
 `eval_mode: "head_logits"` set explicitly (`"auto"` resolves to `"prompt"` when no
-`target_task_heads` path is given).
+`target_task_heads` path is given). `linear_probe_epochs` (default `200`, an epoch here is
+one full pass over the tiny few-shot support set, since training is full-batch) and
+`linear_probe_lr` (default `1e-2`) control the probe's Adam training loop.
 
 Mechanically: for `theseus`/`bico`, the backbone is loaded as `target_base + alpha *
 transported_delta` (the same state the eval loop would score); for `steer_text` (which

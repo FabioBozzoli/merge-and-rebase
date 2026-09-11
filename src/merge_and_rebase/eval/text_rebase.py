@@ -576,6 +576,14 @@ def main() -> None:
             default=None,
             help="Same as --source-input-template, for B.",
         )
+        p.add_argument(
+            "--feature-cache-dir",
+            type=str,
+            default=None,
+            help="steer_text's on-disk cache for pooled features (keyed by source/target/task/regime/split). "
+            "A top-level shortcut for method_params.feature_cache_dir, so it survives a --method-params "
+            "override that replaces the rest of the dict.",
+        )
         add_logging_args(p)
 
         args = p.parse_args()
@@ -629,6 +637,7 @@ def main() -> None:
             "eval_source_finetuned": args.eval_source_finetuned,
             "source_input_template": args.source_input_template,
             "target_input_template": args.target_input_template,
+            "feature_cache_dir": args.feature_cache_dir,
         }
         cfg = merge_non_none(cfg, {k: v for k, v in cli.items() if v is not None})
         logging_cfg = merge_logging_config(cfg.get("logging", {}), build_logging_overrides(args))
@@ -725,6 +734,8 @@ def main() -> None:
             )
         if linear_probe_head and method_name not in {"theseus", "bico", "steer_text"}:
             raise ValueError("linear_probe_head is only supported for method in {theseus, bico, steer_text}.")
+        linear_probe_epochs = int(cfg.get("linear_probe_epochs", 200))
+        linear_probe_lr = float(cfg.get("linear_probe_lr", 1e-2))
 
         if eval_mode == "head_logits":
             if model_kind != "sequence_classification":
@@ -1095,6 +1106,8 @@ def main() -> None:
                     raise RuntimeError("steer_text requires source loaders and a finetuned source model.")
                 steer_params = dict(method_params)
                 steer_seed = int(steer_params.pop("seed", seed))
+                if cfg.get("feature_cache_dir") is not None:
+                    steer_params["feature_cache_dir"] = str(cfg["feature_cache_dir"])
                 prepared = method.prepare(
                     llm_source=llm_source_finetuned,
                     llm_source_pretrained=llm_source,
@@ -1162,14 +1175,24 @@ def main() -> None:
                     load_into_model(llm_target.model, target_base_sd, strict=strict_load)
                     with steer_text_correction_context(llm_target, prepared, alpha=probe_alpha):
                         trained_head_sd = train_linear_probe_head(
-                            llm_target.model, probe_loader, device=device, mask_class=loaders.mask_class
+                            llm_target.model,
+                            probe_loader,
+                            device=device,
+                            mask_class=loaders.mask_class,
+                            lr=linear_probe_lr,
+                            steps=linear_probe_epochs,
                         )
                 else:
                     probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
                     load_into_model(llm_target.model, probe_backbone_sd, strict=strict_load)
                     del probe_backbone_sd
                     trained_head_sd = train_linear_probe_head(
-                        llm_target.model, probe_loader, device=device, mask_class=loaders.mask_class
+                        llm_target.model,
+                        probe_loader,
+                        device=device,
+                        mask_class=loaders.mask_class,
+                        lr=linear_probe_lr,
+                        steps=linear_probe_epochs,
                     )
                 target_task_heads[task] = trained_head_sd
 
