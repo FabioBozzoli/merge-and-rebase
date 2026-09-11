@@ -230,6 +230,81 @@ def head_intermediate_linears(model: nn.Module) -> list[tuple[str, nn.Linear]]:
     return linears[:-1]
 
 
+def train_linear_probe_head(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: str,
+    mask_class: Sequence[int] | None = None,
+    lr: float = 1e-2,
+    steps: int = 200,
+) -> dict[str, torch.Tensor]:
+    """Fit the classification head from scratch on a tiny (few-shot) ``loader``.
+
+    Resets every ``nn.Linear`` under the head root (both the intermediate
+    layers like T5's ``dense`` and the final one) to a fresh random init, then
+    trains only those parameters by full-batch Adam -- the backbone (already
+    loaded by the caller with whatever weights the rebasin step produced, e.g.
+    a transported delta or a steer correction hook) stays frozen throughout.
+
+    ``loader`` is expected to be small enough to fit in memory at once (the
+    same few-shot support set used for the rebasin transport itself); this
+    is not a general-purpose training loop.
+
+    Returns a ``{qualified_param_name: tensor}`` dict in the same shape
+    ``scripts/build_nearest_mean_head.py`` writes to disk, so callers can drop
+    it straight into ``target_task_heads[task]``.
+    """
+    _, linears = _head_root_and_linears(model)
+    head_params = [p for _, m in linears for p in m.parameters()]
+    if not head_params:
+        raise ValueError("Classification head has no trainable parameters.")
+
+    batches = list(loader)
+    if not batches:
+        raise ValueError("train_linear_probe_head got an empty loader.")
+
+    original_requires_grad = {n: p.requires_grad for n, p in model.named_parameters()}
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for _, m in linears:
+        m.reset_parameters()
+        for p in m.parameters():
+            p.requires_grad_(True)
+
+    mask = None if mask_class is None else torch.as_tensor([int(x) for x in mask_class], dtype=torch.long)
+    remap = None if mask is None else {int(c): i for i, c in enumerate(mask.tolist())}
+
+    model.train()
+    optimizer = torch.optim.Adam(head_params, lr=float(lr))
+    try:
+        for _ in range(int(steps)):
+            for batch in batches:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
+                labels = batch["labels"].to(device).long()
+
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+                if mask is not None:
+                    logits = logits.index_select(dim=1, index=mask.to(logits.device))
+                    labels = torch.as_tensor(
+                        [remap[int(y)] for y in labels.tolist()], device=logits.device, dtype=torch.long
+                    )
+
+                loss = torch.nn.functional.cross_entropy(logits, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+    finally:
+        model.eval()
+        for n, p in model.named_parameters():
+            p.requires_grad_(original_requires_grad[n])
+
+    return {f"{qn}.{pn}": p.detach().cpu().clone() for qn, m in linears for pn, p in m.named_parameters()}
+
+
 def text_param_filter(*, exclude_head: bool = True):
     """``key_filter`` for ``TaskVector.from_checkpoints`` on HF text models.
 

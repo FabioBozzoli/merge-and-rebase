@@ -1,0 +1,51 @@
+{
+  "_comment": "Same bico transfer as text_rebase_t5base_flant5large_bico_hubcheckpoint.json, but the target head is trained from scratch (linear_probe_head) after transport, on the same support set (method_params.shots_per_class examples per class, same seed) bico uses for its own bilinear statistics -- no build_nearest_mean_head.py step needed. Do NOT set target_task_heads alongside linear_probe_head, they're mutually exclusive.",
+  "_source_base_UNVERIFIED": "source_model_name_or_path is google-t5/t5-base (original T5, not t5-v1_1-base) because varun-v-rao/t5-base-snli's model name implies that base.",
+  "_source_input_template": "varun-v-rao/t5-base-snli expects a single formatted string, not this repo's default tokenizer(premise, hypothesis) pair encoding -- confirmed with scripts/probe_nli_input_format.py. A-only: B still uses the default pair encoding.",
+
+  "suite": "nli6",
+  "tasks": "snli",
+
+  "source_model_name_or_path": "google-t5/t5-base",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google/flan-t5-large",
+  "target_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "eval_source_finetuned": true,
+  "linear_probe_head": true,
+  "head_key_pattern": "classification_head",
+  "source_input_template": "premise: {premise} hypothesis: {hypothesis}",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 33,
+
+  "method": "bico",
+  "method_params": {
+    "seq_align": "interpolate",
+    "shots_per_class": 300,
+    "center_acts": false,
+    "whiten_power": 0.0,
+    "patch_qkv": false
+  },
+
+  "alpha_search": false,
+  "alpha": 1.0,
+  "alpha_selection": "shared",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "varun-v-rao/t5-base-snli"
+  }
+}

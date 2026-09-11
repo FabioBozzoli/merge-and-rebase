@@ -79,6 +79,7 @@ from ..rebase.text import (  # noqa: F401  -- import registers "steer_text"
     steer_text_correction_context,
     subset_loader,
     text_param_filter,
+    train_linear_probe_head,
 )
 from ..rebase.text.steer_text import _head_as_identity, _pooled_features
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
@@ -715,13 +716,31 @@ def main() -> None:
         head_key_pattern = str(cfg.get("head_key_pattern", "classification_head"))
         model_kind = str(cfg.get("model_kind", "sequence_classification" if eval_mode == "head_logits" else "causal_lm"))
 
+        linear_probe_head = bool(cfg.get("linear_probe_head", False))
+        if linear_probe_head and target_task_heads_path is not None:
+            raise ValueError(
+                "linear_probe_head and target_task_heads/task_heads are mutually exclusive: the target head "
+                "is trained from scratch instead of loaded, so a fixed head file would just be overwritten "
+                "before it's ever used."
+            )
+        if linear_probe_head and method_name not in {"theseus", "bico", "steer_text"}:
+            raise ValueError("linear_probe_head is only supported for method in {theseus, bico, steer_text}.")
+
         if eval_mode == "head_logits":
             if model_kind != "sequence_classification":
                 raise ValueError("eval_mode='head_logits' requires model_kind='sequence_classification'.")
-            if target_task_heads_path is None:
-                raise ValueError("eval_mode='head_logits' requires config['target_task_heads'] (or 'task_heads').")
+            if target_task_heads_path is None and not linear_probe_head:
+                raise ValueError(
+                    "eval_mode='head_logits' requires config['target_task_heads'] (or 'task_heads'), unless "
+                    "'linear_probe_head' is set."
+                )
         elif model_kind == "sequence_classification":
             raise ValueError("eval_mode='prompt' requires model_kind='causal_lm' (there is no head to score).")
+        if linear_probe_head and eval_mode != "head_logits":
+            raise ValueError(
+                "linear_probe_head trains a classification head, so it requires eval_mode='head_logits' "
+                "(set it explicitly -- 'auto' resolves to 'prompt' when no target_task_heads path is given)."
+            )
         if steer_mode and eval_mode != "head_logits":
             raise ValueError(
                 "steer_text fits a correction in the pooled-feature space of a linear classification head, "
@@ -788,7 +807,16 @@ def main() -> None:
         # live in a class-id space that means nothing under a different task.
         delta_key_filter = text_param_filter(exclude_head=(eval_mode == "head_logits"))
 
-        target_task_heads = _load_task_heads(target_task_heads_path) if target_task_heads_path else None
+        target_task_heads: dict[str, Any] | None
+        if target_task_heads_path:
+            target_task_heads = _load_task_heads(target_task_heads_path)
+        elif linear_probe_head:
+            # Populated per task below, once each task's probe has been trained --
+            # empty (not None) so the eval-time re-injection machinery activates,
+            # but with no task key yet until training fills it in.
+            target_task_heads = {}
+        else:
+            target_task_heads = None
         source_task_heads = _load_task_heads(source_task_heads_path) if source_task_heads_path else None
 
         user_prompt_template = cfg.get("prompt_template", None)
@@ -975,9 +1003,13 @@ def main() -> None:
                 if a_finetuned is not llm_source_finetuned:
                     del a_finetuned
 
-            if eval_mode == "head_logits" and target_task_heads is not None:
+            if eval_mode == "head_logits" and target_task_heads is not None and task in target_task_heads:
                 # steer_text reads w_b off the live head at prepare() time, so the
                 # task head must already be in place before the method runs.
+                # Under linear_probe_head, the head hasn't been trained yet for
+                # this task (target_task_heads starts empty), so this is skipped
+                # and the model's own from-scratch random init stays in place --
+                # exactly the starting point linear probing is supposed to fit.
                 _inject_task_head(
                     model=llm_target.model,
                     task=task,
@@ -1112,6 +1144,34 @@ def main() -> None:
                 metrics={f"rebase/{task}/transported_param_count": float(len(transported_delta))},
                 context={"task": task, "method": method.name},
             )
+
+            if linear_probe_head:
+                probe_shots = method_params.get("shots_per_class") if shim_mode else method_params.get("few_shot")
+                if probe_shots is None:
+                    raise ValueError(
+                        f"linear_probe_head requires method_params."
+                        f"{'shots_per_class' if shim_mode else 'few_shot'} to be set -- the probe trains on "
+                        "the exact same support set (same count, same seed) as the rebasin transport itself."
+                    )
+                probe_indices = balanced_indices(loaders.local_labels["train"], int(probe_shots), seed=seed)
+                probe_loader = subset_loader(loaders.train, probe_indices, batch_size=len(probe_indices))
+                print(f"  {task}: linear-probing the target head from scratch on {len(probe_indices)} support examples")
+
+                probe_alpha = float(cfg.get("alpha", 1.0))
+                if steer_mode:
+                    load_into_model(llm_target.model, target_base_sd, strict=strict_load)
+                    with steer_text_correction_context(llm_target, prepared, alpha=probe_alpha):
+                        trained_head_sd = train_linear_probe_head(
+                            llm_target.model, probe_loader, device=device, mask_class=loaders.mask_class
+                        )
+                else:
+                    probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
+                    load_into_model(llm_target.model, probe_backbone_sd, strict=strict_load)
+                    del probe_backbone_sd
+                    trained_head_sd = train_linear_probe_head(
+                        llm_target.model, probe_loader, device=device, mask_class=loaders.mask_class
+                    )
+                target_task_heads[task] = trained_head_sd
 
             save_transport_dir = cfg.get("save_transported_tvs_dir", None)
             if save_transport_dir and not steer_mode:

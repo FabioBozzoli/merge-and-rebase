@@ -638,3 +638,43 @@ def text_rebase_head(model):
     from merge_and_rebase.rebase.text import head_linear
 
     return head_linear(model)
+
+
+def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
+    from merge_and_rebase.rebase.text import train_linear_probe_head
+
+    model = _tiny_t5(seed=0)
+    loaders = _text_loaders(n=12, seed=0)  # classes=2 default -> head_class_ids [0, 2]
+
+    original_backbone = {n: p.clone() for n, p in model.named_parameters() if "classification_head" not in n}
+    original_head = {n: p.clone() for n, p in model.named_parameters() if "classification_head" in n}
+
+    trained = train_linear_probe_head(
+        model, loaders.train, device="cpu", mask_class=loaders.mask_class, lr=0.05, steps=50
+    )
+
+    # Backbone must stay untouched -- only the head is ever trained.
+    for n, p in model.named_parameters():
+        if "classification_head" not in n:
+            assert torch.equal(p, original_backbone[n])
+    # The head must actually have moved from its (fresh, reset) starting point.
+    assert any(not torch.equal(p, original_head[n]) for n, p in model.named_parameters() if n in original_head)
+    # requires_grad is restored to its pre-call state (a fresh model: all True).
+    assert all(p.requires_grad for p in model.parameters())
+    # Returned dict has exactly the head's own qualified parameter names/shapes.
+    head_named = {n: p for n, p in model.named_parameters() if "classification_head" in n}
+    assert set(trained) == set(head_named)
+    for n, p in head_named.items():
+        assert trained[n].shape == p.shape
+
+    # It should have actually fit the tiny few-shot set (near-perfect train accuracy).
+    model.eval()
+    idx = torch.tensor(loaders.mask_class, dtype=torch.long)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch in loaders.train:
+            logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
+            pred = idx[logits.index_select(dim=1, index=idx).argmax(dim=-1)]
+            correct += int((pred == batch["labels"]).sum())
+            total += int(batch["labels"].numel())
+    assert correct / total >= 0.9

@@ -21,6 +21,7 @@ from .adapters import (
     head_linear,
     subset_loader,
     text_param_filter,
+    train_linear_probe_head,
 )
 from .steer_text import (  # noqa: F401  -- import registers "steer_text"
     SteerTextRebase,
@@ -49,4 +50,5 @@ __all__ = [
     "subset_loader",
     "text_param_filter",
     "text_parameter_blocks",
+    "train_linear_probe_head",
 ]

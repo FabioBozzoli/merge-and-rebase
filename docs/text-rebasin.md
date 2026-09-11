@@ -180,6 +180,33 @@ file is written.
 Point `target_task_heads` at the resulting file exactly as you would a trained one; nothing
 else in the pipeline needs to know the head wasn't trained.
 
+## Alternative: linear probing after rebasin
+
+Set `"linear_probe_head": true` (instead of `target_task_heads`, they're mutually
+exclusive) to skip the nearest-mean head entirely: B's classification head starts at
+whatever fresh random init `AutoModelForSequenceClassification.from_pretrained` gives it,
+and is trained from scratch **after** the rebase method's `prepare()`/`transport()` have
+run, on the exact same few-shot support set (same count, same seed) the method itself
+used — `method_params.shots_per_class` for `theseus`/`bico`, `method_params.few_shot` for
+`steer_text`. Supported for `theseus`, `bico`, and `steer_text` only, and requires
+`eval_mode: "head_logits"` set explicitly (`"auto"` resolves to `"prompt"` when no
+`target_task_heads` path is given).
+
+Mechanically: for `theseus`/`bico`, the backbone is loaded as `target_base + alpha *
+transported_delta` (the same state the eval loop would score); for `steer_text` (which
+never writes weights) it's the plain target base under `steer_text_correction_context`.
+Only the head's own parameters get gradients (`rebase/text/adapters.py`'s
+`train_linear_probe_head`, full-batch Adam, backbone frozen); the trained head is then
+stored exactly like a `target_task_heads` file would be, so the rest of the pipeline
+(the alpha sweep's per-call head re-injection) is unaware anything changed. One
+consequence specific to `steer_text`: Stage 1 reads `w_b` off B's live head at
+`prepare()` time, which under this mode is still the untrained random init, not a real
+head — rebasin happens first, the probe only fits afterward.
+
+See `configs/text_rebase_t5base_t5large_theseus_linearprobe.json`,
+`configs/text_rebase_t5base_flant5large_bico_linearprobe.json`, and
+`configs/text_rebase_t5base_t5large_steer_linearprobe.json` for complete examples.
+
 ## Diagnosing a near-chance result
 
 A near-chance accuracy through B's head is ambiguous on its own: it could be the

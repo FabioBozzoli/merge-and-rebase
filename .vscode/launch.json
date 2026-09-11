@@ -459,6 +459,31 @@
             ]
         },
         {
+            "name": "Text Rebase Steer T5 (hub checkpoint)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "merge_and_rebase.eval.text_rebase",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "HF_HOME": "/work/tesi_bcalderara/merge-and-rebase/hf_cache"
+            },
+            "args": [
+                "--config",
+                "configs/text_rebase_t5base_t5large_steer_hubcheckpoint.json",
+                "--tasks",
+                "snli",
+                "--seed",
+                "33",
+                "--target-task-heads",
+                "/work/tesi_bcalderara/merge-and-rebase/text_rebase_heads/t5-v1_1-large_snli_nearest_mean_seed33_fewshot300.pt",
+                "--device",
+                "cuda"
+            ]
+        },
+        {
             "name": "Compute KFAC",
             "type": "debugpy",
             "request": "launch",
