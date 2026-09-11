@@ -1,0 +1,24 @@
+{
+  "_comment": "Control for the rebasin+probe runs: few-shot linear probing of ONE CLIP model, with no rebasin, no source model, no task vector and no fine-tuned checkpoint anywhere. Run it with eval/vision_linear_probe.py (NOT vision_rebase.py): that entrypoint builds only the clip_model/clip_pretrained pair below and uses only that pretrain's own backbone and its own zero-shot heads.",
+  "_how_to_run": "python -m merge_and_rebase.eval.vision_linear_probe --config configs/vision8_zeroshot_linear_probe.json",
+  "_comparability": "Keep clip_model/clip_pretrained equal to the TARGET of the rebasin runs (vision8_{steer,theseus,bico}_linear_probe.json), and linear_probe_shots_per_class / epochs / lr identical to theirs -- then the 'probed' number here is exactly what those runs have to beat, measured on the same backbone with the same probe budget.",
+  "_lr_note": "linear_probe_lr must stay small relative to the head's own scale: rows are L2-normalized (entries ~1/sqrt(D)), and Adam's step is ~lr per coordinate regardless of gradient magnitude, so a large lr erases the zero-shot head in a couple of steps and the probe restarts from nothing. Watch the epoch-0 log line: it reproduces the zero-shot accuracy, and nothing after it should fall below.",
+
+  "suite": "vision8",
+  "tasks": "EuroSAT",
+
+  "clip_model": "ViT-B-16-plus-240",
+  "clip_pretrained": "laion400m_e32",
+
+  "linear_probe_shots_per_class": 16,
+  "linear_probe_epochs": 50,
+  "linear_probe_lr": 0.001,
+  "linear_probe_log_every": 5,
+
+  "split": "test",
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "seed": 54,
+  "no_humanize": true
+}

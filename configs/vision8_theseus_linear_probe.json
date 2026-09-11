@@ -1,0 +1,37 @@
+{
+  "_comment": "Theseus transport, then linear probing: the transported delta is applied to the target backbone at alpha, the backbone is frozen, and only the zero-shot classification head is refit on a few-shot support set. The probe starts from the zero-shot head, so its epoch-0 log line is the plain zero-shot accuracy of the *transported* backbone -- everything above that is what probing adds.",
+  "_support_set": "theseus/bico have no few-shot knob of their own (they use num_batches), so linear_probe_shots_per_class is set explicitly here -- without it the run stops with an error rather than guessing a support-set size.",
+  "_head_at_eval": "The probed head replaces the zero-shot head for BOTH the target_zeroshot and rebased columns, so those columns keep isolating what the transport did -- the classifier is identical on both sides.",
+  "_lr_note": "linear_probe_lr must stay small relative to the head's own scale: rows are L2-normalized (entries ~1/sqrt(D)), and Adam's step is ~lr per coordinate regardless of gradient magnitude, so a large lr erases the zero-shot head in a couple of steps and the probe restarts from nothing.",
+  "suite": "vision8",
+  "tasks": "EuroSAT",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "laion2b_s34b_b88k",
+  "target_clip_model": "ViT-B-16-plus-240",
+  "target_clip_pretrained": "laion400m_e32",
+  "linear_probe_head": true,
+  "linear_probe_shots_per_class": 16,
+  "linear_probe_epochs": 50,
+  "linear_probe_lr": 0.001,
+  "linear_probe_log_every": 5,
+  "alpha_search": false,
+  "alpha_selection": "shared",
+  "alpha": 1.0,
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "seed": 54,
+  "no_humanize": true,
+  "method": "theseus",
+  "method_params": {
+    "num_batches": 1,
+    "batch_size": 32,
+    "seq_align": "interpolate2d",
+    "split_qkv": true,
+    "center_acts": false
+  },
+  "weights": null,
+  "tuned_ckpts": {
+    "EuroSAT": "src/checkpoints/theseus/models/checkpoints/ViT-B-16/laion2b_s34b_b88k/eurosat/best.pt"
+  }
+}

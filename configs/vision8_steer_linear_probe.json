@@ -1,0 +1,47 @@
+{
+  "_comment": "Same transfer as vision8_steer.json, plus linear probing: after steer has fit its feature-space correction, the target's zero-shot classification head is refit on a few-shot support set with the backbone frozen (linear_probe_head). The probe starts FROM the zero-shot head -- the same matrix steer's Stage 1 built its correction through via pinv(w_b) -- so its epoch-0 log line equals the plain zero-shot accuracy, and everything after that is what probing adds on top. It trains with steer's correction wrapper active, so it fits the corrected features, not the uncorrected ones.",
+  "_support_set": "linear_probe_shots_per_class is not set, so the probe reuses method_params.few_shot (16/class here): probe and transport see the same support-set size. Set it explicitly to decouple them.",
+  "_head_at_eval": "The probed head replaces the zero-shot head for BOTH the target_zeroshot and rebased columns, so those columns keep isolating what the correction does -- the classifier is identical on both sides.",
+  "_lr_note": "linear_probe_lr must stay small relative to the head's own scale: rows are L2-normalized (entries ~1/sqrt(D)), and Adam's step is ~lr per coordinate regardless of gradient magnitude, so a large lr erases the zero-shot head in a couple of steps and the probe restarts from nothing.",
+
+  "suite": "vision8",
+  "tasks": "GTSRB",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-B-16-plus-240",
+  "target_clip_pretrained": "laion400m_e32",
+
+  "method": "steer",
+  "method_params": {
+    "feature_regime": "linear",
+    "stage_2_strategy": "block_ridge",
+    "block_ridge_mode": "smoothed_residual",
+    "rho": 0.9,
+    "stage1_lambda": 1.0,
+    "ridge_lambda": 1.0,
+    "mlp_hidden_dim": 1024,
+    "mlp_epochs": 100,
+    "few_shot": 16,
+    "feature_cache_dir": "src/.cache/steer_features",
+    "force_recompute_features": false,
+    "seed": 42
+  },
+
+  "linear_probe_head": true,
+  "linear_probe_epochs": 50,
+  "linear_probe_lr": 0.001,
+  "linear_probe_log_every": 5,
+
+  "alpha_search": false,
+  "alpha_selection": "shared",
+  "alpha": 1.0,
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "seed": 54,
+  "no_humanize": true,
+  "weights": null,
+  "tuned_ckpts": {
+    "GTSRB": "src/checkpoints/theseus/models/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt"
+  }
+}

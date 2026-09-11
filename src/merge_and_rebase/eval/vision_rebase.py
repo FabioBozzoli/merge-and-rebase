@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import os
 import time
@@ -26,6 +27,7 @@ from ..cli_args import (
 from ..data.templates import get_templates
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.utils import (
+    build_grad_dataloader,
     eval_task_top1,
     humanize,
     patch_base_for_attn,
@@ -49,6 +51,7 @@ from ..rebase.runtime import (
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
+from .linear_probe import train_zeroshot_head_probe
 from .datasets.vision8_14_20 import SUITES
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
@@ -306,6 +309,35 @@ def main() -> None:
         strict_load = bool(cfg.get("strict_load", False))
         device = str(cfg.get("device", "cuda"))
 
+        # Linear probing: after the chosen method has produced the target
+        # backbone, refit only the zero-shot classification head on a few-shot
+        # support set, backbone frozen. Works for every method, including
+        # "identity" with alpha=0.0, which is the no-rebasin zero-shot control.
+        linear_probe_head = bool(cfg.get("linear_probe_head", False))
+        linear_probe_epochs = int(cfg.get("linear_probe_epochs", 50))
+        linear_probe_lr = float(cfg.get("linear_probe_lr", 1e-3))
+        linear_probe_log_every = cfg.get("linear_probe_log_every", None)
+        linear_probe_log_every = int(linear_probe_log_every) if linear_probe_log_every is not None else None
+        # Defaults to whatever few-shot budget the method itself was given, so
+        # the probe and the transport see the same support-set size. "identity"
+        # (and any method without such a knob) has to state it explicitly.
+        linear_probe_shots = cfg.get("linear_probe_shots_per_class", None)
+        if linear_probe_shots is None:
+            linear_probe_shots = method_params.get("shots_per_class", method_params.get("few_shot", None))
+        if linear_probe_head and linear_probe_shots is None:
+            raise ValueError(
+                "linear_probe_head needs a support-set size: set 'linear_probe_shots_per_class', or use a "
+                "method that already defines method_params.shots_per_class / method_params.few_shot."
+            )
+        linear_probe_shots = int(linear_probe_shots) if linear_probe_shots is not None else None
+        if linear_probe_head and bool(cfg.get("alpha_search", False)):
+            print(
+                "WARNING: linear_probe_head with alpha_search: the head is probed once, on the backbone at "
+                f"alpha={float(cfg.get('alpha', 1.0))}, and then held fixed while the sweep evaluates every other "
+                "alpha. Those points are scored with a head fit for a different backbone. Prefer alpha_search=false, "
+                "or rerun per alpha."
+            )
+
         if block_extension_eval_requested and not blockext_like_method:
             print(
                 "Block-extension target-dataset eval: requested but skipped "
@@ -482,6 +514,17 @@ def main() -> None:
         transfusion_prepared: dict[str, Any] | None = None
         steer_prepared_by_task: dict[str, dict[str, Any]] = {}
         steer_eval_basis_mismatch = False
+        # Per-task probed heads, consumed by _eval_task through
+        # eval_task_top1(text_features=...) in place of the zero-shot head.
+        probe_heads: dict[str, torch.Tensor] = {}
+
+        # Defined before the task loop because linear probing needs it too, not
+        # only the alpha-sweep closures further down.
+        def _load_into_target_model(sd: dict[str, torch.Tensor]) -> None:
+            if transfusion_mode:
+                method.load_into_target_visual(clf_target, sd, strict=False)
+            else:
+                load_into_model(clf_target.model, sd, strict=strict_load)
 
         for task in tasks:
             hf_path, hf_config, split_map = suite.resolver(task)
@@ -835,7 +878,6 @@ def main() -> None:
             prepare_started = time.perf_counter()
 
             if method_name == "gradfix":
-                from ..eval.utils import build_grad_dataloader
                 from ..models.grad_recipes import clip_contrastive_recipe
 
                 grad_loader = build_grad_dataloader(
@@ -973,6 +1015,58 @@ def main() -> None:
                 context={"task": task, "method": method.name},
             )
 
+            if linear_probe_head:
+                probe_alpha = float(cfg.get("alpha", 1.0))
+                # The backbone the probe trains on must be the one the eval loop
+                # will score: the transported delta at this run's alpha for a
+                # weight-space method, the untouched base under steer (which
+                # applies its correction as a forward wrapper instead).
+                if steer_mode:
+                    _load_into_target_model(target_base_sd)
+                else:
+                    probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
+                    _load_into_target_model(probe_backbone_sd)
+                    del probe_backbone_sd
+
+                # Start from this task's zero-shot head: it is what steer's
+                # Stage 1 fit its correction through, and it makes the probe's
+                # epoch-0 line equal to the zero-shot accuracy.
+                clf_target.build_zeroshot_text_features(
+                    list(classnames), build_cfg_task, cache_dir="src/.cache/zs_cache", force_rebuild=False
+                )
+                probe_loader = build_grad_dataloader(
+                    loaders.train,
+                    loaders.train.dataset,
+                    grad_imgs_per_class=linear_probe_shots,
+                    num_workers=int(cfg.get("num_workers", 6)),
+                    seed=int(cfg.get("seed", 42)),
+                )
+                print(
+                    f"  {task}: linear-probing the zero-shot head on "
+                    f"{len(probe_loader.dataset)} support images ({linear_probe_shots}/class)"
+                )
+                probe_eval_loaders = {"support": probe_loader, "val": loaders.val, "test": loaders.test}
+
+                # steer applies its correction as a forward wrapper, so the probe
+                # must train with that wrapper active -- every other method has
+                # already baked its transport into the weights loaded above.
+                probe_ctx: Any = (
+                    steer_correction_context(clf_target, prepared, alpha=probe_alpha)
+                    if steer_mode
+                    else contextlib.nullcontext()
+                )
+                with probe_ctx:
+                    probe_heads[task] = train_zeroshot_head_probe(
+                        clf_target,
+                        probe_loader,
+                        device=device,
+                        lr=linear_probe_lr,
+                        steps=linear_probe_epochs,
+                        eval_loaders=probe_eval_loaders,
+                        log_every=linear_probe_log_every,
+                        log_prefix=f"  [probe:{task}]",
+                    )
+
             save_transport_dir = cfg.get("save_transported_tvs_dir", None)
             if save_transport_dir and not steer_mode:
                 os.makedirs(save_transport_dir, exist_ok=True)
@@ -1015,6 +1109,10 @@ def main() -> None:
                     print(f"  - ... and {len(issues) - 3} more incompatibilities")
 
         def _eval_task(item: dict[str, Any], split: str) -> float:
+            # Under linear probing the probed head replaces the zero-shot one for
+            # *both* baseline and rebased columns, exactly as a task_heads file
+            # would: the head is held fixed so the columns isolate what the
+            # transport/correction did, not a change of classifier.
             return float(
                 eval_task_top1(
                     clf=clf_target,
@@ -1023,6 +1121,7 @@ def main() -> None:
                     build_cfg_task=item["build_cfg_task"],
                     device=device,
                     split=split,
+                    text_features=probe_heads.get(str(item["task"])),
                 )
             )
 
@@ -1056,12 +1155,6 @@ def main() -> None:
             print("Using mixed baseline evaluation: untransported where compatible, target zeroshot otherwise.")
         else:
             print("Using target zeroshot baseline for all tasks.")
-
-        def _load_into_target_model(sd: dict[str, torch.Tensor]) -> None:
-            if transfusion_mode:
-                method.load_into_target_visual(clf_target, sd, strict=False)
-            else:
-                load_into_model(clf_target.model, sd, strict=strict_load)
 
         def _eval_zeroshot_all_tasks(split: str) -> list[float]:
             if split not in baseline_cache_zeroshot:
