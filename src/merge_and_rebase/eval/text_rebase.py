@@ -1186,6 +1186,14 @@ def main() -> None:
                             lr=linear_probe_lr,
                             steps=linear_probe_epochs,
                         )
+                        # Sanity check, not a generalization estimate: if the probe
+                        # can't even fit the examples it was trained on, the problem
+                        # is the probe's own training (epochs/lr/collapse), not the
+                        # transport/correction mechanism upstream of it.
+                        probe_train_acc = llm_target.sequence_classification_accuracy(
+                            probe_loader, device=device, mask_class=loaders.mask_class
+                        )
+                        print(f"  {task}: linear probe support-set accuracy after training = {probe_train_acc:.4f}")
                 else:
                     probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
                     load_into_model(llm_target.model, probe_backbone_sd, strict=strict_load)
@@ -1198,6 +1206,10 @@ def main() -> None:
                         lr=linear_probe_lr,
                         steps=linear_probe_epochs,
                     )
+                    probe_train_acc = llm_target.sequence_classification_accuracy(
+                        probe_loader, device=device, mask_class=loaders.mask_class
+                    )
+                    print(f"  {task}: linear probe support-set accuracy after training = {probe_train_acc:.4f}")
                 target_task_heads[task] = trained_head_sd
 
             save_transport_dir = cfg.get("save_transported_tvs_dir", None)
