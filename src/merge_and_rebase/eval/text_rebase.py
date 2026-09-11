@@ -1167,7 +1167,11 @@ def main() -> None:
                         "the exact same support set (same count, same seed) as the rebasin transport itself."
                     )
                 probe_indices = balanced_indices(loaders.local_labels["train"], int(probe_shots), seed=seed)
-                probe_loader = subset_loader(loaders.train, probe_indices, batch_size=len(probe_indices))
+                # Mini-batched at the run's own batch_size, not one giant batch of
+                # the whole support set -- shots_per_class=300 x 3 classes is 900
+                # examples, which OOMs a large target model in a single forward pass
+                # regardless of how small batch_size is set elsewhere.
+                probe_loader = subset_loader(loaders.train, probe_indices, batch_size=batch_size)
                 print(f"  {task}: linear-probing the target head from scratch on {len(probe_indices)} support examples")
 
                 probe_alpha = float(cfg.get("alpha", 1.0))
