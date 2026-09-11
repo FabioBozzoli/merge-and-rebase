@@ -1051,6 +1051,14 @@ def main() -> None:
                     head_class_ids=head_class_ids,
                 )
 
+            if linear_probe_head:
+                # steer_text's Stage 1 reads w_b off the live head in prepare(),
+                # and the probe below must start from that exact same matrix for
+                # the correction to mean anything. Restore the pristine base so
+                # both see it -- otherwise task 2 of a multi-task run would fit
+                # its correction against task 1's trained head.
+                load_into_model(llm_target.model, target_base_sd, strict=strict_load)
+
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
             if torch.cuda.is_available() and device != "cpu":
                 torch.cuda.reset_peak_memory_stats()

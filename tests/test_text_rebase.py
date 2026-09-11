@@ -662,6 +662,25 @@ def test_neutralize_intermediate_head_layers_is_a_noop_without_one() -> None:
     assert neutralize_intermediate_head_layers(_tiny_qwen(seed=0)) == {}
 
 
+def test_train_linear_probe_head_starts_from_the_head_already_in_the_model() -> None:
+    """It must not re-initialize the head: steer_text's correction is fit via
+    pinv(w_b) against the head that is live at prepare() time, so a fresh draw
+    here would discard the readout the correction only works through."""
+    from merge_and_rebase.rebase.text import train_linear_probe_head
+
+    model = _tiny_t5(seed=0)
+    loaders = _text_loaders(n=8, seed=0)
+
+    marker = torch.full_like(model.classification_head.out_proj.weight, 0.123)
+    with torch.no_grad():
+        model.classification_head.out_proj.weight.copy_(marker)
+
+    # lr=0 -> Adam applies no update, so anything that changed came from a reset.
+    train_linear_probe_head(model, loaders.train, device="cpu", mask_class=loaders.mask_class, lr=0.0, steps=1)
+
+    assert torch.equal(model.classification_head.out_proj.weight, marker)
+
+
 def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
     from merge_and_rebase.rebase.text import train_linear_probe_head
 
@@ -692,8 +711,7 @@ def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
     for n, p in model.named_parameters():
         if n in original_dense:
             assert torch.equal(p, original_dense[n])
-    # out_proj (the actual linear probe) must have moved from its (fresh, reset)
-    # starting point.
+    # out_proj (the actual linear probe) must have moved from its starting point.
     assert any(not torch.equal(p, original_out_proj[n]) for n, p in model.named_parameters() if n in original_out_proj)
     # requires_grad is restored to its pre-call state (a fresh model: all True).
     assert all(p.requires_grad for p in model.parameters())

@@ -327,10 +327,22 @@ def train_linear_probe_head(
     log_every: int | None = None,
     log_prefix: str = "[probe]",
 ) -> dict[str, torch.Tensor]:
-    """Fit *only* the final classification ``nn.Linear`` from scratch, on a
-    tiny (few-shot) ``loader``.
+    """Fit *only* the final classification ``nn.Linear`` on a tiny (few-shot)
+    ``loader``, starting from whatever weights it currently holds.
 
-    This resets and trains ``head_linear(model)`` alone -- never
+    It deliberately does **not** re-initialize that layer. The caller has
+    already put the model in the state the probe must start from, and for
+    ``steer_text`` that state is load-bearing: Stage 1 builds its correction
+    through ``pinv(w_b)`` of the head that was live at ``prepare()`` time, so
+    the correction only produces the right logit shift through *that* matrix.
+    Drawing a fresh random head here would throw away the very readout the
+    correction was fit against -- the probe would start at chance instead of at
+    Stage 2's accuracy, and would have to relearn from nothing. (The head is
+    already "from scratch" in the sense that matters: it is the random draw
+    ``AutoModelForSequenceClassification`` made at build time, never trained on
+    the task.)
+
+    It trains ``head_linear(model)`` alone -- never
     ``head_intermediate_linears(model)`` (e.g. T5's ``dense``). Those
     intermediate layers are never part of any base checkpoint (always a
     fresh random draw at model-build time), but for ``steer_text`` they are
@@ -376,7 +388,6 @@ def train_linear_probe_head(
     original_requires_grad = {n: p.requires_grad for n, p in model.named_parameters()}
     for p in model.parameters():
         p.requires_grad_(False)
-    final_linear.reset_parameters()
     for p in head_params:
         p.requires_grad_(True)
 
