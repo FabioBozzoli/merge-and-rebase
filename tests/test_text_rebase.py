@@ -647,24 +647,32 @@ def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
     loaders = _text_loaders(n=12, seed=0)  # classes=2 default -> head_class_ids [0, 2]
 
     original_backbone = {n: p.clone() for n, p in model.named_parameters() if "classification_head" not in n}
-    original_head = {n: p.clone() for n, p in model.named_parameters() if "classification_head" in n}
+    original_dense = {n: p.clone() for n, p in model.named_parameters() if "classification_head.dense" in n}
+    original_out_proj = {n: p.clone() for n, p in model.named_parameters() if "classification_head.out_proj" in n}
 
     trained = train_linear_probe_head(
         model, loaders.train, device="cpu", mask_class=loaders.mask_class, lr=0.05, steps=50
     )
 
-    # Backbone must stay untouched -- only the head is ever trained.
+    # Backbone must stay untouched -- only the head's final linear is ever trained.
     for n, p in model.named_parameters():
         if "classification_head" not in n:
             assert torch.equal(p, original_backbone[n])
-    # The head must actually have moved from its (fresh, reset) starting point.
-    assert any(not torch.equal(p, original_head[n]) for n, p in model.named_parameters() if n in original_head)
+    # T5's intermediate layer (dense) must ALSO stay untouched: steer_text's cached
+    # features/correction are fit against that exact draw, so resetting it here
+    # would invalidate them (see the function's docstring).
+    for n, p in model.named_parameters():
+        if n in original_dense:
+            assert torch.equal(p, original_dense[n])
+    # out_proj (the actual linear probe) must have moved from its (fresh, reset)
+    # starting point.
+    assert any(not torch.equal(p, original_out_proj[n]) for n, p in model.named_parameters() if n in original_out_proj)
     # requires_grad is restored to its pre-call state (a fresh model: all True).
     assert all(p.requires_grad for p in model.parameters())
-    # Returned dict has exactly the head's own qualified parameter names/shapes.
-    head_named = {n: p for n, p in model.named_parameters() if "classification_head" in n}
-    assert set(trained) == set(head_named)
-    for n, p in head_named.items():
+    # Returned dict contains exactly out_proj's own qualified parameter names/shapes
+    # -- NOT dense, which was never touched.
+    assert set(trained) == set(original_out_proj)
+    for n, p in original_out_proj.items():
         assert trained[n].shape == p.shape
 
     # It should have actually fit the tiny few-shot set (near-perfect train accuracy).

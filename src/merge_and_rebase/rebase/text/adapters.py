@@ -239,13 +239,26 @@ def train_linear_probe_head(
     lr: float = 1e-2,
     steps: int = 200,
 ) -> dict[str, torch.Tensor]:
-    """Fit the classification head from scratch on a tiny (few-shot) ``loader``.
+    """Fit *only* the final classification ``nn.Linear`` from scratch, on a
+    tiny (few-shot) ``loader``.
 
-    Resets every ``nn.Linear`` under the head root (both the intermediate
-    layers like T5's ``dense`` and the final one) to a fresh random init, then
-    trains only those parameters by full-batch Adam -- the backbone (already
-    loaded by the caller with whatever weights the rebasin step produced, e.g.
-    a transported delta or a steer correction hook) stays frozen throughout.
+    This resets and trains ``head_linear(model)`` alone -- never
+    ``head_intermediate_linears(model)`` (e.g. T5's ``dense``). Those
+    intermediate layers are never part of any base checkpoint (always a
+    fresh random draw at model-build time), but for ``steer_text`` they are
+    also baked into whatever state ``prepare()`` already fit against: its
+    cached pooled features and returned ``correction_fn`` are computed from
+    *that exact* ``dense`` draw. Resetting ``dense`` here would silently
+    invalidate that fit -- the live forward pass would feed the correction
+    into a *different* post-``dense`` feature space than the one it was
+    fit on, turning a real correction into noise, and the probe would start
+    from a scrambled feature space instead of the one steer already
+    corrected. ``theseus``/``bico`` are unaffected either way (they never
+    transport head params, so ``dense`` stays at the model's own single
+    persistent draw throughout regardless). The backbone (already loaded by
+    the caller with whatever weights the rebasin step produced, e.g. a
+    transported delta or a steer correction hook) stays frozen throughout,
+    same as every other non-head layer.
 
     ``loader`` is expected to be small enough to fit in memory at once (the
     same few-shot support set used for the rebasin transport itself); this
@@ -253,12 +266,13 @@ def train_linear_probe_head(
 
     Returns a ``{qualified_param_name: tensor}`` dict in the same shape
     ``scripts/build_nearest_mean_head.py`` writes to disk, so callers can drop
-    it straight into ``target_task_heads[task]``.
+    it straight into ``target_task_heads[task]`` -- note it only contains the
+    final linear's own weight/bias, not the (untouched) intermediate layers.
     """
-    _, linears = _head_root_and_linears(model)
-    head_params = [p for _, m in linears for p in m.parameters()]
+    head_name, final_linear = head_linear(model)
+    head_params = list(final_linear.parameters())
     if not head_params:
-        raise ValueError("Classification head has no trainable parameters.")
+        raise ValueError("Classification head's final linear has no trainable parameters.")
 
     batches = list(loader)
     if not batches:
@@ -267,10 +281,9 @@ def train_linear_probe_head(
     original_requires_grad = {n: p.requires_grad for n, p in model.named_parameters()}
     for p in model.parameters():
         p.requires_grad_(False)
-    for _, m in linears:
-        m.reset_parameters()
-        for p in m.parameters():
-            p.requires_grad_(True)
+    final_linear.reset_parameters()
+    for p in head_params:
+        p.requires_grad_(True)
 
     mask = None if mask_class is None else torch.as_tensor([int(x) for x in mask_class], dtype=torch.long)
     remap = None if mask is None else {int(c): i for i, c in enumerate(mask.tolist())}
@@ -302,7 +315,7 @@ def train_linear_probe_head(
         for n, p in model.named_parameters():
             p.requires_grad_(original_requires_grad[n])
 
-    return {f"{qn}.{pn}": p.detach().cpu().clone() for qn, m in linears for pn, p in m.named_parameters()}
+    return {f"{head_name}.{pn}": p.detach().cpu().clone() for pn, p in final_linear.named_parameters()}
 
 
 def text_param_filter(*, exclude_head: bool = True):

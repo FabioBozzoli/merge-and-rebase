@@ -198,12 +198,19 @@ one full pass over the tiny few-shot support set, since training is full-batch) 
 Mechanically: for `theseus`/`bico`, the backbone is loaded as `target_base + alpha *
 transported_delta` (the same state the eval loop would score); for `steer_text` (which
 never writes weights) it's the plain target base under `steer_text_correction_context`.
-Only the head's own parameters get gradients (`rebase/text/adapters.py`'s
-`train_linear_probe_head`, full-batch Adam, backbone frozen); the trained head is then
-stored exactly like a `target_task_heads` file would be, so the rest of the pipeline
-(the alpha sweep's per-call head re-injection) is unaware anything changed. One
-consequence specific to `steer_text`: Stage 1 reads `w_b` off B's live head at
-`prepare()` time, which under this mode is still the untrained random init, not a real
+Only the classification head's *final* linear layer gets gradients
+(`rebase/text/adapters.py`'s `train_linear_probe_head`, full-batch Adam, backbone
+frozen) -- intermediate head layers like T5's `dense` are reset once at model-build
+time and then left untouched forever, never retrained here. That's deliberate, not an
+oversight: for `steer_text`, `dense`'s draw is baked into the cached pooled features and
+the `correction_fn` `prepare()` already fit; retraining it would silently invalidate
+both (the live forward pass would feed the correction into a different post-`dense`
+space than the one it was fit on), so the probe would no longer start from the
+corrected feature space at all. The trained final layer is then stored exactly like a
+`target_task_heads` file would be, so the rest of the pipeline (the alpha sweep's
+per-call head re-injection) is unaware anything changed. One consequence specific to
+`steer_text`: Stage 1 reads `w_b` off B's live head at `prepare()` time, which under
+this mode is still the untrained random init, not a real
 head — rebasin happens first, the probe only fits afterward.
 
 See `configs/text_rebase_t5base_t5large_theseus_linearprobe.json`,
