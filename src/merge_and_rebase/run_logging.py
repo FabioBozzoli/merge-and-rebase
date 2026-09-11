@@ -93,7 +93,11 @@ def _config_for_display(metadata: dict[str, Any]) -> dict[str, Any]:
     cfg = metadata.get("resolved_config", metadata)
     if not isinstance(cfg, dict):
         cfg = {"value": cfg}
-    out = dict(cfg)
+    # Keys starting with "_" are the config files' own documentation
+    # (``_comment``, ``_source_head``, ...), several paragraphs long and of no
+    # use at runtime. Display only -- the full config still reaches the summary
+    # JSON and the loggers through ``metadata``.
+    out = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
     if metadata.get("config_path") is not None and "config" not in out:
         out["config"] = metadata["config_path"]
     if metadata.get("summary_path") is not None and "summary" not in out:
