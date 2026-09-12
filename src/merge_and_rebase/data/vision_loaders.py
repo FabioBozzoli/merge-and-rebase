@@ -15,6 +15,8 @@ from datasets import load_dataset as hf_load_dataset
 from PIL import ImageFile
 from torch.utils.data import DataLoader, Dataset
 
+from .svhn_preprocess import maybe_svhn_transforms
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 LabelRemap = dict[int, int] | Sequence[int] | np.ndarray | Callable[[int], int] | None
@@ -429,6 +431,7 @@ def build_vision_loaders(
     if hf_path == "tanganke/emnist_mnist":
         eval_preprocess = emnist_fix_transform(eval_preprocess)
         train_transform = emnist_fix_transform(train_transform)
+    train_transform, eval_preprocess = maybe_svhn_transforms(hf_path, train_transform, eval_preprocess)
 
     # Wrap with torch datasets
     train_ds = HFVisionDataset(
