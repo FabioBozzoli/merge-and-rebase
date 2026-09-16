@@ -15,7 +15,7 @@
     "mlp_hidden_dim": 1024,
     "mlp_epochs": 100,
     "few_shot": 2,
-    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/features/nonlinear_feature",
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase-new/features/nonlinear_feature/",
     "force_recompute_features": false,
     "seed": 42
   },
@@ -34,7 +34,7 @@
   "tuned_ckpts": {
     "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt",
     "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/resisc45/best.pt",
-    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/svhn/best.pt",
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt",
     "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/dtd/best.pt",
     "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/mnist/best.pt",
     "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt",

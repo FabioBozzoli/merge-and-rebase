@@ -16,7 +16,7 @@
     "mlp_hidden_dim": 1024,
     "mlp_epochs": 100,
     "few_shot": 2,
-    "feature_cache_dir": "/work/tesi_bcalderara/merge-and-rebase/linear_feature",
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/features/linear_feature",
     "force_recompute_features": false,
     "seed": 42
   },
