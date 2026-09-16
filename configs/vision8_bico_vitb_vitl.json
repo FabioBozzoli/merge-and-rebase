@@ -3,8 +3,8 @@
   "tasks": "all",
   "source_clip_model": "ViT-B-16",
   "source_clip_pretrained": "datacomp_xl_s13b_b90k",
-  "target_clip_model": "ViT-B-16",
-  "target_clip_pretrained": "laion2b_s34b_b88k",
+  "target_clip_model": "ViT-L-14",
+  "target_clip_pretrained": "datacomp_xl_s13b_b90k",
   "method": "bico",
   "method_params": {
     "num_batches": 5,

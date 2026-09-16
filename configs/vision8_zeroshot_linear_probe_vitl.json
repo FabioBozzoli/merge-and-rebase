@@ -7,8 +7,8 @@
   "suite": "vision8",
   "tasks": "EuroSAT",
 
-  "clip_model": "ViT-B-16",
-  "clip_pretrained": "laion2b_s34b_b88k",
+  "clip_model": "ViT-L-14",
+  "clip_pretrained": "datacomp_xl_s13b_b90k",
 
   "linear_probe_shots_per_class": 1,
   "linear_probe_epochs": 20,
