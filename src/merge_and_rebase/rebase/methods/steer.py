@@ -557,7 +557,7 @@ def _collect_standard_split(
     for (x_a, y_a), (x_b, _y_b) in zip(_iter_batches(source_loader, device=device), _iter_batches(target_loader, device=device), strict=True):
         f_a_ft = _l2_normalize(clf_source_finetuned_visual(x_a))
         f_a_pre = _l2_normalize(clf_source_pretrained_visual(x_a))
-        features_a.append(f_a_ft.cpu())
+        features_a.append(f_a_pre.cpu())
         delta_a.append((f_a_ft - f_a_pre).cpu())
         features_b.append(_l2_normalize(target_visual(x_b)).cpu())
         labels.append(y_a.cpu())

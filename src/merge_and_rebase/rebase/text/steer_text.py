@@ -288,7 +288,7 @@ def _collect_standard_split(
         for batch_a, batch_b in _iter_paired(source_loader, target_loader):
             f_a_ft = _pooled_features(source_finetuned, batch_a, device)
             f_a_pre = _pooled_features(source_pretrained, batch_a, device)
-            features_a.append(f_a_ft.cpu())
+            features_a.append(f_a_pre.cpu())
             delta_a.append((f_a_ft - f_a_pre).cpu())
             features_b.append(_pooled_features(target, batch_b, device).cpu())
             labels.append(batch_a["labels"].cpu())
