@@ -43,6 +43,6 @@
     "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/mnist/best.pt",
     "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/resisc45/best.pt",
     "SUN397": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/sun397/best.pt",
-    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt"
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full_best_ep.pt"
   }
 }
