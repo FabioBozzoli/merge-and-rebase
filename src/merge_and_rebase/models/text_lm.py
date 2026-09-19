@@ -12,13 +12,19 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 
+# Architectures whose encoder stack model_kind="encoder_classification" can build.
+# Checked against config.model_type so that an already-converted encoder-only
+# directory (which reports is_encoder_decoder=False) is still recognised.
+_T5_FAMILY_MODEL_TYPES = frozenset({"t5", "mt5", "umt5", "longt5"})
+
+
 @dataclass(frozen=True)
 class TextBuildConfig:
     model_name_or_path: str
     model_arch: str = "auto"  # "llama" | "t5" | "auto"
     device: str = "cuda"
     dtype: str | None = None  # "fp16" | "bf16" | "fp32" | None
-    model_kind: str = "causal_lm"  # "causal_lm" | "sequence_classification"
+    model_kind: str = "causal_lm"  # "causal_lm" | "sequence_classification" | "encoder_classification"
     num_labels: int = 3
     trust_remote_code: bool = False
     use_fast_tokenizer: bool = True
@@ -106,8 +112,39 @@ class TextLM(nn.Module):
                 **common,
                 num_labels=int(cfg.num_labels),
             )
+        elif kind == "encoder_classification":
+            # Imported inside the branch on purpose. Importing `rebase.text`
+            # registers `steer_text` in the rebase registry as a side effect,
+            # and `rebase/methods/__init__.py` deliberately leaves that package
+            # out so only eval/text_rebase.py triggers it. A module-level import
+            # here would make every `models.text_lm` import register rebase
+            # methods -- including on the vision paths, which never want them.
+            from ..rebase.text.encoder_classifier import T5EncoderForSequenceClassification
+
+            # Gate on the model family, not on config.is_encoder_decoder: a
+            # checkpoint already converted by scripts/convert_t5_encoder_ckpt.py
+            # is a T5 encoder with no decoder, so it reports is_encoder_decoder
+            # False and would fail that test despite being exactly what this
+            # kind is for.
+            model_type = str(getattr(hf_cfg, "model_type", "")).lower()
+            if model_type not in _T5_FAMILY_MODEL_TYPES:
+                raise ValueError(
+                    f"model_kind='encoder_classification' builds a T5 encoder stack, but "
+                    f"'{cfg.model_name_or_path}' has model_type='{model_type}'. Supported: "
+                    f"{sorted(_T5_FAMILY_MODEL_TYPES)}. Use model_kind='sequence_classification' "
+                    "for other architectures."
+                )
+            # A Hub id and a local converted directory are the same call here:
+            # from_pretrained accepts either, so converted checkpoints need no
+            # separate code path.
+            model = T5EncoderForSequenceClassification.from_pretrained(
+                **common,
+                num_labels=int(cfg.num_labels),
+            )
         else:
-            raise ValueError("model_kind must be one of: causal_lm, sequence_classification")
+            raise ValueError(
+                "model_kind must be one of: causal_lm, sequence_classification, encoder_classification"
+            )
 
         # Sequence-classification forward with batch_size > 1 requires pad_token_id.
         if getattr(model.config, "pad_token_id", None) is None:

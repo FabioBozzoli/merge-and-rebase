@@ -152,6 +152,7 @@ def build_head(
     trust_remote_code: bool,
     use_fast_tokenizer: bool,
     batch_size: int = 16,
+    model_kind: str = "sequence_classification",
 ) -> tuple[dict[str, torch.Tensor], dict[str, object], TextLM]:
     torch.manual_seed(seed)
 
@@ -160,7 +161,7 @@ def build_head(
         model_arch=model_arch,
         device=device,
         dtype=dtype,
-        model_kind="sequence_classification",
+        model_kind=model_kind,
         num_labels=num_labels,
         trust_remote_code=trust_remote_code,
         use_fast_tokenizer=use_fast_tokenizer,
@@ -213,11 +214,23 @@ def build_head(
 
     normed = torch.nn.functional.normalize(features, dim=-1)
     _diagnose_pooled_features(normed, labels)
+    # ``labels`` are head-space ids, not local 0..K-1 ones: a task with fewer
+    # classes than the shared head is placed at its head_class_ids (qnli/rte ->
+    # [0, 2], scitail -> [0, 1]), so the rows in between are *expected* to be
+    # empty. Leave those at zero -- a zero row contributes a constant logit of 0
+    # and mask_class restricts the argmax to the task's own classes at eval, so
+    # it never participates. Only a class the task actually uses may not be
+    # missing.
     centroids = torch.zeros(num_labels, features.shape[-1], dtype=torch.float64)
     for class_id in range(num_labels):
         rows = normed[labels == class_id]
         if rows.shape[0] == 0:
-            raise ValueError(f"No support examples ended up in class {class_id} after tokenization.")
+            if class_id in head_class_ids:
+                raise ValueError(
+                    f"No support examples ended up in class {class_id} after tokenization, but "
+                    f"task '{task}' uses it (head_class_ids={head_class_ids})."
+                )
+            continue
         centroids[class_id] = torch.nn.functional.normalize(rows.mean(dim=0), dim=-1)
 
     head_name, head_module = head_linear(llm.model)
@@ -233,6 +246,10 @@ def build_head(
     meta = {
         "model_name_or_path": model_name_or_path,
         "model_arch": model_arch,
+        # The centroids live in this kind's pooled-feature space and are
+        # meaningless in another's; recorded so a head file can be checked
+        # against the run that injects it.
+        "model_kind": model_kind,
         "task": task,
         "few_shot": few_shot,
         "seed": seed,
@@ -277,10 +294,21 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-name-or-path", type=str, required=True, help="The model whose pooled features define the centroids (usually the target base model B).")
     p.add_argument("--model-arch", type=str, default="auto", choices=["llama", "t5", "auto"])
+    p.add_argument(
+        "--model-kind",
+        type=str,
+        default="sequence_classification",
+        choices=["sequence_classification", "encoder_classification"],
+        help="Which wrapper defines the pooled feature the centroids are built from. "
+        "'encoder_classification' pools the T5 encoder's token features; "
+        "'sequence_classification' uses the architecture's own rule (T5: the decoder's eos "
+        "position). The two produce different features, so a head built under one kind is not "
+        "valid under the other -- it must match the model_kind of the run that will inject it.",
+    )
     p.add_argument("--task", type=str, required=True, help="One of the nli6 tasks (snli, mnli, sick, qnli, rte, scitail).")
     p.add_argument("--few-shot", type=int, required=True, help="Support examples per class used to build each centroid.")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num-labels", type=int, default=3, help="Head width; must match the model_kind='sequence_classification' build used at eval time.")
+    p.add_argument("--num-labels", type=int, default=3, help="Head width; must match the num_labels of the build used at eval time.")
     p.add_argument("--max-length", type=int, default=256)
     p.add_argument("--max-candidates", type=int, default=20000, help="Cap on train rows loaded before balanced sampling (0 = no cap).")
     p.add_argument("--batch-size", type=int, default=16, help="Forward-pass batch size for feature extraction and the sanity-check eval; lower this if you hit CUDA OOM with a large --few-shot.")
@@ -306,6 +334,7 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         use_fast_tokenizer=not args.no_fast_tokenizer,
         batch_size=args.batch_size,
+        model_kind=str(args.model_kind).strip().lower(),
     )
 
     out_path = Path(args.output)

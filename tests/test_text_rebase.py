@@ -190,21 +190,53 @@ def test_build_nli_tokenized_loader_applies_a_single_string_template() -> None:
     assert texts == ["premise: a cat sits hypothesis: an animal rests"]
 
 
-def test_is_hub_model_reference_distinguishes_hub_ids_from_local_paths(tmp_path) -> None:
+def test_is_full_model_reference_distinguishes_whole_models_from_delta_files(tmp_path) -> None:
     # A full HF Hub checkpoint (e.g. varun-v-rao/t5-base-snli): no local file,
     # has a slash, no weight-file extension.
-    assert text_rebase._is_hub_model_reference("varun-v-rao/t5-base-snli")
+    assert text_rebase._is_full_model_reference("varun-v-rao/t5-base-snli")
     # A local delta file living alongside a shared base -- even one that
-    # happens to contain a slash in its path -- is never a Hub reference.
+    # happens to contain a slash in its path -- is never a full model.
     local = tmp_path / "sub" / "full_best_ep.pt"
     local.parent.mkdir()
     local.write_bytes(b"not a real checkpoint, just needs to exist")
-    assert not text_rebase._is_hub_model_reference(str(local))
+    assert not text_rebase._is_full_model_reference(str(local))
     # A hub-style path string that ends in a weight extension is a filename,
     # not a bare repo id, even though it wasn't found on disk.
-    assert not text_rebase._is_hub_model_reference("someorg/somerepo/full_best_ep.pt")
+    assert not text_rebase._is_full_model_reference("someorg/somerepo/full_best_ep.pt")
     # No slash at all: neither shape.
-    assert not text_rebase._is_hub_model_reference("full_best_ep.pt")
+    assert not text_rebase._is_full_model_reference("full_best_ep.pt")
+
+
+def test_is_full_model_reference_accepts_a_local_transformers_directory(tmp_path) -> None:
+    """A converted checkpoint directory must take the full-model path.
+
+    Before this, an existing path short-circuited to False and the directory
+    was handed to ``torch.load``, which cannot read one.
+    """
+    converted = tmp_path / "converted"
+    converted.mkdir()
+    (converted / "model.safetensors").write_bytes(b"weights")
+    # No config.json yet: an ordinary directory of files is not a model.
+    assert not text_rebase._is_full_model_reference(str(converted))
+
+    (converted / "config.json").write_text('{"model_type": "t5"}')
+    assert text_rebase._is_full_model_reference(str(converted))
+
+
+def test_model_tag_separates_cache_namespaces_by_model_kind() -> None:
+    """steer_text's feature cache is keyed by the tags alone, and the two kinds
+    pool different things under identical base ids."""
+    from merge_and_rebase.models.text_lm import TextBuildConfig
+
+    def tag(kind: str) -> str:
+        return text_rebase._model_tag(
+            TextBuildConfig(model_name_or_path="google/t5-v1_1-base", model_kind=kind)
+        )
+
+    # The historical default keeps its path, so existing caches stay valid.
+    assert tag("sequence_classification") == "google__t5-v1_1-base"
+    assert tag("encoder_classification") != tag("sequence_classification")
+    assert "encoder_classification" in tag("encoder_classification")
 
 
 # --------------------------------------------------------------------------

@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from copy import deepcopy
@@ -343,7 +344,7 @@ def _evaluate_source_finetuned(
     """
     out: dict[str, Any] = {"task": task, "split": split}
     recorded: dict[str, Any] = {}
-    if ckpt_path is not None and _is_hub_model_reference(ckpt_path):
+    if ckpt_path is not None and _is_full_model_reference(ckpt_path):
         print(f"  [A checkpoint] '{ckpt_path}' is a full HF Hub model, not a local checkpoint file -- no training metadata to read.")
     elif ckpt_path is not None:
         recorded = _checkpoint_training_metadata(ckpt_path)
@@ -417,17 +418,31 @@ def _evaluate_source_finetuned(
     return out
 
 
-def _is_hub_model_reference(ref: str) -> bool:
-    """Whether ``ref`` names a full HF Hub model repo rather than a local checkpoint file.
+# Model kinds that expose a linear classification head, i.e. the ones
+# eval_mode="head_logits" (and therefore steer_text) can score. Both pool a
+# sentence into one feature vector and read it out with a single nn.Linear;
+# they differ only in where that pooled feature comes from.
+_HEAD_MODEL_KINDS = frozenset({"sequence_classification", "encoder_classification"})
 
-    Distinguishes ``varun-v-rao/t5-base-snli`` (a complete, already fine-tuned
-    ``AutoModelForSequenceClassification`` checkpoint, loadable on its own via
-    ``from_pretrained``) from a local ``.pt``/``.bin`` file holding a task
-    delta relative to a shared local base. Anything that exists on disk is a
-    local file, never a Hub reference, even if its name happens to contain a
-    slash.
+
+def _is_full_model_reference(ref: str) -> bool:
+    """Whether ``ref`` names a complete model loadable by ``from_pretrained``.
+
+    Distinguishes a whole fine-tuned model -- either an HF Hub repo such as
+    ``varun-v-rao/t5-base-snli``, or a **local transformers directory** such as
+    one written by ``scripts/convert_t5_encoder_ckpt.py`` -- from a local
+    ``.pt``/``.bin`` file holding a task delta relative to a shared local base.
+
+    A local directory counts as a full model only when it actually carries a
+    ``config.json``: that is what ``from_pretrained`` needs, and requiring it
+    keeps an ordinary directory of checkpoint files from being mistaken for a
+    model. Any other path that exists on disk is a local checkpoint file, never
+    a Hub reference, even if its name happens to contain a slash.
     """
-    if Path(ref).exists():
+    path = Path(ref)
+    if path.is_dir():
+        return (path / "config.json").is_file()
+    if path.exists():
         return False
     return "/" in ref and not ref.lower().endswith((".pt", ".bin", ".safetensors", ".ckpt", ".pth"))
 
@@ -443,21 +458,23 @@ def _load_tuned_source_state_dict(
 
     Two shapes of ``tuned_ckpts`` entry are supported: a local file (the
     existing convention -- a delta-shaped checkpoint alongside a shared local
-    base, read with ``load_ckpt``), or a bare HF Hub model id, which is loaded
-    as a complete, already fine-tuned ``AutoModelForSequenceClassification``/
-    ``AutoModelForSeq2SeqLM`` in its own right (e.g. a community checkpoint
-    such as ``varun-v-rao/t5-base-snli``) -- there is no local delta file for
-    these at all, the Hub repo *is* the fine-tuned model.
+    base, read with ``load_ckpt``), or a **complete fine-tuned model**, which is
+    built in its own right and reduced to its state dict. The latter covers both
+    a bare HF Hub id (e.g. ``varun-v-rao/t5-base-snli``) and a local
+    transformers directory, such as one written by
+    ``scripts/convert_t5_encoder_ckpt.py`` -- ``from_pretrained`` treats the two
+    identically, so they need no separate code path.
 
-    For the Hub case, ``source_model_name_or_path`` in the config must be the
-    actual pretrained base that checkpoint was fine-tuned from (tokenizer
+    For the full-model case, ``source_model_name_or_path`` in the config must be
+    the actual pretrained base that checkpoint was fine-tuned from (tokenizer
     vocab size and architecture must match, or key alignment below silently
-    drops every mismatched tensor) -- this function has no way to verify that
-    against the Hub repo's own model card, so a task_delta computed from a
-    wrong guess is a silent correctness risk, not just a missed transport.
+    drops every mismatched tensor) -- this function has no way to verify that,
+    so a task_delta computed from a wrong guess is a silent correctness risk,
+    not just a missed transport.
     """
-    if _is_hub_model_reference(ref):
-        print(f"  Loading '{ref}' as a full HF Hub sequence-classification checkpoint (not a local delta file).")
+    if _is_full_model_reference(ref):
+        kind_label = "local model directory" if Path(ref).is_dir() else "HF Hub model"
+        print(f"  Loading '{ref}' as a complete fine-tuned model ({kind_label}), not a local delta file.")
         hub_cfg = TextBuildConfig(
             model_name_or_path=ref,
             model_arch=source_cfg.model_arch,
@@ -497,8 +514,52 @@ def _build_llm(cfg: dict[str, Any], *, role: str, model_kind: str, device: str) 
     return TextLM.build(build_cfg), build_cfg
 
 
+def _is_jsonable(value: Any) -> bool:
+    """Whether ``value`` survives a round trip through JSON."""
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _artifacts_to_cpu(obj: Any) -> Any:
+    """Recursively move tensors to CPU so a saved artifact loads without a GPU.
+
+    ``steer_text.prepare`` hands back references to the live fitted objects (the
+    same ones ``correction_fn`` closes over), so this detaches and copies rather
+    than moving in place -- mutating them would change the correction that the
+    eval hook is about to apply.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu")
+    if isinstance(obj, dict):
+        return {k: _artifacts_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_artifacts_to_cpu(v) for v in obj]
+    return obj
+
+
 def _model_tag(build_cfg: TextBuildConfig) -> str:
-    return str(build_cfg.model_name_or_path).replace("/", "__")
+    """The cache namespace for one side of the transfer.
+
+    ``steer_text``'s on-disk feature cache is keyed by
+    ``(source_tag, target_tag, task, regime, split)`` and nothing else, so two
+    runs over the same base ids share a directory. That is wrong across model
+    kinds: ``encoder_classification`` pools the encoder's token features, while
+    ``sequence_classification`` pools the decoder's eos position, and the two
+    live in different spaces under identical base ids. Without the kind in the
+    key a stale cache silently feeds one run the other's features.
+
+    The historical default is left unsuffixed so caches written before this
+    existed keep their paths. Only ``steer_text`` consumes these tags, and it
+    requires a head-bearing kind, so no other run type has a cache to invalidate.
+    """
+    tag = str(build_cfg.model_name_or_path).replace("/", "__")
+    kind = str(build_cfg.model_kind).strip().lower()
+    if kind and kind != "sequence_classification":
+        tag = f"{tag}__{kind}"
+    return tag
 
 
 def main() -> None:
@@ -557,6 +618,14 @@ def main() -> None:
         p.add_argument("--alpha-patience", type=int, default=None)
         p.add_argument("--alpha-search-split", type=str, default=None, choices=["val", "test"])
         p.add_argument("--save-transported-tvs-dir", type=str, default=None)
+        p.add_argument(
+            "--save-steer-artifacts-dir",
+            type=str,
+            default=None,
+            help="Where to write steer_text's fitted Stage 1/Stage 2 transforms, one .pt per task. "
+            "steer_text produces no weight delta, so --save-transported-tvs-dir has nothing to write "
+            "for it; this is the equivalent for what it does produce.",
+        )
         p.add_argument(
             "--eval-source-finetuned",
             action=argparse.BooleanOptionalAction,
@@ -635,6 +704,7 @@ def main() -> None:
             "alpha_step": args.alpha_step,
             "alpha": args.alpha,
             "save_transported_tvs_dir": args.save_transported_tvs_dir,
+            "save_steer_artifacts_dir": args.save_steer_artifacts_dir,
             "eval_source_finetuned": args.eval_source_finetuned,
             "source_input_template": args.source_input_template,
             "target_input_template": args.target_input_template,
@@ -743,15 +813,21 @@ def main() -> None:
         linear_probe_log_every = int(linear_probe_log_every) if linear_probe_log_every is not None else None
 
         if eval_mode == "head_logits":
-            if model_kind != "sequence_classification":
-                raise ValueError("eval_mode='head_logits' requires model_kind='sequence_classification'.")
+            if model_kind not in _HEAD_MODEL_KINDS:
+                raise ValueError(
+                    f"eval_mode='head_logits' requires model_kind in {sorted(_HEAD_MODEL_KINDS)}, "
+                    f"got '{model_kind}'."
+                )
             if target_task_heads_path is None and not linear_probe_head:
                 raise ValueError(
                     "eval_mode='head_logits' requires config['target_task_heads'] (or 'task_heads'), unless "
                     "'linear_probe_head' is set."
                 )
-        elif model_kind == "sequence_classification":
-            raise ValueError("eval_mode='prompt' requires model_kind='causal_lm' (there is no head to score).")
+        elif model_kind in _HEAD_MODEL_KINDS:
+            raise ValueError(
+                f"eval_mode='prompt' requires model_kind='causal_lm'; '{model_kind}' has a "
+                "classification head and no decoder to score continuations with."
+            )
         if linear_probe_head and eval_mode != "head_logits":
             raise ValueError(
                 "linear_probe_head trains a classification head, so it requires eval_mode='head_logits' "
@@ -1153,6 +1229,28 @@ def main() -> None:
                     **steer_params,
                 )
                 steer_prepared_by_task[task] = prepared
+                save_steer_dir = cfg.get("save_steer_artifacts_dir", None)
+                if save_steer_dir:
+                    # steer_text never produces a weight delta, so the
+                    # save_transported_tvs_dir path below has nothing to write for
+                    # it. These are what it does produce: the Stage 1 logit map
+                    # and the fitted Stage 2 transform, moved to CPU so the file
+                    # loads without a GPU.
+                    os.makedirs(save_steer_dir, exist_ok=True)
+                    steer_path = os.path.join(save_steer_dir, f"{task}_steer_artifacts.pt")
+                    payload = {
+                        "task": task,
+                        "method_params": {k: v for k, v in method_params.items() if _is_jsonable(v)},
+                        "source_model": str(source_cfg.model_name_or_path),
+                        "target_model": str(target_cfg.model_name_or_path),
+                        "model_kind": model_kind,
+                        "head_class_ids": list(head_class_ids),
+                        "diagnostics": dict(prepared.get("diagnostics", {})),
+                        **_artifacts_to_cpu(prepared.get("artifacts", {})),
+                    }
+                    torch.save(payload, steer_path)
+                    print(f"  {task}: saved steer_text stage1/stage2 transforms -> {steer_path}")
+                    transported_artifacts.setdefault(task, []).append(steer_path)
             else:
                 prepared = None
 

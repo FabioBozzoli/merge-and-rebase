@@ -69,6 +69,7 @@ from ..methods.steer import (
 )
 from ..registry import register
 from .adapters import head_linear
+from .encoder_classifier import masked_mean
 
 # Matched with ``search`` against ``name + "."`` and anchored on a preceding dot
 # or the string start, so a task-head wrapper's prefix does not hide the stack:
@@ -214,14 +215,11 @@ def _pooled_features(model: nn.Module, batch: Mapping[str, torch.Tensor], device
     return out.logits
 
 
-def _masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
-    """Mean-pool ``[B, T, D]`` over real tokens. Text twin of ``steer._pool_block_output``."""
-    if hidden.ndim != 3:
-        return hidden
-    if attention_mask is None:
-        return hidden.mean(dim=1)
-    mask = attention_mask.to(dtype=hidden.dtype, device=hidden.device).unsqueeze(-1)
-    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+# Mean-pool ``[B, T, D]`` over real tokens; text twin of ``steer._pool_block_output``.
+# Defined in encoder_classifier.py rather than here so that T5EncoderForSequenceClassification's
+# pooled "CLS" feature and the per-block activations captured below are pooled by the *same*
+# function, not by two copies that could drift apart.
+_masked_mean = masked_mean
 
 
 class _TextBlockCapture:
@@ -599,6 +597,7 @@ class SteerTextRebase:
 
         if stage_2_strategy == "global_ridge":
             coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
+            stage2_state = {"kind": "global_ridge", "coefficient": coefficient}
 
             def correction_fn(activations: Mapping[str, Any], *, _coef=coefficient) -> torch.Tensor:
                 global_act = activations["global"]
@@ -613,6 +612,14 @@ class SteerTextRebase:
                 epochs=int(mlp_epochs),
                 hidden_dim=int(mlp_hidden_dim),
             ).to(dev)
+            stage2_state = {
+                "kind": "global_mlp",
+                "state_dict": model.state_dict(),
+                "input_dim": int(f_b.shape[1]),
+                "hidden_dim": int(mlp_hidden_dim),
+                "output_dim": int(train_target.shape[1]),
+                "epochs": int(mlp_epochs),
+            }
 
             def correction_fn(activations: Mapping[str, Any], *, _model=model) -> torch.Tensor:
                 global_act = activations["global"]
@@ -665,6 +672,15 @@ class SteerTextRebase:
                     rho=rho,
                 )
             ]
+            stage2_state = {
+                "kind": "block_ridge",
+                "coefficients": coefficients,
+                "num_target_residual": int(num_target_residual),
+                "num_source_residual_blocks": int(num_source_residual_blocks),
+                "block_group_strategy": str(block_group_strategy),
+                "block_ridge_mode": str(block_ridge_mode),
+                "rho": float(rho),
+            }
 
             def correction_fn(
                 activations: Mapping[str, Any],
@@ -716,6 +732,22 @@ class SteerTextRebase:
             "feature_regime": feature_regime,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
+            # The fitted transforms themselves, so a run can be inspected or
+            # replayed without refitting. ``correction_fn`` closes over the same
+            # Stage 2 object, so these are references, not copies -- consumers
+            # must not mutate them. Everything here is small except
+            # ``stage2_state``: global_ridge's coefficient is ``[d_b, d_b]``.
+            "artifacts": {
+                "stage1_logit_map": logit_map,
+                "stage1_pinv_w_b": p_b,
+                "stage1_lambda": float(stage1_lambda),
+                "ridge_lambda": float(ridge_lambda),
+                "w_a": w_a,
+                "w_b": w_b,
+                "b_b": b_b,
+                "selected": selected,
+                "stage2_state": stage2_state,
+            },
             "diagnostics": {
                 "stage0_test_acc": stage0_test_acc,
                 "stage1_test_acc": stage1_test_acc,
