@@ -469,6 +469,7 @@ class SteerTextRebase:
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
+        block_ridge_lambda_scaling: str = "none",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -484,6 +485,8 @@ class SteerTextRebase:
             raise ValueError("steer_text block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer_text block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
+        if block_ridge_lambda_scaling not in {"none", "trace"}:
+            raise ValueError("steer_text block_ridge_lambda_scaling must be 'none' or 'trace'")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
 
@@ -670,6 +673,7 @@ class SteerTextRebase:
                     regularization=ridge_lambda,
                     mode=block_ridge_mode,
                     rho=rho,
+                    regularization_scaling=block_ridge_lambda_scaling,
                 )
             ]
             stage2_state = {
@@ -680,6 +684,7 @@ class SteerTextRebase:
                 "block_group_strategy": str(block_group_strategy),
                 "block_ridge_mode": str(block_ridge_mode),
                 "rho": float(rho),
+                "lambda_scaling": str(block_ridge_lambda_scaling),
             }
 
             def correction_fn(

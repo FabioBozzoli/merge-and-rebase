@@ -217,6 +217,7 @@ def _fit_block_ridge(
     regularization: float,
     mode: str,
     rho: float = 0.9,
+    regularization_scaling: str = "none",
 ) -> list[torch.Tensor]:
     """
     Fit per-block ridge coefficients, chained with a smoothed-residual carry.
@@ -226,11 +227,21 @@ def _fit_block_ridge(
     coefficients can be applied to *any* new block activations at predict
     time -- this is the split-fit/predict factoring of steer4rebase's
     stage2.block_ridge (which fits and predicts in a single call).
+
+    ``regularization_scaling="trace"`` fits block ``b`` with
+    ``regularization * tr(X_b X_bᵀ) / n``, i.e. relative to the mean eigenvalue
+    of that block's Gram matrix. A single absolute ``regularization`` cannot suit
+    every block when their activation scales differ: t5's un-normalized residual
+    stream grows by orders of magnitude with depth, so ``regularization=1`` is
+    negligible on deep blocks (they interpolate the support) while still biting
+    on the final, layer-normed one.
     """
     if mode not in {"independent", "smoothed_residual"}:
         raise ValueError(f"Unknown steer block_ridge mode: {mode}")
     if mode == "smoothed_residual" and not 0.0 <= rho <= 1.0:
         raise ValueError("steer block_ridge rho must be in [0, 1]")
+    if regularization_scaling not in {"none", "trace"}:
+        raise ValueError(f"Unknown steer block_ridge regularization_scaling: {regularization_scaling}")
 
     num_blocks = train_targets.shape[1]
     state = torch.zeros_like(train_targets[:, 0])
@@ -240,7 +251,10 @@ def _fit_block_ridge(
         local_target = train_targets[:, block_id]
         compensation = rho * state if mode == "smoothed_residual" else torch.zeros_like(state)
         fitted_target = local_target + compensation
-        coefficient = _ridge(x_train, fitted_target, regularization)
+        block_regularization = regularization
+        if regularization_scaling == "trace":
+            block_regularization = regularization * float(x_train.square().sum()) / x_train.shape[0]
+        coefficient = _ridge(x_train, fitted_target, block_regularization)
         coefficients.append(coefficient)
         if mode == "smoothed_residual":
             block_train_prediction = x_train @ coefficient
