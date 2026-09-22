@@ -558,6 +558,182 @@ def test_theseus_and_bico_transport_across_widths(method_name) -> None:
         assert torch.isfinite(value).all()
 
 
+def _tiny_t5_encoder(d_model: int = 32, num_layers: int = 2, seed: int = 0):
+    """The encoder-only classifier the T5 grid actually runs.
+
+    Not the same model as _tiny_t5: no decoder, a single Linear head, and every
+    parameter named `transformer.encoder.block.N...`. That prefix is the whole
+    point -- theseus keys its activation registry by module name and matches it
+    against the delta's keys, so a naming mismatch would silently transport
+    nothing at all.
+    """
+    from transformers import T5Config
+
+    from merge_and_rebase.rebase.text.encoder_classifier import T5EncoderForSequenceClassification
+
+    torch.manual_seed(seed)
+    config = T5Config(
+        vocab_size=VOCAB,
+        d_model=d_model,
+        d_ff=2 * d_model,
+        d_kv=8,
+        num_layers=num_layers,
+        num_heads=2,
+        num_labels=NUM_LABELS,
+        pad_token_id=PAD,
+        eos_token_id=EOS,
+        dropout_rate=0.0,
+    )
+    return T5EncoderForSequenceClassification(config).eval()
+
+
+def _cuda_runs() -> bool:
+    """True only if CUDA kernels actually execute here.
+
+    torch.cuda.is_available() is not enough: a visible device whose compute
+    capability the installed torch has no kernel image for reports True and then
+    raises on the first real op (this cluster's login node exposes exactly that).
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        torch.ones(8, 8, device="cuda").sum().item()
+    except Exception:
+        return False
+    return True
+
+
+def _theseus_transport(source_base, source_tuned, target_base, *, n=16, **params):
+    """prepare() + transport() through the text shim, with everything else fixed."""
+    delta = _delta_between(source_base, source_tuned)
+    target_sd = {k: v.float() for k, v in target_base.state_dict().items()}
+    method = get_method("theseus")
+    prepared = method.prepare(
+        source_model=TextEncoderShim(source_base, PAD),
+        target_model=TextEncoderShim(target_base, PAD),
+        source_dataloader=alias_inputs_loader(_loader(_DictDataset(n, seed=0))),
+        target_dataloader=alias_inputs_loader(_loader(_DictDataset(n, seed=0))),
+        target_base=target_sd,
+        delta=delta,
+        device="cpu",
+        seq_align="interpolate",
+        patch_qkv=False,
+        verbose=False,
+        show_progress=False,
+        **params,
+    )
+    out = method.transport(
+        source_base={k: v.float() for k, v in source_base.state_dict().items()},
+        target_base=target_sd,
+        delta=delta,
+        prepared=prepared,
+        verbose=False,
+        show_progress=False,
+    )
+    return prepared, out, target_sd
+
+
+def test_theseus_transports_an_encoder_classifier() -> None:
+    # model_kind="encoder_classification" had never run through theseus: every
+    # existing config and test uses T5ForSequenceClassification, which has a
+    # decoder and different parameter names.
+    source_base, source_tuned = _tiny_t5_encoder(d_model=32, seed=0), _tiny_t5_encoder(d_model=32, seed=1)
+    target_base = _tiny_t5_encoder(d_model=48, seed=2)
+    _, out, target_sd = _theseus_transport(source_base, source_tuned, target_base, num_batches=4)
+
+    for key, value in out.items():
+        assert value.shape == target_sd[key].shape, key
+        assert torch.isfinite(value).all(), key
+
+    # The assertion that matters. _apply_transforms_to_visual_delta writes a zero
+    # tensor for any key it could not transport -- a shape mismatch, a missing
+    # transform, a device mismatch -- and only logs a warning. "transport produced
+    # keys" is therefore satisfied just as well by transporting nothing, so the
+    # encoder blocks have to be checked for actual content.
+    blocks = [
+        k
+        for k in out
+        if ".encoder.block." in k and out[k].ndim == 2 and "relative_attention_bias" not in k
+    ]
+    assert blocks, "no encoder block matrices in the transported delta"
+    dead = [k for k in blocks if not out[k].any()]
+    assert not dead, f"encoder blocks transported as all-zero: {dead[:5]}"
+
+    # Embeddings are the deliberate exception, and there are two of them. adapters'
+    # runtime patch skips nn.Embedding when registering hooks, because T5's
+    # relative-position bias captures a tensor whose last dimension is the batch's
+    # token count rather than a hidden size, which breaks the cross-batch covariance
+    # accumulation outright. Both therefore get no transform and are zeroed on
+    # purpose -- note relative_attention_bias is 2-D and lives under .encoder.block.,
+    # so it looks exactly like a weight matrix that failed to transport.
+    zeroed = ["transformer.shared.weight"]
+    zeroed += [k for k in out if "relative_attention_bias" in k]
+    for key in zeroed:
+        assert not out[key].any(), f"{key} was expected to be zeroed (no hook, no transform)"
+
+
+def test_theseus_float32_compute_tracks_the_float64_default() -> None:
+    source_base, source_tuned = _tiny_t5_encoder(d_model=32, seed=0), _tiny_t5_encoder(d_model=32, seed=1)
+    target_base = _tiny_t5_encoder(d_model=48, seed=2)
+
+    _, ref, _ = _theseus_transport(source_base, source_tuned, target_base, num_batches=4)
+    prepared32, got, _ = _theseus_transport(
+        source_base, source_tuned, target_base, num_batches=4, compute_dtype="float32"
+    )
+
+    assert prepared32["compute_dtype"] == "float32"
+    assert prepared32["compute_device"] == "cpu"
+    assert set(got) == set(ref)
+
+    # Deliberately NOT asserting that the two transported deltas are close.
+    # _compute_procrustes_map_from_cov returns `u @ v_h` -- the singular *values* are
+    # discarded, so every direction enters the map with equal weight however weakly
+    # the data determined it. Wherever the spectrum is near-degenerate the singular
+    # vectors are ill-determined, and two precisions can land on different, equally
+    # valid, minimizers. On this tiny random pair that alone moves the transported
+    # delta by tens of percent, and no tolerance would make such a comparison
+    # meaningful. What *is* well-posed is that both maps solve the same problem:
+    # they must be orthogonal, and they must produce a usable delta. Whether float32
+    # costs accuracy on the real pair is an empirical question about real
+    # activations, answered by running one grid cell both ways, not here.
+    for key, transform in prepared32["transforms_by_key"].items():
+        for name in ("t_in", "t_out"):
+            tensor = getattr(transform, name)
+            if tensor is None:
+                continue
+            gram = tensor @ tensor.T
+            eye = torch.eye(gram.shape[0], dtype=gram.dtype)
+            assert torch.allclose(gram, eye, atol=1e-4), f"{key}.{name} is not orthogonal under float32"
+    assert any(v.any() for v in got.values()), "the float32 path transported everything as zero"
+    assert all(torch.isfinite(v).all() for v in got.values())
+
+
+def test_theseus_transforms_are_returned_on_the_cpu() -> None:
+    # _apply_transforms_to_visual_delta computes `delta.float().cpu() @ t_in`, so a
+    # transform left on an accelerator raises RuntimeError there -- which is caught,
+    # logged, and replaced with a zero delta. Landing on the CPU is what makes
+    # compute_device="cuda" safe, so assert it rather than trusting it.
+    source_base, source_tuned = _tiny_t5_encoder(d_model=32, seed=0), _tiny_t5_encoder(d_model=32, seed=1)
+    target_base = _tiny_t5_encoder(d_model=48, seed=2)
+    device = "cuda" if _cuda_runs() else "cpu"
+    prepared, out, _ = _theseus_transport(
+        source_base, source_tuned, target_base, num_batches=4, compute_device=device, compute_dtype="float32"
+    )
+    for key, transform in prepared["transforms_by_key"].items():
+        for name in ("t_in", "t_out"):
+            tensor = getattr(transform, name)
+            if tensor is not None:
+                assert tensor.device.type == "cpu", f"{key}.{name} came back on {tensor.device}"
+    assert any(v.any() for v in out.values()), "everything transported as zero"
+
+
+def test_theseus_rejects_an_unknown_compute_dtype() -> None:
+    source_base, source_tuned = _tiny_t5_encoder(d_model=32, seed=0), _tiny_t5_encoder(d_model=32, seed=1)
+    target_base = _tiny_t5_encoder(d_model=48, seed=2)
+    with pytest.raises(ValueError, match="compute_dtype"):
+        _theseus_transport(source_base, source_tuned, target_base, num_batches=1, compute_dtype="bfloat8")
+
+
 # --------------------------------------------------------------------------
 # steer_text
 # --------------------------------------------------------------------------
