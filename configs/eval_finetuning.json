@@ -1,0 +1,33 @@
+{
+    "suite": "vision8",
+    "tasks": "all",
+
+    "backbone_name": "openclip",
+    "clip_model": "ViT-B-16",
+    "clip_pretrained": "datacomp_xl_s13b_b90k",
+
+    "device": "cuda",
+    "dtype": "fp32",
+    "batch_size": 128,
+    "num_workers": 8,
+    "val_fraction": 0.1,
+    "seed": 0,
+    "split": "test",
+
+    "forward_mode": "auto",
+    "text_features_source": "auto",
+    "no_humanize": true,
+
+    "tuned_ckpts": {
+      "Cars": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/cars/best.pt",
+      "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/dtd/best.pt",
+      "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt",
+      "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt",
+      "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/mnist/best.pt",
+      "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/resisc45/best.pt",
+      "SUN397": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/sun397/best.pt",
+      "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full_best_ep.pt"
+    },
+
+    "output_json": "logs/vision8_finetune_eval.json"
+  }

@@ -26,7 +26,7 @@
   "tuned_ckpts": {
     "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt",
     "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/resisc45/best.pt",
-    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/best.pt",
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full_best_ep.pt",
     "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/dtd/best.pt",
     "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/mnist/best.pt",
     "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt",
