@@ -77,6 +77,7 @@ from ..rebase.text import (  # noqa: F401  -- import registers "steer_text"
     count_transformer_blocks,
     describe_key_coverage,
     feature_separability,
+    head_linear,
     neutralize_intermediate_head_layers,
     steer_text_correction_context,
     subset_loader,
@@ -294,6 +295,55 @@ def _pooled_feature_report(
         f"gap={stats['gap']:+.4f} pairwise_std={stats['pairwise_std']:.4f}"
     )
     return stats
+
+
+@torch.no_grad()
+def _nearest_mean_init_head(
+    *,
+    model: torch.nn.Module,
+    loader: DataLoader,
+    local_labels: list[int],
+    mask_class: list[int],
+    device: str,
+) -> None:
+    """Overwrite the head's final Linear in place with nearest-class-mean
+    (cosine) centroids fit on ``loader``, so a following
+    ``train_linear_probe_head`` call continues training from that
+    initialization instead of the model's from-scratch random draw.
+
+    ``local_labels[i]`` (dense 0..num_classes-1) is the class of the i-th
+    example in ``loader``'s own unshuffled iteration order (true for every
+    ``subset_loader`` in this file); ``mask_class[local_id]`` maps it to the
+    row the head actually predicts over (qnli/rte/scitail skip rows in a
+    wider head, see ``data/text_loaders.py:default_head_class_ids_for_task``).
+    Each row is a unit-norm centroid of the model's own pooled features (head
+    swapped for identity, same trick as ``scripts/build_nearest_mean_head.py``);
+    a raw dot product against unit-norm rows is argmax-equivalent to cosine
+    nearest-mean classification (see that script's module docstring). Bias is
+    zeroed.
+    """
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    was_training = model.training
+    model.eval()
+    chunks: list[torch.Tensor] = []
+    with _head_as_identity(model):
+        for batch in loader:
+            chunks.append(_pooled_features(model, batch, dev).cpu().double())
+    if was_training:
+        model.train()
+
+    features = torch.nn.functional.normalize(torch.cat(chunks, dim=0), dim=-1)
+    labels = torch.as_tensor(local_labels, dtype=torch.long)[: features.shape[0]]
+
+    _, final_linear = head_linear(model)
+    for local_id, raw_row in enumerate(mask_class):
+        rows = features[labels == local_id]
+        if rows.shape[0] == 0:
+            raise ValueError(f"No support examples for class {local_id} -- cannot build its nearest-mean centroid.")
+        centroid = torch.nn.functional.normalize(rows.mean(dim=0), dim=-1)
+        final_linear.weight[raw_row].copy_(centroid.to(dtype=final_linear.weight.dtype, device=final_linear.weight.device))
+    if final_linear.bias is not None:
+        final_linear.bias.zero_()
 
 
 def _checkpoint_training_metadata(ckpt_path: str) -> dict[str, Any]:
@@ -807,6 +857,9 @@ def main() -> None:
             raise ValueError("linear_probe_head is only supported for method in {theseus, bico, steer_text}.")
         linear_probe_epochs = int(cfg.get("linear_probe_epochs", 200))
         linear_probe_lr = float(cfg.get("linear_probe_lr", 1e-2))
+        linear_probe_init = str(cfg.get("linear_probe_init", "random")).strip().lower()
+        if linear_probe_init not in {"random", "nearest_mean"}:
+            raise ValueError(f"linear_probe_init must be 'random' or 'nearest_mean', got '{linear_probe_init}'.")
         # None -> ~10 log lines over the run. Each line scores support/val/test,
         # so a small value here buys more curve at the cost of extra eval passes.
         linear_probe_log_every = cfg.get("linear_probe_log_every", None)
@@ -1300,7 +1353,9 @@ def main() -> None:
                 # examples, which OOMs a large target model in a single forward pass
                 # regardless of how small batch_size is set elsewhere.
                 probe_loader = subset_loader(loaders.train, probe_indices, batch_size=batch_size)
-                print(f"  {task}: linear-probing the target head from scratch on {len(probe_indices)} support examples")
+                probe_local_labels = [int(loaders.local_labels["train"][i]) for i in probe_indices]
+                init_desc = "from a nearest-mean-cosine init" if linear_probe_init == "nearest_mean" else "from scratch"
+                print(f"  {task}: linear-probing the target head {init_desc} on {len(probe_indices)} support examples")
 
                 # "support" is the probe's own training set: if that one doesn't
                 # rise, the probe simply isn't training (epochs/lr), independently
@@ -1312,6 +1367,20 @@ def main() -> None:
                 probe_alpha = float(cfg.get("alpha", 1.0))
                 if steer_mode:
                     load_into_model(llm_target.model, target_base_sd, strict=strict_load)
+                    if linear_probe_init == "nearest_mean":
+                        # ponytail: computed on the plain (uncorrected) pooled feature --
+                        # steer_text_correction_context hooks the head module itself, which
+                        # this swaps out for Identity, so init sees no correction regardless
+                        # of alpha. Exact for this baseline (alpha=0 always); for a real
+                        # alpha!=0 steer_text run, move this inside the context and capture
+                        # the head's post-hook input instead of using _head_as_identity.
+                        _nearest_mean_init_head(
+                            model=llm_target.model,
+                            loader=probe_loader,
+                            local_labels=probe_local_labels,
+                            mask_class=loaders.mask_class,
+                            device=device,
+                        )
                     with steer_text_correction_context(llm_target, prepared, alpha=probe_alpha):
                         trained_head_sd = train_linear_probe_head(
                             llm_target.model,
@@ -1328,6 +1397,14 @@ def main() -> None:
                     probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
                     load_into_model(llm_target.model, probe_backbone_sd, strict=strict_load)
                     del probe_backbone_sd
+                    if linear_probe_init == "nearest_mean":
+                        _nearest_mean_init_head(
+                            model=llm_target.model,
+                            loader=probe_loader,
+                            local_labels=probe_local_labels,
+                            mask_class=loaders.mask_class,
+                            device=device,
+                        )
                     trained_head_sd = train_linear_probe_head(
                         llm_target.model,
                         probe_loader,
