@@ -1,5 +1,6 @@
 {
-  "_comment": "Control for text_rebase_t5base_t5large_steer_linearprobe.json: few-shot linear probing of the TARGET model alone (google/t5-v1_1-large), with no steering applied. This is the number the steer_text run has to beat.",
+  "_comment": "Control for the steer_text run: few-shot linear probing of the TARGET model alone (google-t5/t5-large), with no steering applied. This is the number steer_text has to beat.",
+  "_target_is_original_t5": "Target is google-t5/t5-large (original T5), NOT google/t5-v1_1-large. It therefore shares the original-T5 vocabulary (32128) with the source google-t5/t5-base, unlike the v1_1 variants (32100). NOTE: configs/text_rebase_t5base_t5large_steer_linearprobe.json still targets google/t5-v1_1-large -- point it at google-t5/t5-large too, or the baseline and the steer run are not measuring the same backbone.",
   "_how_to_run": "uv run python -m merge_and_rebase.eval.text_rebase --config configs/text_rebase_t5large_linearprobe_baseline.json",
   "_why_alpha_0": "There is no standalone text linear-probe entrypoint (vision has eval/vision_linear_probe.py). alpha=0 is the equivalent: steer_text_correction_context adds alpha*correction to the pooled feature (steer_text.py:780), so at 0 the probe trains, and is scored, on the plain target base. Both the 'target_zeroshot' and 'rebased' columns then report the same probe accuracy and 'norm' is 1.0.",
   "_cheap_stage2": "stage_2_strategy/feature_regime are downgraded from block_ridge/linear on purpose: the correction is multiplied by zero, so the per-block forward-mode jvp through t5-base would be pure waste. prepare() still extracts pooled features for the support set -- unavoidable without a dedicated entrypoint, and the feature cache makes a rerun cheap.",
@@ -10,7 +11,7 @@
 
   "source_model_name_or_path": "google-t5/t5-base",
   "source_model_arch": "t5",
-  "target_model_name_or_path": "google/t5-v1_1-large",
+  "target_model_name_or_path": "google-t5/t5-large",
   "target_model_arch": "t5",
   "model_kind": "sequence_classification",
   "num_labels": 3,
