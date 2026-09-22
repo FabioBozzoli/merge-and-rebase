@@ -41,6 +41,23 @@ def apply_training_forward_mode(
     if not param_names:
         raise RuntimeError("No trainable parameters found for linearized_ntk forward mode.")
 
+    # LinearizedModule deepcopies the *PEFT-wrapped* model, so the frozen
+    # reference keeps whatever the adapter held at bind time. It contributes 0
+    # to f(x; theta0) only because PEFT zero-inits lora_B. Bind after loading a
+    # trained adapter and the expansion point silently becomes
+    # "pretrained + frozen adapter", double-counting the delta.
+    warm_lora_b = [
+        name
+        for name, param in model.named_parameters()
+        if "lora_B" in name and bool(param.detach().any())
+    ]
+    if warm_lora_b:
+        raise RuntimeError(
+            "linearized_ntk requires lora_B == 0 at bind time so the linearization point is the "
+            f"pretrained weights; found {len(warm_lora_b)} nonzero lora_B tensors "
+            f"(e.g. {warm_lora_b[0]}). Bind the forward mode before loading any adapter."
+        )
+
     linearized = LinearizedModule.from_module(
         model,
         device=device,

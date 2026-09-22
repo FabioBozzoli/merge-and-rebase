@@ -1,0 +1,127 @@
+# Linearized-NTK LoRA fine-tuning of Llama-3.2-3B (BASE, not Instruct) on the
+# full hkust-nlp/dart-math-uniform corpus -- one pass, 591K rows.
+#
+#   export HF_TOKEN=...        # meta-llama/Llama-3.2-3B is a gated repo
+#   python -m merge_and_rebase.finetune.train_text \
+#       --text-config src/merge_and_rebase/finetune/configs/text-causal-ntk-llama32-3b-dartmath.yaml
+#
+# This trains source model A *in the tangent space*, so steer_text / theseus
+# `feature_regime: "linear"` reads an exact representation instead of a
+# first-order approximation of a model that was never linear. The export at
+# output.out_dir/.../peft_lora__linearized_ntk_hf is a plain HF directory that
+# lm_eval's hf_rebased loads as `source_finetuned` -- but its merged weights are
+# W0 + dW while the function that was trained is f(x;W0) + J(x;W0).dW. A standard
+# HF forward on that directory is NOT the trained model; only feature_regime
+# "linear" consumes it correctly. merge_and_rebase_meta.json restates this.
+#
+# vocab_size is 128256 here, matching meta-llama/Llama-3.1-8B -- the
+# 128320-vs-128256 Stage-1 blocker noted at the top of the math steer configs.
+#
+# Measured on 2000 rows of dart-math-uniform (Llama-family BPE):
+#   prompt  mean  53 tok, p95  104
+#   response mean 314 tok, p95  698
+#   total   mean 368 tok, p95  805, max 2446
+# max_length 1024 keeps ~297 supervised tokens/row; 512 keeps ~266 (-10%) but
+# quarters attention memory. Solutions here are CoT ending in \boxed{}, so
+# truncating them teaches the model not to finish -- 1024 is the safer default.
+#
+# Memory at 3B under linearized_ntk (bf16): ref module ~6.4 GB + theta0 clone of
+# the LoRA host weights ~5.6 GB + live model ~6.4 GB + materialized params and
+# tangents in the autograd graph ~11 GB ~= 29 GB resident BEFORE activations,
+# roughly double in fp32. jvp forces the MATH SDPA backend (flash/efficient raise
+# NotImplementedError under forward-mode AD), so attention is O(T^2): at
+# max_length 1024 this needs a 40 GB card at minimum, 80 GB comfortably. Measured
+# reference point: Qwen2.5-0.5B, bf16, max_length 512, batch_size 1 peaked at
+# 5.34 GiB. Raise accumulate_grad_batches, never batch_size, to buy headroom.
+#
+# CPU RAM: the loader streams all 591K rows, then tokenizes in 1000-row chunks
+# into int32 arrays (~1.7 GB). Peak is ~3 GB including the transient string list.
+#
+# Wall clock: 590K rows / 16 accumulated = ~36.9K optimizer steps, each ~2-3x a
+# standard step because of the jvp. Budget tens of GPU-hours. Set
+# data.max_train_samples to cap the run instead of cutting epochs.
+
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: bf16
+
+  backbone:
+    name: hf_text
+    model_name_or_path: meta-llama/Llama-3.2-3B
+    model_arch: auto
+    model_kind: causal_lm
+    trust_remote_code: false
+    use_fast_tokenizer: true
+
+  data:
+    batch_size: 1
+    num_workers: 8
+    max_length: 1024
+    # prompt_fields is "+"-separated and joined with blank lines, exactly like
+    # lm_eval.models.hf_rebased._calibration_texts, so A trains on the same text
+    # steer_text later calibrates on.
+    hf_path: hkust-nlp/dart-math-uniform
+    hf_config: null
+    split: train
+    prompt_fields: query
+    response_field: response
+    max_train_samples: null     # null = the whole 591K-row split
+    # dart-math ships train only, so validation is a seeded carve out of it.
+    # 0.001 of 591K = ~591 rows; each eval is a full linearized forward pass
+    # over them, so keep it small when eval_every_n_steps is tight.
+    val_fraction: 0.001
+
+  train:
+    epochs: 1
+    optimizer:
+      name: adamw
+    lr: 1.0e-4
+    weight_decay: 0.0
+    accumulate_grad_batches: 16   # effective batch 16
+    lr_scheduler:
+      name: cosine
+      warmup_steps: 500
+    grad_clip_norm: 1.0
+    # Epoch-level early stopping is inert at epochs=1 -- one pass produces one
+    # epoch-end evaluation. eval_every_n_steps validates mid-epoch instead, so
+    # patience counts evaluations: 3 consecutive non-improving evals = 6000
+    # optimizer steps without progress, then stop and keep the best checkpoint.
+    eval_every_n_steps: 2000      # ~18 evals over ~36.9K steps
+    early_stopping: true
+    early_stopping_patience: 3
+
+  strategy:
+    name: peft_lora               # causal_lm supports peft_lora only
+    forward_mode: linearized_ntk  # standard | linearized_ntk
+    peft:
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+      r: 16
+      lora_alpha: 16
+      lora_dropout: 0.0
+      bias: none
+
+  output:
+    out_dir: src/checkpoints/finetune_text
+    save_format: hf               # full | head | peft | hf
+    save_last_epoch: false
+    extract_heads: false
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: null
+    log_every_n_steps: 100
+    run_name: null
+
+# Causal task names are config keys, not a fixed registry, so this list is required.
+datasets_order:
+  - dart_math_uniform
+
+datasets:
+  dart_math_uniform: {}

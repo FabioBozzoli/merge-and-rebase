@@ -1,0 +1,126 @@
+# Linearized-NTK LoRA fine-tuning of a CausalLM -- i.e. training source model A
+# *in the tangent space* so that steer_text / theseus `feature_regime: "linear"`
+# reads an exact representation instead of a first-order approximation of a model
+# that was never linear.
+#
+#   python -m merge_and_rebase.finetune.train_text \
+#       --text-config src/merge_and_rebase/finetune/configs/text-causal-lora-ntk.yaml \
+#       --tasks dart_math_hard
+#
+# Export: output.save_format: hf writes `<out_dir>/<model_tag>/<task>/peft_lora__linearized_ntk_hf`,
+# a plain HF directory that lm_eval's hf_rebased loads as `source_finetuned`. The merged
+# weights there are W0 + dW, but the function that was trained is f(x;W0) + J(x;W0).dW --
+# a standard HF forward on that directory is NOT the trained model. Only
+# `feature_regime: "linear"` consumes it correctly; merge_and_rebase_meta.json says so too.
+#
+# Base model note: Llama-3.2-3B-Instruct keeps vocab_size=128256, matching
+# meta-llama/Llama-3.1-8B. That is the 128320-vs-128256 Stage-1 blocker documented
+# at the top of the math steer configs -- training A here clears it.
+#
+# Memory, at 3B under linearized_ntk (single GPU, bf16):
+#   ref module ~6.4 GB + theta0 clone ~5.6 GB + live model ~6.4 GB
+#   + materialized params and tangents inside the autograd graph ~11 GB
+#   ~= 29 GB resident BEFORE activations; roughly double in fp32.
+# jvp forces the MATH SDPA backend (flash/efficient raise NotImplementedError under
+# forward-mode AD), so attention is O(T^2) in memory: keep max_length at 512 and
+# batch_size at 1 unless the card is 80 GB+. Raise accumulate_grad_batches, not batch_size.
+
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: bf16
+
+  backbone:
+    name: hf_text
+    model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
+    model_arch: auto
+    model_kind: causal_lm
+    trust_remote_code: false
+    use_fast_tokenizer: true
+
+  data:
+    batch_size: 1
+    num_workers: 4
+    max_length: 512
+    # Dataset is described here, not registered in code: prompt_fields is
+    # "+"-separated and joined with blank lines, exactly like
+    # lm_eval.models.hf_rebased._calibration_texts, so A trains on the same text
+    # steer_text later calibrates on.
+    hf_path: hkust-nlp/dart-math-hard
+    hf_config: null
+    split: train
+    prompt_fields: query
+    response_field: response
+    # response_index_field: label   # multiple-choice sets (hellaswag: ctx / endings / label)
+    max_train_samples: 20000
+    val_fraction: 0.02
+
+  train:
+    epochs: 1
+    optimizer:
+      name: adamw
+    lr: 1.0e-4
+    weight_decay: 0.0
+    accumulate_grad_batches: 16
+    lr_scheduler:
+      name: cosine
+      warmup_steps: 100
+    grad_clip_norm: 1.0
+    early_stopping: false
+    early_stopping_patience: 3
+
+  strategy:
+    name: peft_lora               # causal_lm supports peft_lora only
+    forward_mode: linearized_ntk  # standard | linearized_ntk
+    peft:
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+      r: 16
+      lora_alpha: 16
+      lora_dropout: 0.0
+      bias: none
+
+  output:
+    out_dir: src/checkpoints/finetune_text
+    save_format: hf               # full | head | peft | hf
+    save_last_epoch: false
+    extract_heads: false
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: null
+    log_every_n_steps: 50
+    run_name: null
+
+# Causal task names are config keys, not a fixed registry, so this list is required.
+datasets_order:
+  - dart_math_hard
+
+datasets:
+  dart_math_hard: {}
+
+  # Other targets; move one up into datasets_order to train it.
+  # magicoder_oss:
+  #   data:
+  #     hf_path: ise-uiuc/Magicoder-OSS-Instruct-75K
+  #     prompt_fields: problem
+  #     response_field: solution
+  # alpaca:
+  #   data:
+  #     hf_path: tatsu-lab/alpaca
+  #     prompt_fields: instruction+input
+  #     response_field: output
+  # hellaswag:
+  #   data:
+  #     hf_path: Rowan/hellaswag
+  #     prompt_fields: ctx
+  #     response_field: endings
+  #     response_index_field: label
+  #
+  # IFEval is eval-only: its 541 prompts ship without reference responses, so it
+  # cannot be an SFT set. It stays an lm_eval task.

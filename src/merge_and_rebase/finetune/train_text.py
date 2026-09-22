@@ -22,10 +22,13 @@ from merge_and_rebase.utils.helpers import parse_csv
 
 from ..data.text_loaders import (
     NLI_TASKS,
-    NLITokenizedData,
+    CausalTokenizedData,
+    build_causal_task_data,
+    build_causal_tokenized_loader,
     build_nli_task_data,
     build_nli_tokenized_loader,
     default_head_class_ids_for_task,
+    split_causal_task_data,
 )
 from ..models.text_lm import TextBuildConfig, TextLM
 from .forward_mode import apply_training_forward_mode, resolve_training_forward_mode
@@ -257,6 +260,85 @@ def _resolve_head_class_ids(
     )
 
 
+def _build_causal_task_loaders(
+    *,
+    task: str,
+    tokenizer: Any,
+    batch_size: int,
+    num_workers: int,
+    max_length: int,
+    task_cfg: dict[str, Any],
+) -> tuple[CausalTokenizedData, CausalTokenizedData, CausalTokenizedData, dict[str, Any]]:
+    hf_path = _get(task_cfg, "data.hf_path", None)
+    if not isinstance(hf_path, str) or not hf_path.strip():
+        raise ValueError(f"[{task}] data.hf_path is required for backbone.model_kind='causal_lm'.")
+    prompt_fields = _get(task_cfg, "data.prompt_fields", None)
+    if not isinstance(prompt_fields, str) or not prompt_fields.strip():
+        raise ValueError(f"[{task}] data.prompt_fields is required (e.g. 'query' or 'instruction+input').")
+    response_field = _get(task_cfg, "data.response_field", None)
+    if not isinstance(response_field, str) or not response_field.strip():
+        raise ValueError(f"[{task}] data.response_field is required.")
+
+    hf_config = _get(task_cfg, "data.hf_config", None)
+    response_index_field = _get(task_cfg, "data.response_index_field", None)
+    common = {
+        "task": task,
+        "hf_path": str(hf_path),
+        "hf_config": None if hf_config is None else str(hf_config),
+        "prompt_fields": str(prompt_fields),
+        "response_field": str(response_field),
+        "response_index_field": None if response_index_field is None else str(response_index_field),
+    }
+
+    train_data = build_causal_task_data(
+        split=str(_get(task_cfg, "data.split", "train")),
+        max_samples=_get(task_cfg, "data.max_train_samples", None),
+        **common,
+    )
+    val_split = _get(task_cfg, "data.val_split", None)
+    if isinstance(val_split, str) and val_split.strip():
+        val_data = build_causal_task_data(
+            split=str(val_split),
+            max_samples=_get(task_cfg, "data.max_val_samples", None),
+            **common,
+        )
+    else:
+        train_data, val_data = split_causal_task_data(
+            train_data,
+            val_fraction=float(_get(task_cfg, "data.val_fraction", 0.02)),
+        )
+
+    train_loader = build_causal_tokenized_loader(
+        task_data=train_data,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        max_length=max_length,
+        shuffle=True,
+    )
+    val_loader = build_causal_tokenized_loader(
+        task_data=val_data,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        max_length=max_length,
+        shuffle=False,
+    )
+
+    meta = {
+        "model_kind": "causal_lm",
+        "train": train_loader.meta,
+        "validation": val_loader.meta,
+        # No held-out test split: SFT sets here ship train only, and the real
+        # report card for a source model A is lm_eval downstream, not a
+        # token-level score on a second carve of the same distribution.
+        "test": "alias:validation",
+    }
+    # val is returned in the test slot too; the causal branch of the training
+    # loop only ever iterates the val loader.
+    return train_loader, val_loader, val_loader, meta
+
+
 def _build_task_loaders(
     *,
     task: str,
@@ -266,7 +348,18 @@ def _build_task_loaders(
     max_length: int,
     head_num_labels: int,
     task_cfg: dict[str, Any],
-) -> tuple[NLITokenizedData, NLITokenizedData, NLITokenizedData, dict[str, Any]]:
+    model_kind: str = "sequence_classification",
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    if str(model_kind) == "causal_lm":
+        return _build_causal_task_loaders(
+            task=task,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            max_length=max_length,
+            task_cfg=task_cfg,
+        )
+
     max_train_samples = _get(task_cfg, "data.max_train_samples", None)
     max_val_samples = _get(task_cfg, "data.max_val_samples", None)
     max_test_samples = _get(task_cfg, "data.max_test_samples", None)
@@ -348,10 +441,19 @@ def _configure_text_strategy(
     scheduler_name: str = "cosine",
     steps: int,
     device: torch.device,
+    model_kind: str = "sequence_classification",
 ) -> tuple[nn.Module, optim.Optimizer, Any, dict[str, int], dict[str, Any]]:
     cfg = dict(strategy_cfg or {})
     name = str(strategy).strip().lower()
+    is_causal = str(model_kind) == "causal_lm"
     peft_cfg_out: dict[str, Any] = {}
+
+    if is_causal and name != "peft_lora":
+        raise ValueError(
+            f"model_kind='causal_lm' supports strategy.name='peft_lora' only (got '{name}'). "
+            "'full' has no memory headroom under linearized_ntk and 'linear_probe' needs a "
+            "classification head this model does not have."
+        )
 
     if name == "full":
         for p in model.parameters():
@@ -392,8 +494,9 @@ def _configure_text_strategy(
         ):
             raise ValueError("strategy.peft.modules_to_save must be a list[str] when provided.")
 
+        task_type = TaskType.CAUSAL_LM if is_causal else TaskType.SEQ_CLS
         lora_cfg = LoraConfig(
-            task_type=TaskType.SEQ_CLS,
+            task_type=task_type,
             inference_mode=False,
             r=int(peft_cfg.get("r", 16)),
             lora_alpha=int(peft_cfg.get("lora_alpha", 16)),
@@ -404,7 +507,7 @@ def _configure_text_strategy(
         )
         model = get_peft_model(model, lora_cfg)
         peft_cfg_out = {
-            "task_type": "SEQ_CLS",
+            "task_type": str(task_type).split(".")[-1],
             "inference_mode": False,
             "r": int(peft_cfg.get("r", 16)),
             "lora_alpha": int(peft_cfg.get("lora_alpha", 16)),
@@ -441,6 +544,57 @@ def _configure_text_strategy(
     info["scheduler_name"] = scheduler_name
 
     return model, opt, scheduler, info, peft_cfg_out
+
+
+def _causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Shifted next-token CE over unmasked (non -100) positions only."""
+    return nn.functional.cross_entropy(
+        logits[:, :-1, :].reshape(-1, logits.size(-1)).float(),
+        labels[:, 1:].reshape(-1),
+        ignore_index=-100,
+    )
+
+
+@torch.no_grad()
+def _eval_causal(model: nn.Module, loader, device: str) -> dict[str, float]:
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    model.to(dev)
+    model.eval()
+
+    total_loss = 0.0
+    total_tokens = 0
+    correct = 0
+    for batch in loader:
+        input_ids = batch["input_ids"].to(dev, non_blocking=True)
+        attention_mask = batch.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(dev, non_blocking=True)
+        labels = batch["labels"].to(dev, non_blocking=True).long()
+
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        flat_logits = logits[:, :-1, :].reshape(-1, logits.size(-1)).float()
+        flat_labels = labels[:, 1:].reshape(-1)
+        supervised = flat_labels != -100
+        n_tokens = int(supervised.sum().item())
+        if n_tokens == 0:
+            continue
+
+        total_loss += float(
+            nn.functional.cross_entropy(
+                flat_logits, flat_labels, ignore_index=-100, reduction="sum"
+            ).item()
+        )
+        total_tokens += n_tokens
+        correct += int((flat_logits.argmax(dim=-1) == flat_labels)[supervised].sum().item())
+
+    if total_tokens == 0:
+        return {"val_loss": float("nan"), "val_ppl": float("nan"), "val_token_acc": float("nan")}
+    loss = total_loss / total_tokens
+    return {
+        "val_loss": float(loss),
+        "val_ppl": float(math.exp(min(loss, 80.0))),
+        "val_token_acc": float(correct / total_tokens),
+    }
 
 
 @torch.no_grad()
@@ -503,6 +657,61 @@ def _save_peft_text_adapter(
     return meta
 
 
+def _export_hf_merged_model(
+    *,
+    model: nn.Module,
+    tokenizer: Any,
+    out_dir: Path,
+    trainable_state: dict[str, torch.Tensor],
+    build_cfg: TextBuildConfig,
+    forward_mode: str,
+    peft_cfg: dict[str, Any] | None,
+    data_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge LoRA into the base weights and write a plain HF model directory.
+
+    This is what lm_eval's `hf_rebased` loads as `source_finetuned`; it must be
+    a directory `AutoModelForCausalLM.from_pretrained` accepts, not an adapter.
+    """
+    if not hasattr(model, "merge_and_unload"):
+        raise ValueError("save_format='hf' expects a PEFT-wrapped model with .merge_and_unload().")
+
+    if trainable_state:
+        incompatible = model.load_state_dict(trainable_state, strict=False)
+        unexpected = list(getattr(incompatible, "unexpected_keys", []))
+        if unexpected:
+            raise RuntimeError(f"Unexpected keys while restoring the best adapter: {unexpected[:5]}")
+
+    merged = model.merge_and_unload()
+    _ensure_dir(out_dir)
+    merged.save_pretrained(out_dir)
+    if hasattr(tokenizer, "save_pretrained"):
+        tokenizer.save_pretrained(out_dir)
+
+    meta = {
+        "format": "hf",
+        "forward_mode": forward_mode,
+        "peft_cfg": peft_cfg if peft_cfg is not None else {},
+        "backbone": {
+            "kind": "hf_text",
+            "model_name_or_path": build_cfg.model_name_or_path,
+            "model_arch": build_cfg.model_arch,
+            "model_kind": build_cfg.model_kind,
+            "dtype": build_cfg.dtype,
+        },
+        "data": data_meta,
+    }
+    if forward_mode == "linearized_ntk":
+        meta["linearized_warning"] = (
+            "These weights are W0 + dW, but the function that was trained is "
+            "f(x; W0) + J(x; W0) . dW. A standard HF forward on this directory is NOT the "
+            "trained model. Consume it with feature_regime='linear' (steer_text / theseus), "
+            "which applies the same first-order expansion around W0."
+        )
+    _save_json(out_dir / "merge_and_rebase_meta.json", meta)
+    return meta
+
+
 def train_task(
     *,
     task: str,
@@ -523,6 +732,7 @@ def train_task(
     head_num_labels: int,
     early_stopping: bool,
     early_stopping_patience: int,
+    eval_every_n_steps: int = 0,
     seed: int,
     deterministic: bool,
     device: str,
@@ -540,12 +750,19 @@ def train_task(
     _set_seed(seed, deterministic=deterministic)
     forward_mode = resolve_training_forward_mode(strategy_cfg)
 
-    if build_cfg.model_kind != "sequence_classification":
-        raise ValueError("train_text currently supports backbone.model_kind='sequence_classification' only.")
+    if build_cfg.model_kind not in {"sequence_classification", "causal_lm"}:
+        raise ValueError(
+            "train_text supports backbone.model_kind in {'sequence_classification', 'causal_lm'}."
+        )
+    is_causal = build_cfg.model_kind == "causal_lm"
 
     llm = TextLM.build(build_cfg)
     model = llm.model
     tokenizer = llm.tokenizer
+    if is_causal:
+        # The KV cache is dead weight for teacher-forced training and its
+        # in-place state does not survive functional_call under jvp.
+        model.config.use_cache = False
 
     train_loader, val_loader, test_loader, task_meta = _build_task_loaders(
         task=task,
@@ -555,15 +772,17 @@ def train_task(
         max_length=max_length,
         head_num_labels=head_num_labels,
         task_cfg=task_cfg or {},
+        model_kind=build_cfg.model_kind,
     )
-    expected_num_labels = int(len(task_meta.get("labels", [])))
-    model_num_labels = int(getattr(model.config, "num_labels", expected_num_labels))
-    if model_num_labels != expected_num_labels:
-        raise ValueError(
-            f"[{task}] model head/logits mismatch: model_num_labels={model_num_labels} "
-            f"but dataset_num_labels={expected_num_labels}. "
-            "Ensure backbone.num_labels matches the dataset label space for this task."
-        )
+    if not is_causal:
+        expected_num_labels = int(len(task_meta.get("labels", [])))
+        model_num_labels = int(getattr(model.config, "num_labels", expected_num_labels))
+        if model_num_labels != expected_num_labels:
+            raise ValueError(
+                f"[{task}] model head/logits mismatch: model_num_labels={model_num_labels} "
+                f"but dataset_num_labels={expected_num_labels}. "
+                "Ensure backbone.num_labels matches the dataset label space for this task."
+            )
 
     task_dir = out_dir / _safe_model_tag(build_cfg.model_name_or_path) / task
     _ensure_dir(task_dir)
@@ -594,6 +813,7 @@ def train_task(
         scheduler_name=scheduler_name,
         steps=total_steps,
         device=dev,
+        model_kind=build_cfg.model_kind,
     )
     trainable_info = dict(trainable_info)
     trainable_info["forward_mode"] = forward_mode
@@ -607,24 +827,25 @@ def train_task(
         )
     )
 
-    best_val = -1.0
+    # Higher-is-better score: top1 for classification, -val_loss for causal.
+    best_val = float("-inf")
     best_state: dict[str, Any] | None = None
     best_head_payload: dict[str, torch.Tensor] | None = None
     best_epoch = -1
     last_epoch = 0
-    last_val = float("nan")
-    last_test = float("nan")
+    last_metrics: dict[str, float] = {}
     patience_left = int(early_stopping_patience)
 
     t_start = time.time()
     global_update_step = 0
     ckpt_stem = str(strategy) if forward_mode == "standard" else f"{strategy}__{forward_mode}"
+    hf_export_dir = task_dir / f"{ckpt_stem}_hf"
+    best_trainable_state: dict[str, torch.Tensor] = {}
 
     def _build_checkpoint_payload(
         *,
         epoch_i: int,
-        val_acc_i: float,
-        test_acc_i: float,
+        metrics_i: dict[str, float],
         kind: str,
     ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
         payload: dict[str, Any] = {
@@ -642,10 +863,7 @@ def train_task(
             "labels": list(task_meta.get("labels", [])),
             "label_texts": list(task_meta.get("label_texts", [])),
             "head_class_ids": list(task_meta.get("head_class_ids", [])),
-            "metrics": {
-                "val_top1": float(val_acc_i),
-                "test_top1": float(test_acc_i),
-            },
+            "metrics": {k: float(v) for k, v in metrics_i.items()},
         }
         if kind == "best_ep":
             payload["best_epoch"] = int(epoch_i)
@@ -655,7 +873,7 @@ def train_task(
         else:
             raise ValueError("kind must be 'best_ep' or 'last_ep'")
 
-        head_payload = _extract_task_head(model)
+        head_payload = {} if is_causal else _extract_task_head(model)
 
         if save_format == "full":
             payload["state_dict"] = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -675,11 +893,103 @@ def train_task(
                     build_cfg=build_cfg,
                 )
             )
+        elif save_format == "hf":
+            payload["format"] = "hf"
+            payload["hf_dir"] = str(hf_export_dir)
+            if kind == "best_ep":
+                # merge_and_unload() is destructive, so the merged export cannot
+                # run mid-loop. Stash the LoRA factors (a few MB) and merge once
+                # after training instead.
+                # ponytail: best epoch only; save_last_epoch still writes the .pt,
+                # not a second merged directory.
+                best_trainable_state.clear()
+                best_trainable_state.update(
+                    {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
+                )
         else:
-            raise ValueError("save_format must be 'full', 'head', or 'peft'")
+            raise ValueError("save_format must be 'full', 'head', 'peft', or 'hf'")
 
         return payload, head_payload
 
+    def _validate_and_track(*, epoch: int, train_loss: float, step: int | None = None) -> bool:
+        """Evaluate, keep the best checkpoint, decay patience. True => stop.
+
+        Also callable mid-epoch (train.eval_every_n_steps): a single pass over a
+        591K-row corpus produces exactly one epoch-end evaluation, which leaves
+        early stopping with nothing to act on.
+        """
+        nonlocal best_val, best_state, best_head_payload, best_epoch, last_epoch, last_metrics, patience_left
+
+        if is_causal:
+            metrics = _eval_causal(model, val_loader.loader, str(dev))
+            score = -float(metrics["val_loss"])
+            desc = (
+                f"val_loss={metrics['val_loss']:.4f}  "
+                f"val_ppl={metrics['val_ppl']:.3f}  "
+                f"val_tok_acc={metrics['val_token_acc']:.4f}"
+            )
+            log_metrics = {
+                f"val/{task}/loss": float(metrics["val_loss"]),
+                f"val/{task}/ppl": float(metrics["val_ppl"]),
+                f"val/{task}/token_acc": float(metrics["val_token_acc"]),
+            }
+        else:
+            val_acc = _top1(model, val_loader.loader, str(dev))
+            test_acc = _top1(model, test_loader.loader, str(dev))
+            metrics = {"val_top1": float(val_acc), "test_top1": float(test_acc)}
+            score = float(val_acc)
+            desc = f"val={val_acc:.4f}  test={test_acc:.4f}"
+            log_metrics = {
+                f"val/{task}/top1": float(val_acc),
+                f"test/{task}/top1": float(test_acc),
+            }
+
+        last_epoch = epoch
+        last_metrics = dict(metrics)
+        stop = False
+
+        if not math.isnan(score) and score > best_val:
+            patience_left = int(early_stopping_patience)
+            best_epoch = int(epoch)
+            best_val = float(score)
+            best_state, best_head_payload = _build_checkpoint_payload(
+                epoch_i=best_epoch,
+                metrics_i=metrics,
+                kind="best_ep",
+            )
+        else:
+            patience_left -= 1
+            if early_stopping and patience_left <= 0:
+                print(f"[{task}] Early stopping triggered.")
+                stop = True
+
+        where = f"epoch {epoch:03d}/{epochs}" + ("" if step is None else f" step {step}")
+        print(
+            f"[{task}] {where}  "
+            f"loss={train_loss:.4f}  {desc} "
+            f"patience={patience_left}/{early_stopping_patience}"
+        )
+        if run_logger is not None:
+            run_logger.log_event(
+                "eval" if step is not None else "epoch_end",
+                metrics={
+                    f"train/{task}/loss": float(train_loss),
+                    f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
+                    **log_metrics,
+                    f"train/{task}/seconds": float(time.time() - t_start),
+                },
+                step=int(step if step is not None else epoch),
+                context={
+                    "task": task,
+                    "epoch": int(epoch),
+                    "update_step": int(global_update_step),
+                    "patience_left": int(patience_left),
+                },
+            )
+        model.train()
+        return stop
+
+    stop_training = False
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -700,11 +1010,18 @@ def train_task(
                     attention_mask = attention_mask.to(dev, non_blocking=True)
                 labels = batch["labels"].to(dev, non_blocking=True).long()
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                raw_loss = outputs.loss
-                if raw_loss is None:
-                    logits = outputs.logits
-                    raw_loss = nn.CrossEntropyLoss()(logits, labels)
+                if is_causal:
+                    # No labels= into the model: HF would run its own shifted CE
+                    # *inside* the jvp, and under linearized_ntk the loss must be
+                    # computed on f(x;W0) + J.dW after the tangent is added.
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    raw_loss = _causal_lm_loss(outputs.logits, labels)
+                else:
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    raw_loss = outputs.loss
+                    if raw_loss is None:
+                        logits = outputs.logits
+                        raw_loss = nn.CrossEntropyLoss()(logits, labels)
                 loss = raw_loss / window_size
                 loss.backward()
 
@@ -719,7 +1036,9 @@ def train_task(
                     global_update_step += 1
                     window_batch_count = 0
 
-                bs = int(labels.numel())
+                # Causal loss is a per-token mean, so the running average has to
+                # weight by supervised tokens, not rows.
+                bs = int((labels != -100).sum().item()) if is_causal else int(labels.numel())
                 running_loss += float(raw_loss.item()) * bs
                 n_seen += bs
 
@@ -746,61 +1065,32 @@ def train_task(
                         },
                     )
 
-        val_acc = _top1(model, val_loader.loader, str(dev))
-        test_acc = _top1(model, test_loader.loader, str(dev))
+                if (
+                    should_step
+                    and eval_every_n_steps > 0
+                    and global_update_step > 0
+                    and global_update_step % eval_every_n_steps == 0
+                ):
+                    if _validate_and_track(epoch=epoch, train_loss=train_loss, step=global_update_step):
+                        stop_training = True
+                        break
 
-        last_epoch = epoch
-        last_val = float(val_acc)
-        last_test = float(test_acc)
-
-        if not math.isnan(val_acc) and val_acc > best_val:
-            patience_left = int(early_stopping_patience)
-            best_epoch = int(epoch)
-            best_val = float(val_acc)
-            best_state, best_head_payload = _build_checkpoint_payload(
-                epoch_i=best_epoch,
-                val_acc_i=float(val_acc),
-                test_acc_i=float(test_acc),
-                kind="best_ep",
-            )
-        else:
-            patience_left -= 1
-            if early_stopping and patience_left <= 0:
-                print(f"[{task}] Early stopping triggered.")
-                break
-
-        print(
-            f"[{task}] epoch {epoch:03d}/{epochs}  "
-            f"loss={train_loss:.4f}  val={val_acc:.4f}  test={test_acc:.4f} "
-            f"patience={patience_left}/{early_stopping_patience}"
-        )
-        if run_logger is not None:
-            run_logger.log_event(
-                "epoch_end",
-                metrics={
-                    f"train/{task}/loss": float(train_loss),
-                    f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
-                    f"val/{task}/top1": float(val_acc),
-                    f"test/{task}/top1": float(test_acc),
-                    f"train/{task}/seconds": float(time.time() - t_start),
-                },
-                step=int(epoch),
-                context={
-                    "task": task,
-                    "epoch": int(epoch),
-                    "patience_left": int(patience_left),
-                },
-            )
+        if stop_training or _validate_and_track(epoch=epoch, train_loss=train_loss):
+            break
 
     seconds = time.time() - t_start
 
     if best_state is None or best_head_payload is None:
         fallback_best_epoch = best_epoch if best_epoch > 0 else last_epoch
-        fallback_test = last_test if not math.isnan(last_test) else _top1(model, test_loader.loader, str(dev))
+        if not last_metrics:
+            last_metrics = (
+                _eval_causal(model, val_loader.loader, str(dev))
+                if is_causal
+                else {"val_top1": float("nan"), "test_top1": _top1(model, test_loader.loader, str(dev))}
+            )
         best_state, best_head_payload = _build_checkpoint_payload(
             epoch_i=fallback_best_epoch,
-            val_acc_i=last_val,
-            test_acc_i=float(fallback_test),
+            metrics_i=last_metrics,
             kind="best_ep",
         )
 
@@ -813,12 +1103,25 @@ def train_task(
             last_epoch = epochs
         last_state, _ = _build_checkpoint_payload(
             epoch_i=last_epoch,
-            val_acc_i=last_val,
-            test_acc_i=last_test,
+            metrics_i=last_metrics,
             kind="last_ep",
         )
         last_ckpt_path = task_dir / f"{ckpt_stem}_last_ep.pt"
         torch.save(last_state, last_ckpt_path)
+
+    if save_format == "hf":
+        best_state["hf_meta"] = _export_hf_merged_model(
+            model=model,
+            tokenizer=tokenizer,
+            out_dir=hf_export_dir,
+            trainable_state=best_trainable_state,
+            build_cfg=build_cfg,
+            forward_mode=forward_mode,
+            peft_cfg=peft_cfg_out,
+            data_meta=task_meta,
+        )
+        torch.save(best_state, best_ckpt_path)
+        print(f"[{task}] saved merged HF model: {hf_export_dir}")
 
     summary = {
         "task": task,
@@ -847,6 +1150,9 @@ def train_task(
             "effective_batch_size": int(batch_size * accumulate_grad_batches),
             "num_workers": int(num_workers),
             "max_length": int(max_length),
+            "eval_every_n_steps": int(eval_every_n_steps),
+            "early_stopping": bool(early_stopping),
+            "early_stopping_patience": int(early_stopping_patience),
             "seed": int(seed),
         },
     }
@@ -859,8 +1165,11 @@ def train_task(
         run_logger.log_event(
             "task_end",
             metrics={
-                f"val/{task}/top1": float(summary["metrics"].get("val_top1", float("nan"))),
-                f"test/{task}/top1": float(summary["metrics"].get("test_top1", float("nan"))),
+                **{
+                    f"{k.split('_', 1)[0]}/{task}/{k.split('_', 1)[1]}": float(v)
+                    for k, v in summary["metrics"].items()
+                    if "_" in k
+                },
                 f"train/{task}/seconds": float(summary["seconds"]),
             },
             context={
@@ -923,8 +1232,16 @@ def main() -> None:
 
         model_arch = str(_get(global_cfg, "backbone.model_arch", "auto"))
         model_kind = str(_get(global_cfg, "backbone.model_kind", "sequence_classification"))
-        if model_kind != "sequence_classification":
-            raise ValueError("train_text currently requires common.backbone.model_kind='sequence_classification'.")
+        if model_kind not in {"sequence_classification", "causal_lm"}:
+            raise ValueError(
+                "common.backbone.model_kind must be 'sequence_classification' or 'causal_lm'."
+            )
+        is_causal = model_kind == "causal_lm"
+        if is_causal and _resolve_tasks_from_cfg(cfg_file) is None and not (args.tasks and args.tasks.strip()):
+            raise ValueError(
+                "model_kind='causal_lm' requires config['datasets_order'] (or --tasks): causal task "
+                "names are keys under config['datasets'], not entries in a fixed registry."
+            )
 
         trust_remote_code = bool(_get(global_cfg, "backbone.trust_remote_code", False))
         use_fast_tokenizer = bool(_get(global_cfg, "backbone.use_fast_tokenizer", True))
@@ -1008,7 +1325,7 @@ def main() -> None:
 
         for task in tasks:
             task = str(task).strip().lower()
-            if task not in NLI_TASKS:
+            if not is_causal and task not in NLI_TASKS:
                 raise ValueError(f"Unknown task '{task}'. Supported: {list(NLI_TASKS)}")
 
             task_cfg = deepcopy(common)
@@ -1027,6 +1344,10 @@ def main() -> None:
             strategy = str(_get(task_cfg, "strategy.name", "full"))
             if strategy not in {"full", "linear_probe", "peft_lora"}:
                 raise ValueError(f"[{task}] Unsupported strategy '{strategy}'. Use one of: full, linear_probe, peft_lora")
+            if is_causal and strategy != "peft_lora":
+                raise ValueError(
+                    f"[{task}] model_kind='causal_lm' supports strategy.name='peft_lora' only (got '{strategy}')."
+                )
 
             optimizer_name = str(_get(task_cfg, "train.optimizer.name", "adamw"))
             lr = float(_get(task_cfg, "train.lr", 1e-4))
@@ -1041,30 +1362,38 @@ def main() -> None:
             batch_size = int(_get(task_cfg, "data.batch_size", 8))
             num_workers = int(_get(task_cfg, "data.num_workers", 0))
             max_length = int(_get(task_cfg, "data.max_length", 512))
-            task_num_labels = int(len(build_nli_task_data(task=task, split="train", max_samples=1).labels))
-            cfg_head_num_labels = int(
-                _get(task_cfg, "backbone.num_labels", _get(global_cfg, "backbone.num_labels", task_num_labels))
-            )
-            if cfg_head_num_labels != task_num_labels:
-                print(
-                    f"[{task}] overriding backbone.num_labels from {cfg_head_num_labels} "
-                    f"to {task_num_labels} to match dataset labels."
+            if is_causal:
+                head_num_labels = 0
+            else:
+                task_num_labels = int(len(build_nli_task_data(task=task, split="train", max_samples=1).labels))
+                cfg_head_num_labels = int(
+                    _get(task_cfg, "backbone.num_labels", _get(global_cfg, "backbone.num_labels", task_num_labels))
                 )
-            head_num_labels = int(task_num_labels)
+                if cfg_head_num_labels != task_num_labels:
+                    print(
+                        f"[{task}] overriding backbone.num_labels from {cfg_head_num_labels} "
+                        f"to {task_num_labels} to match dataset labels."
+                    )
+                head_num_labels = int(task_num_labels)
 
             seed = int(_get(task_cfg, "seed", 42))
             early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
             early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
+            eval_every_n_steps = int(_get(task_cfg, "train.eval_every_n_steps", 0))
 
             task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
             save_format = str(_get(task_cfg, "output.save_format", save_format_default))
             save_last_epoch = bool(_get(task_cfg, "output.save_last_epoch", save_last_epoch_default))
             extract_heads = bool(_get(task_cfg, "output.extract_heads", extract_heads_default))
 
-            if save_format not in {"full", "head", "peft"}:
-                raise ValueError(f"[{task}] output.save_format must be one of: full, head, peft")
-            if save_format == "peft" and strategy != "peft_lora":
-                raise ValueError(f"[{task}] save_format='peft' requires strategy.name='peft_lora'.")
+            if save_format not in {"full", "head", "peft", "hf"}:
+                raise ValueError(f"[{task}] output.save_format must be one of: full, head, peft, hf")
+            if save_format in {"peft", "hf"} and strategy != "peft_lora":
+                raise ValueError(f"[{task}] save_format='{save_format}' requires strategy.name='peft_lora'.")
+            if is_causal and save_format in {"head"}:
+                raise ValueError(f"[{task}] save_format='head' is meaningless for model_kind='causal_lm'.")
+            if is_causal and extract_heads:
+                raise ValueError(f"[{task}] output.extract_heads is unsupported for model_kind='causal_lm'.")
 
             build_cfg = TextBuildConfig(
                 model_name_or_path=str(model_name_or_path),
@@ -1072,7 +1401,7 @@ def main() -> None:
                 device=str(device),
                 dtype=_get(task_cfg, "dtype", dtype),
                 model_kind=str(_get(task_cfg, "backbone.model_kind", model_kind)),
-                num_labels=int(head_num_labels),
+                num_labels=max(1, int(head_num_labels)),
                 trust_remote_code=bool(_get(task_cfg, "backbone.trust_remote_code", trust_remote_code)),
                 use_fast_tokenizer=bool(_get(task_cfg, "backbone.use_fast_tokenizer", use_fast_tokenizer)),
             )
@@ -1096,6 +1425,7 @@ def main() -> None:
                 head_num_labels=head_num_labels,
                 early_stopping=early_stopping,
                 early_stopping_patience=early_stopping_patience,
+                eval_every_n_steps=eval_every_n_steps,
                 seed=seed,
                 deterministic=deterministic,
                 device=str(device),

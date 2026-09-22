@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 NLI_TASKS = ("snli", "mnli", "sick", "qnli", "rte", "scitail")
+
+# Blank-line join shared with lm_eval.models.hf_rebased._calibration_texts.
+_CAUSAL_TEXT_JOIN = "\n\n"
+
+# Rows per batched tokenizer call. Bounds the transient Python-list peak.
+_TOKENIZE_CHUNK = 1000
 
 
 @dataclass(frozen=True)
@@ -411,3 +419,271 @@ def build_nli_tokenized_loader(
         }
     )
     return NLITokenizedData(task=task_data.task, loader=loader, mask_class=mask_class, meta=meta)
+
+
+# --- Causal-LM (prompt -> response) loading ------------------------------
+#
+# Deliberately generic: the dataset is described in the training config rather
+# than registered here, because the target sets (dart-math, Magicoder, alpaca,
+# hellaswag) share one shape and differ only in field names.
+
+# Same rationale and same role as eval.text_rebase._VAL_TEST_SPLIT_SEED.
+_CAUSAL_VAL_SPLIT_SEED = 0
+
+
+@dataclass(frozen=True)
+class CausalExample:
+    prompt: str
+    response: str
+
+
+@dataclass(frozen=True)
+class CausalTaskData:
+    task: str
+    examples: list[CausalExample]
+    meta: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CausalTokenizedData:
+    task: str
+    loader: DataLoader
+    meta: dict[str, Any]
+
+
+def _causal_response(row: dict[str, Any], *, response_field: str, response_index_field: str | None) -> str | None:
+    raw = row.get(response_field, None)
+    if response_index_field is None:
+        return str(raw).strip() if isinstance(raw, str) and raw.strip() else None
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    try:
+        idx = int(str(row.get(response_index_field, "")).strip())
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= idx < len(raw):
+        return None
+    picked = str(raw[idx]).strip()
+    return picked or None
+
+
+def build_causal_task_data(
+    *,
+    task: str,
+    hf_path: str,
+    hf_config: str | None = None,
+    split: str = "train",
+    prompt_fields: str,
+    response_field: str,
+    response_index_field: str | None = None,
+    max_samples: int | None = None,
+) -> CausalTaskData:
+    """Rows of (prompt, response) from an arbitrary HF dataset.
+
+    ``prompt_fields`` is ``+``-separated and joined by blank lines, matching
+    ``lm_eval.models.hf_rebased._calibration_texts`` exactly: the text a source
+    model is trained on here must be the text steer_text later calibrates on,
+    or Stage 1 silently reads a different distribution than it was fit for.
+    """
+    try:
+        from datasets import load_dataset
+    except Exception as e:
+        raise ImportError("Text task loading requires `datasets` (install with `.[data]`).") from e
+
+    names = [n for n in str(prompt_fields).split("+") if n]
+    if not names:
+        raise ValueError("prompt_fields must name at least one dataset column.")
+
+    # ponytail: streaming + head-of-split, like _calibration_texts. Swap in
+    # .shuffle(seed) on a non-streaming load if head-of-split ordering bias shows up.
+    rows = load_dataset(hf_path, hf_config, split=split, streaming=True)
+
+    limit = None if max_samples is None else max(0, int(max_samples))
+    examples: list[CausalExample] = []
+    skipped = 0
+    for row in rows:
+        if limit is not None and len(examples) >= limit:
+            break
+        prompt = _CAUSAL_TEXT_JOIN.join(str(row[k]) for k in names if row.get(k))
+        response = _causal_response(
+            row, response_field=response_field, response_index_field=response_index_field
+        )
+        if not prompt.strip() or response is None:
+            skipped += 1
+            continue
+        examples.append(CausalExample(prompt=prompt, response=response))
+
+    if not examples:
+        raise ValueError(
+            f"No usable examples for task '{task}' "
+            f"(path={hf_path}, config={hf_config}, split={split}, "
+            f"prompt_fields={prompt_fields}, response_field={response_field})."
+        )
+
+    meta = {
+        "task": task,
+        "hf_path": hf_path,
+        "hf_config": hf_config,
+        "hf_split": split,
+        "prompt_fields": str(prompt_fields),
+        "response_field": str(response_field),
+        "response_index_field": response_index_field,
+        "num_examples": len(examples),
+        "num_skipped": skipped,
+    }
+    return CausalTaskData(task=task, examples=examples, meta=meta)
+
+
+def split_causal_task_data(
+    task_data: CausalTaskData,
+    *,
+    val_fraction: float,
+) -> tuple[CausalTaskData, CausalTaskData]:
+    """Seeded disjoint (train, val) carve.
+
+    dart-math / Magicoder / alpaca ship a single ``train`` split, so validation
+    has to be carved out of it; the seeded permutation keeps the carve identical
+    across runs (same pattern as eval.text_rebase._build_task_splits).
+    """
+    if not 0.0 < float(val_fraction) < 1.0:
+        raise ValueError("val_fraction must be in (0, 1).")
+
+    generator = torch.Generator().manual_seed(_CAUSAL_VAL_SPLIT_SEED)
+    perm = torch.randperm(len(task_data.examples), generator=generator).tolist()
+    n_val = int(round(float(val_fraction) * len(perm)))
+    if n_val <= 0 or n_val >= len(perm):
+        raise ValueError(
+            f"val_fraction={val_fraction} carves {n_val} of {len(perm)} examples for "
+            f"task '{task_data.task}'; raise max_train_samples or val_fraction."
+        )
+
+    def _slice(indices: list[int], name: str) -> CausalTaskData:
+        meta = dict(task_data.meta)
+        meta.update({"split_role": name, "num_examples": len(indices)})
+        return CausalTaskData(
+            task=task_data.task,
+            examples=[task_data.examples[i] for i in indices],
+            meta=meta,
+        )
+
+    return _slice(sorted(perm[n_val:]), "train"), _slice(sorted(perm[:n_val]), "validation")
+
+
+class _TokenizedCausalDataset(Dataset):
+    """Token ids as int32 arrays, not Python lists.
+
+    591K rows of dart-math-uniform at max_length=1024 is ~13.6 GB as lists of
+    Python ints (28 bytes per int plus an 8-byte slot, x2 for labels) and ~1.7 GB
+    as int32 -- the difference between OOM-before-step-1 and fitting.
+    """
+
+    def __init__(self, rows: list[tuple[np.ndarray, np.ndarray]]) -> None:
+        self.rows = rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        return self.rows[int(idx)]
+
+
+@dataclass(frozen=True)
+class _CausalCollator:
+    """Right-pads to the batch max. A module-level class, not a closure, so
+    DataLoader workers can pickle it (py3.12+ defaults to forkserver)."""
+
+    pad_id: int
+
+    def __call__(self, batch: list[tuple[np.ndarray, np.ndarray]]) -> dict[str, torch.Tensor]:
+        width = max(len(ids) for ids, _ in batch)
+        input_ids = torch.full((len(batch), width), self.pad_id, dtype=torch.long)
+        labels = torch.full((len(batch), width), -100, dtype=torch.long)
+        attention_mask = torch.zeros((len(batch), width), dtype=torch.long)
+        for i, (ids, ys) in enumerate(batch):
+            n = len(ids)
+            input_ids[i, :n] = torch.from_numpy(ids.astype(np.int64))
+            labels[i, :n] = torch.from_numpy(ys.astype(np.int64))
+            attention_mask[i, :n] = 1
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def build_causal_tokenized_loader(
+    *,
+    task_data: CausalTaskData,
+    tokenizer: Any,
+    batch_size: int = 1,
+    num_workers: int = 0,
+    max_length: int = 512,
+    shuffle: bool = False,
+) -> CausalTokenizedData:
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be > 0.")
+    if int(max_length) <= 4:
+        raise ValueError("max_length must be > 4.")
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        raise ValueError("Tokenizer exposes neither pad_token_id nor eos_token_id.")
+    eos_id = tokenizer.eos_token_id
+
+    rows: list[tuple[np.ndarray, np.ndarray]] = []
+    dropped = 0
+    limit = int(max_length)
+    # Chunked so the tokenizer's Python-list output never materializes for the
+    # whole split at once; batched calls also use the fast tokenizer's threads.
+    for start in range(0, len(task_data.examples), _TOKENIZE_CHUNK):
+        chunk = task_data.examples[start : start + _TOKENIZE_CHUNK]
+        # Prompt and response tokenized separately and concatenated:
+        # tok(a + b) != tok(a) + tok(b) in general, and the -100 boundary has to
+        # land exactly on the join.
+        prompt_batch = tokenizer([ex.prompt for ex in chunk], add_special_tokens=True)["input_ids"]
+        response_batch = tokenizer(
+            [_CAUSAL_TEXT_JOIN + ex.response for ex in chunk], add_special_tokens=False
+        )["input_ids"]
+
+        for prompt_ids, response_ids in zip(prompt_batch, response_batch, strict=True):
+            n_prompt = len(prompt_ids)
+            if n_prompt >= limit:
+                # Prompt alone fills max_length: nothing is supervised, so the
+                # row would contribute a zero-token loss term.
+                dropped += 1
+                continue
+            if eos_id is not None:
+                response_ids = list(response_ids) + [int(eos_id)]
+            ids = np.fromiter(
+                itertools.chain(prompt_ids, response_ids), dtype=np.int32, count=n_prompt + len(response_ids)
+            )[:limit]
+            ys = ids.copy()
+            ys[:n_prompt] = -100
+            rows.append((ids, ys))
+
+    if not rows:
+        raise ValueError(
+            f"All {len(task_data.examples)} rows of task '{task_data.task}' lost their response to "
+            f"truncation at max_length={max_length}."
+        )
+
+    loader = DataLoader(
+        _TokenizedCausalDataset(rows),
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=_CausalCollator(pad_id=int(pad_id)),
+    )
+
+    meta = dict(task_data.meta)
+    meta.update(
+        {
+            "num_examples_tokenized": len(rows),
+            "num_dropped_truncated": dropped,
+            "max_length": int(max_length),
+            "batch_size": int(batch_size),
+            "num_workers": int(num_workers),
+            "shuffle": bool(shuffle),
+        }
+    )
+    return CausalTokenizedData(task=task_data.task, loader=loader, meta=meta)
