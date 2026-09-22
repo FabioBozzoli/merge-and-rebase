@@ -940,3 +940,56 @@ def test_train_linear_probe_head_fits_a_few_shot_support_set() -> None:
             correct += int((pred == batch["labels"]).sum())
             total += int(batch["labels"].numel())
     assert correct / total >= 0.9
+
+
+@pytest.mark.parametrize("dropout", [False, True])
+def test_train_linear_probe_head_dropout_switch_sets_the_backbone_mode(dropout: bool) -> None:
+    """dropout=False must keep every Dropout in eval mode for the whole probe loop.
+
+    Recorded from the Dropout modules themselves rather than from `model.training`,
+    because what matters is what the frozen backbone's features saw. The True case
+    pins the legacy default, which older linear-probe configs rely on to reproduce.
+    """
+    from merge_and_rebase.rebase.text import train_linear_probe_head
+
+    model = _tiny_t5_encoder(seed=0)
+    loaders = _text_loaders(n=12, seed=0)
+    seen: list[bool] = []
+    dropouts = [m for m in model.modules() if isinstance(m, torch.nn.Dropout)]
+    assert dropouts, "the tiny encoder should carry the same Dropout modules as t5-large"
+    handles = [m.register_forward_pre_hook(lambda mod, _args: seen.append(mod.training)) for m in dropouts]
+    try:
+        train_linear_probe_head(
+            model, loaders.train, device="cpu", mask_class=loaders.mask_class, lr=0.05, steps=2, dropout=dropout,
+        )
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert seen
+    assert set(seen) == {dropout}
+    assert not model.training  # always handed back in eval(), whichever path ran
+
+
+def test_train_linear_probe_head_feature_cache_matches_recomputing() -> None:
+    """Caching the head's inputs must change the cost, not the result.
+
+    A frozen backbone in eval() returns the same features every epoch, so the two
+    paths differ only in how often they compute them -- if this drifts, the cache is
+    pairing features with the wrong labels or missing the steer correction hook.
+    """
+    from merge_and_rebase.rebase.text import train_linear_probe_head
+
+    kwargs = dict(device="cpu", lr=0.05, steps=5, dropout=False)
+    model_a, loaders_a = _tiny_t5_encoder(seed=0), _text_loaders(n=12, seed=0)
+    cached = train_linear_probe_head(
+        model_a, loaders_a.train, mask_class=loaders_a.mask_class, cache_features=True, **kwargs
+    )
+    model_b, loaders_b = _tiny_t5_encoder(seed=0), _text_loaders(n=12, seed=0)
+    recomputed = train_linear_probe_head(
+        model_b, loaders_b.train, mask_class=loaders_b.mask_class, cache_features=False, **kwargs
+    )
+
+    assert set(cached) == set(recomputed)
+    for name, tensor in cached.items():
+        torch.testing.assert_close(tensor, recomputed[name], rtol=1e-5, atol=1e-6)

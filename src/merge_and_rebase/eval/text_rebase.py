@@ -857,6 +857,10 @@ def main() -> None:
             raise ValueError("linear_probe_head is only supported for method in {theseus, bico, steer_text}.")
         linear_probe_epochs = int(cfg.get("linear_probe_epochs", 200))
         linear_probe_lr = float(cfg.get("linear_probe_lr", 1e-2))
+        # True (the default) trains the probe with the model in train(), i.e. with the
+        # frozen backbone's dropout on; false keeps it in eval(). See
+        # adapters.train_linear_probe_head -- the default only preserves older configs.
+        linear_probe_dropout = bool(cfg.get("linear_probe_dropout", True))
         linear_probe_init = str(cfg.get("linear_probe_init", "random")).strip().lower()
         if linear_probe_init not in {"random", "nearest_mean"}:
             raise ValueError(f"linear_probe_init must be 'random' or 'nearest_mean', got '{linear_probe_init}'.")
@@ -1355,7 +1359,10 @@ def main() -> None:
                 probe_loader = subset_loader(loaders.train, probe_indices, batch_size=batch_size)
                 probe_local_labels = [int(loaders.local_labels["train"][i]) for i in probe_indices]
                 init_desc = "from a nearest-mean-cosine init" if linear_probe_init == "nearest_mean" else "from scratch"
-                print(f"  {task}: linear-probing the target head {init_desc} on {len(probe_indices)} support examples")
+                print(
+                    f"  {task}: linear-probing the target head {init_desc} on {len(probe_indices)} support examples "
+                    f"(backbone dropout {'on' if linear_probe_dropout else 'off'})"
+                )
 
                 # "support" is the probe's own training set: if that one doesn't
                 # rise, the probe simply isn't training (epochs/lr), independently
@@ -1392,6 +1399,7 @@ def main() -> None:
                             eval_loaders=probe_eval_loaders,
                             log_every=linear_probe_log_every,
                             log_prefix=f"  [probe:{task}]",
+                            dropout=linear_probe_dropout,
                         )
                 else:
                     probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
@@ -1415,6 +1423,7 @@ def main() -> None:
                         eval_loaders=probe_eval_loaders,
                         log_every=linear_probe_log_every,
                         log_prefix=f"  [probe:{task}]",
+                        dropout=linear_probe_dropout,
                     )
                 # Ship the identity intermediate layers alongside the trained
                 # final linear, exactly as build_nearest_mean_head.py does, so
