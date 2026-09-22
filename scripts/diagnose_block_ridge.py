@@ -35,6 +35,7 @@ import argparse
 import itertools
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -69,8 +70,10 @@ def _model_tag(model: str, kind: str) -> str:
 def _load_split(cfg: Mapping[str, Any], task: str, split: str) -> dict[str, Any]:
     mp = cfg["method_params"]
     kind = cfg.get("model_kind", "sequence_classification")
+    # FEATURE_CACHE_DIR relocates the cache (e.g. a copy on another machine)
+    # without editing every run's config.json; the layout under it is unchanged.
     cache_dir = _cache_split_dir(
-        str(mp["feature_cache_dir"]),
+        os.environ.get("FEATURE_CACHE_DIR", str(mp["feature_cache_dir"])),
         _model_tag(cfg["source_model_name_or_path"], kind),
         _model_tag(cfg["target_model_name_or_path"], kind),
         task,
