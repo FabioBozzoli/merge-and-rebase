@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import time
@@ -860,6 +861,16 @@ def main() -> None:
         linear_probe_init = str(cfg.get("linear_probe_init", "random")).strip().lower()
         if linear_probe_init not in {"random", "nearest_mean"}:
             raise ValueError(f"linear_probe_init must be 'random' or 'nearest_mean', got '{linear_probe_init}'.")
+        # "post" (default, legacy): probe after prepare/transport, so for steer_text
+        # Stage 1 reads an *untrained* random w_b off the live head and the probe is
+        # then fit under the resulting correction. "pre": probe on the pristine
+        # target base first, inject, and only then run the rebasin method -- w_b is
+        # the probed head, and the head no longer depends on the method.
+        linear_probe_stage = str(cfg.get("linear_probe_stage", "post")).strip().lower()
+        if linear_probe_stage not in {"post", "pre"}:
+            raise ValueError(f"linear_probe_stage must be 'post' or 'pre', got '{linear_probe_stage}'.")
+        if linear_probe_stage == "pre" and not linear_probe_head:
+            raise ValueError("linear_probe_stage only applies when linear_probe_head is set.")
         # None -> ~10 log lines over the run. Each line scores support/val/test,
         # so a small value here buys more curve at the cost of extra eval passes.
         linear_probe_log_every = cfg.get("linear_probe_log_every", None)
@@ -1006,6 +1017,73 @@ def main() -> None:
         transported_artifacts: dict[str, list[str]] = {}
         steer_prepared_by_task: dict[str, dict[str, Any]] = {}
         source_eval_rows: list[dict[str, Any]] = []
+
+        def _probe_head(*, task: str, loaders: TextLoaders, correction: Any = None) -> dict[str, torch.Tensor]:
+            """Train the target's final head Linear on this task's support set and
+            return the head state dict to store in ``target_task_heads``.
+
+            The model must already hold the backbone the probe should be fit on
+            (pristine base for stage="pre", base + transported delta for "post");
+            ``correction`` is steer_text's correction context, active during
+            training so the probe fits the corrected feature.
+            """
+            probe_shots = method_params.get("shots_per_class") if shim_mode else method_params.get("few_shot")
+            if probe_shots is None:
+                raise ValueError(
+                    f"linear_probe_head requires method_params."
+                    f"{'shots_per_class' if shim_mode else 'few_shot'} to be set -- the probe trains on "
+                    "the exact same support set (same count, same seed) as the rebasin transport itself."
+                )
+            probe_indices = balanced_indices(loaders.local_labels["train"], int(probe_shots), seed=seed)
+            # Mini-batched at the run's own batch_size, not one giant batch of
+            # the whole support set -- shots_per_class=300 x 3 classes is 900
+            # examples, which OOMs a large target model in a single forward pass
+            # regardless of how small batch_size is set elsewhere.
+            probe_loader = subset_loader(loaders.train, probe_indices, batch_size=batch_size)
+            probe_local_labels = [int(loaders.local_labels["train"][i]) for i in probe_indices]
+            init_desc = "from a nearest-mean-cosine init" if linear_probe_init == "nearest_mean" else "from scratch"
+            print(f"  {task}: linear-probing the target head {init_desc} on {len(probe_indices)} support examples")
+
+            if linear_probe_init == "nearest_mean":
+                # ponytail: computed on the plain (uncorrected) pooled feature --
+                # steer_text_correction_context hooks the head module itself, which
+                # this swaps out for Identity, so init sees no correction regardless
+                # of alpha. Exact under stage="pre" (no correction exists yet) and
+                # for the alpha=0 baseline; for a stage="post" run with alpha!=0,
+                # capture the head's post-hook input instead of _head_as_identity.
+                _nearest_mean_init_head(
+                    model=llm_target.model,
+                    loader=probe_loader,
+                    local_labels=probe_local_labels,
+                    mask_class=loaders.mask_class,
+                    device=device,
+                )
+
+            # "support" is the probe's own training set: if that one doesn't
+            # rise, the probe simply isn't training (epochs/lr), independently
+            # of anything the transport/correction did upstream. val/test are
+            # scored under the same condition the probe was fit in (for
+            # steer_text under stage="post", that means with the correction hook
+            # active), so they are not the same numbers as the final
+            # baseline/rebased table.
+            probe_eval_loaders = {"support": probe_loader, "val": loaders.val, "test": loaders.test}
+            with (correction if correction is not None else contextlib.nullcontext()):
+                trained_head_sd = train_linear_probe_head(
+                    llm_target.model,
+                    probe_loader,
+                    device=device,
+                    mask_class=loaders.mask_class,
+                    lr=linear_probe_lr,
+                    steps=linear_probe_epochs,
+                    eval_loaders=probe_eval_loaders,
+                    log_every=linear_probe_log_every,
+                    log_prefix=f"  [probe:{task}]",
+                )
+            # Ship the identity intermediate layers alongside the trained final
+            # linear, exactly as build_nearest_mean_head.py does, so the
+            # per-evaluation head injection restores the same feature space the
+            # probe (and steer's correction) were fit in.
+            return {**trained_head_sd, **neutralized_head_layers}
 
         for task in tasks:
             splits = _build_task_splits(
@@ -1165,13 +1243,25 @@ def main() -> None:
                 if a_finetuned is not llm_source_finetuned:
                     del a_finetuned
 
+            if linear_probe_head and linear_probe_stage == "pre":
+                # Build the head BEFORE any rebasin method touches anything, on
+                # the pristine target base: no transported delta, no correction.
+                # target_base_sd already carries the neutralized (identity)
+                # intermediate head layers -- they were written before it was
+                # snapshotted -- so the probe fits the same feature space the
+                # head is later re-injected into. The reload also keeps task 2
+                # from probing on top of task 1's trained head.
+                load_into_model(llm_target.model, target_base_sd, strict=strict_load)
+                target_task_heads[task] = _probe_head(task=task, loaders=loaders)
+
             if eval_mode == "head_logits" and target_task_heads is not None and task in target_task_heads:
                 # steer_text reads w_b off the live head at prepare() time, so the
                 # task head must already be in place before the method runs.
-                # Under linear_probe_head, the head hasn't been trained yet for
-                # this task (target_task_heads starts empty), so this is skipped
-                # and the model's own from-scratch random init stays in place --
-                # exactly the starting point linear probing is supposed to fit.
+                # Under linear_probe_head with stage="post", the head hasn't been
+                # trained yet for this task (target_task_heads starts empty), so
+                # this is skipped and the model's own from-scratch random init
+                # stays in place. Under stage="pre" the block above has just
+                # filled it in, so what lands here is the probed head.
                 _inject_task_head(
                     model=llm_target.model,
                     task=task,
@@ -1180,12 +1270,15 @@ def main() -> None:
                     head_class_ids=head_class_ids,
                 )
 
-            if linear_probe_head:
+            if linear_probe_head and linear_probe_stage == "post":
                 # steer_text's Stage 1 reads w_b off the live head in prepare(),
                 # and the probe below must start from that exact same matrix for
                 # the correction to mean anything. Restore the pristine base so
                 # both see it -- otherwise task 2 of a multi-task run would fit
                 # its correction against task 1's trained head.
+                # Skipped under stage="pre": the reload already happened before
+                # the probe, and repeating it here would wipe the head that was
+                # just injected for prepare() to read.
                 load_into_model(llm_target.model, target_base_sd, strict=strict_load)
 
             print(f"\n--- Transporting '{task}' with method '{method.name}' ---")
@@ -1339,88 +1432,17 @@ def main() -> None:
                 context={"task": task, "method": method.name},
             )
 
-            if linear_probe_head:
-                probe_shots = method_params.get("shots_per_class") if shim_mode else method_params.get("few_shot")
-                if probe_shots is None:
-                    raise ValueError(
-                        f"linear_probe_head requires method_params."
-                        f"{'shots_per_class' if shim_mode else 'few_shot'} to be set -- the probe trains on "
-                        "the exact same support set (same count, same seed) as the rebasin transport itself."
-                    )
-                probe_indices = balanced_indices(loaders.local_labels["train"], int(probe_shots), seed=seed)
-                # Mini-batched at the run's own batch_size, not one giant batch of
-                # the whole support set -- shots_per_class=300 x 3 classes is 900
-                # examples, which OOMs a large target model in a single forward pass
-                # regardless of how small batch_size is set elsewhere.
-                probe_loader = subset_loader(loaders.train, probe_indices, batch_size=batch_size)
-                probe_local_labels = [int(loaders.local_labels["train"][i]) for i in probe_indices]
-                init_desc = "from a nearest-mean-cosine init" if linear_probe_init == "nearest_mean" else "from scratch"
-                print(f"  {task}: linear-probing the target head {init_desc} on {len(probe_indices)} support examples")
-
-                # "support" is the probe's own training set: if that one doesn't
-                # rise, the probe simply isn't training (epochs/lr), independently
-                # of anything the transport/correction did upstream. val/test are
-                # scored under the same condition the probe was fit in (for
-                # steer_text, that means with the correction hook active), so they
-                # are not the same numbers as the final baseline/rebased table.
-                probe_eval_loaders = {"support": probe_loader, "val": loaders.val, "test": loaders.test}
+            if linear_probe_head and linear_probe_stage == "post":
                 probe_alpha = float(cfg.get("alpha", 1.0))
                 if steer_mode:
                     load_into_model(llm_target.model, target_base_sd, strict=strict_load)
-                    if linear_probe_init == "nearest_mean":
-                        # ponytail: computed on the plain (uncorrected) pooled feature --
-                        # steer_text_correction_context hooks the head module itself, which
-                        # this swaps out for Identity, so init sees no correction regardless
-                        # of alpha. Exact for this baseline (alpha=0 always); for a real
-                        # alpha!=0 steer_text run, move this inside the context and capture
-                        # the head's post-hook input instead of using _head_as_identity.
-                        _nearest_mean_init_head(
-                            model=llm_target.model,
-                            loader=probe_loader,
-                            local_labels=probe_local_labels,
-                            mask_class=loaders.mask_class,
-                            device=device,
-                        )
-                    with steer_text_correction_context(llm_target, prepared, alpha=probe_alpha):
-                        trained_head_sd = train_linear_probe_head(
-                            llm_target.model,
-                            probe_loader,
-                            device=device,
-                            mask_class=loaders.mask_class,
-                            lr=linear_probe_lr,
-                            steps=linear_probe_epochs,
-                            eval_loaders=probe_eval_loaders,
-                            log_every=linear_probe_log_every,
-                            log_prefix=f"  [probe:{task}]",
-                        )
+                    correction = steer_text_correction_context(llm_target, prepared, alpha=probe_alpha)
                 else:
                     probe_backbone_sd = axpy_state_dict(target_base_sd, transported_delta, alpha=probe_alpha)
                     load_into_model(llm_target.model, probe_backbone_sd, strict=strict_load)
                     del probe_backbone_sd
-                    if linear_probe_init == "nearest_mean":
-                        _nearest_mean_init_head(
-                            model=llm_target.model,
-                            loader=probe_loader,
-                            local_labels=probe_local_labels,
-                            mask_class=loaders.mask_class,
-                            device=device,
-                        )
-                    trained_head_sd = train_linear_probe_head(
-                        llm_target.model,
-                        probe_loader,
-                        device=device,
-                        mask_class=loaders.mask_class,
-                        lr=linear_probe_lr,
-                        steps=linear_probe_epochs,
-                        eval_loaders=probe_eval_loaders,
-                        log_every=linear_probe_log_every,
-                        log_prefix=f"  [probe:{task}]",
-                    )
-                # Ship the identity intermediate layers alongside the trained
-                # final linear, exactly as build_nearest_mean_head.py does, so
-                # the per-evaluation head injection restores the same feature
-                # space the probe (and steer's correction) were fit in.
-                target_task_heads[task] = {**trained_head_sd, **neutralized_head_layers}
+                    correction = None
+                target_task_heads[task] = _probe_head(task=task, loaders=loaders, correction=correction)
 
             save_transport_dir = cfg.get("save_transported_tvs_dir", None)
             if save_transport_dir and not steer_mode:
