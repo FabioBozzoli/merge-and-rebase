@@ -776,6 +776,11 @@ def _export_hf_merged_model(
 # so every optimizer step consumes the same A rows for any N dividing A, and the
 # summed-then-normalized gradient over them is identical. A sweep on 4 GPUs can
 # therefore continue on 8; total_steps still guards the horizon.
+#
+# Nor are batch_size and accumulate_grad_batches separately: only their product,
+# the rows per optimizer step. Rank r's rows of step k are the same for bs=1 x 64
+# and bs=2 x 32, and the gradient is an exact token-weighted sum over them, so a
+# bs=1 run can continue at bs=2.
 _RESUME_STRUCTURAL_KEYS = (
     "model_name_or_path",
     "model_kind",
@@ -787,8 +792,7 @@ _RESUME_STRUCTURAL_KEYS = (
     "warmup_length",
     "steps_per_epoch",
     "total_steps",
-    "accumulate_grad_batches",
-    "batch_size",
+    "rows_per_step",
     "max_length",
     "seed",
     "num_train_rows",
@@ -830,7 +834,9 @@ def _load_resume_checkpoint(
     allow_lr_change: bool,
 ) -> dict[str, Any]:
     ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
-    saved = ckpt.get("fingerprint", {})
+    saved = dict(ckpt.get("fingerprint", {}))
+    if "rows_per_step" not in saved and "batch_size" in saved:  # checkpoints from before the key existed
+        saved["rows_per_step"] = int(saved["batch_size"]) * int(saved["accumulate_grad_batches"])
     keys = list(_RESUME_STRUCTURAL_KEYS) + ([] if allow_lr_change else ["lr"])
     mismatched = {k: (saved.get(k), fingerprint.get(k)) for k in keys if saved.get(k) != fingerprint.get(k)}
     if mismatched:
@@ -969,16 +975,8 @@ def train_task(
         device=dev,
         model_kind=build_cfg.model_kind,
     )
-    # 'lowrank' computes the same function without densifying the adapter (see
-    # forward_mode._apply_lowrank_linearized_forward) and is 1.6x faster on CPU, but measured
-    # 0.68x on an A100 at seq 1024 (0.97 vs 0.66 s/micro-batch) for ~2 GiB less: the dense
-    # dW . x is cheap on tensor cores while the low-rank path adds many small kernels. Dense
-    # stays the default; 'lowrank' is kept for CPU runs and as the equivalence reference.
-    linearization_impl = str((strategy_cfg or {}).get("linearization_impl", "dense"))
     trainable_info = dict(trainable_info)
     trainable_info["forward_mode"] = forward_mode
-    if forward_mode != "standard":
-        trainable_info["linearization_impl"] = linearization_impl
     trainable_info.update(
         apply_training_forward_mode(
             model=model,
@@ -986,7 +984,6 @@ def train_task(
             device=dev,
             output_transform=lambda out: out.logits,
             output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
-            impl=linearization_impl,
         )
     )
 
@@ -1028,6 +1025,7 @@ def train_task(
         "steps_per_epoch": int(steps_per_epoch),
         "total_steps": int(total_steps),
         "accumulate_grad_batches": int(accumulate_grad_batches_global),
+        "rows_per_step": int(batch_size) * int(accumulate_grad_batches_global),
         "world_size": int(ddp.world_size),
         "batch_size": int(batch_size),
         "max_length": int(max_length),
@@ -1048,10 +1046,9 @@ def train_task(
         resumed_ckpt = _load_resume_checkpoint(
             resume_from, fingerprint=fingerprint, allow_lr_change=resume_allow_lr_change
         )
-        # Loaded strictly after apply_training_forward_mode: the dense impl
-        # snapshots its linearization point with lora_B == 0 (the pretrained
-        # weights) and would refuse a warm adapter. The lowrank impl has no
-        # snapshot, so the order is harmless there.
+        # Loaded after apply_training_forward_mode, which snapshots the
+        # pretrained value of any non-LoRA trainable param as its expansion
+        # point; LoRA hosts expand around the frozen base weights either way.
         params = _trainable_params()
         saved_params = resumed_ckpt["trainable_state"]
         if set(params) != set(saved_params):

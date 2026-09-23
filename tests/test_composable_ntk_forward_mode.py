@@ -233,9 +233,10 @@ def test_apply_training_forward_mode_linearizes_only_trainable_text_params() -> 
         output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
     )
 
+    # Frozen params are read live from the model (no reference copy), so only the
+    # trainable weight moves; the model is linear, so the linearization is exact.
     with torch.no_grad():
         model.score.weight.add_(2.0)
-        model.score.bias.add_(5.0)
 
     batch = torch.ones(2, 4)
     out = model(input_ids=batch)
@@ -632,23 +633,22 @@ def test_apply_training_forward_mode_materializes_lora_weight_space_for_text() -
         output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
     )
 
-    linearized = model._linearized_module
-    assert all("lora_" not in name for name in linearized.param_names)
-    assert any(name.endswith("proj.base_layer.weight") for name in linearized.param_names)
+    names = model._ntk_linearized_names
+    assert all("lora_" not in name for name in names)
+    assert any(name.endswith("proj.base_layer.weight") for name in names)
 
     named_params = dict(model.named_parameters())
     with torch.no_grad():
         named_params["base_model.model.proj.lora_B.default.weight"].fill_(0.25)
 
+    # proj is linear, so f(W0) + J.(s B A) is exactly x (W0 + s B A)^T + b.
     inputs = torch.randn(4, 4)
     actual = model(input_ids=inputs).logits
-    current_params = materialized_peft_param_map(model)
-    manual = linearized.forward(
-        current_module=model,
-        current_params=current_params,
-        kwargs={"input_ids": inputs},
-        output_transform=lambda out: out.logits,
-    )
+    w0 = named_params["base_model.model.proj.base_layer.weight"]
+    b0 = named_params["base_model.model.proj.base_layer.bias"]
+    a = named_params["base_model.model.proj.lora_A.default.weight"]
+    b = named_params["base_model.model.proj.lora_B.default.weight"]
+    manual = inputs @ (w0 + (4 / 2) * b @ a).t() + b0
     assert torch.allclose(actual, manual, atol=1e-6, rtol=1e-5)
 
     actual.sum().backward()

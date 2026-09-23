@@ -31,7 +31,7 @@ from merge_and_rebase.data.text_loaders import (
 from merge_and_rebase.finetune import train_text
 from merge_and_rebase.finetune.forward_mode import apply_training_forward_mode
 from merge_and_rebase.models.text_lm import TextBuildConfig
-from merge_and_rebase.utils.peft_materialization import materialized_peft_param_map
+from merge_and_rebase.utils.linearization import forward_ad_safe_attention_context
 
 VOCAB = 64
 TARGET_MODULES = ["q_proj", "v_proj"]
@@ -78,8 +78,8 @@ def _linearized_peft_causal_lm(*, r: int = 4, lora_alpha: int = 8, seed: int = 0
         output_transform=lambda out: out.logits,
         output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
     )
-    # PEFT zero-inits lora_B, which is what makes the bind-time snapshot equal
-    # the pretrained weights. Move off zero only afterwards.
+    # Warm the adapter after binding, as a resumed run does; the expansion point
+    # is the frozen base weights either way.
     with torch.no_grad():
         for name, param in model.named_parameters():
             if "lora_B" in name:
@@ -109,49 +109,46 @@ def _tiny_tokenizer():
 
 
 def test_linearized_forward_is_first_order_expansion_around_pretrained_weights() -> None:
-    """f_lin(x) == f(x; W0) + d/de f(x; W0 + e.dW)|_{e=0}.
+    """f_lin(x) == f(x; W0) + d/de f(x; W0 + e.dW)|_{e=0}, dW = s.B.A.
 
-    Checked in two halves against an *independent* plain-forward path, so a
-    wrong expansion point and a wrong tangent fail separately:
+    Checked in two halves against an *independent* plain forward of the
+    unwrapped pretrained model, so a wrong expansion point and a wrong tangent
+    fail separately:
       - with lora_B == 0 the linearized forward must be exactly f(x; W0);
-      - the remainder must match a central difference along dW = s.B.A.
+      - the remainder must match a central difference along dW.
     """
     model = _linearized_peft_causal_lm()
     model.double()
-    linearized = model._linearized_module
-    linearized.ref_module.double()
-    linearized.theta0 = tuple(t.double() for t in linearized.theta0)
-    linearized.buffer_values = tuple(
-        b.double() if b.is_floating_point() else b for b in linearized.buffer_values
-    )
+    plain = _tiny_causal_lm().double()  # same seed -> same W0, no adapters
 
-    assert all("lora_" not in name for name in linearized.param_names)
-    assert any(name.endswith("q_proj.base_layer.weight") for name in linearized.param_names)
+    names = model._ntk_linearized_names
+    assert all("lora_" not in name for name in names)
+    assert any(name.endswith("q_proj.base_layer.weight") for name in names)
+
+    # dW per host, from the adapter factors, keyed by the plain model's names.
+    tangent = {}
+    for name, mod in model.named_modules():
+        if hasattr(mod, "base_layer") and "default" in getattr(mod, "lora_A", {}):
+            plain_name = name.removeprefix("base_model.model.") + ".weight"
+            a, b = mod.lora_A["default"].weight.detach(), mod.lora_B["default"].weight.detach()
+            tangent[plain_name] = float(mod.scaling["default"]) * b @ a
+    w0 = {n: p.detach() for n, p in plain.named_parameters()}
+    assert tangent and max(float(t.abs().max()) for t in tangent.values()) > 0.0
 
     input_ids = torch.randint(2, VOCAB, (2, 6))
     attention_mask = torch.ones_like(input_ids)
 
-    theta0 = dict(zip(linearized.param_names, linearized.theta0, strict=True))
-    buffers = dict(zip(linearized.buffer_names, linearized.buffer_values, strict=True))
-    params_now = materialized_peft_param_map(model)
-    tangent = {n: params_now[n].double().detach() - theta0[n] for n in linearized.param_names}
-    assert max(float(t.abs().max()) for t in tangent.values()) > 0.0
-
     def _plain(eps: float) -> torch.Tensor:
-        param_map = {n: theta0[n] + eps * tangent[n] for n in linearized.param_names}
+        params = {n: w0[n] + eps * t for n, t in tangent.items()}
         out = functional_call(
-            linearized.ref_module,
-            (param_map, buffers),
-            args=(),
-            kwargs={"input_ids": input_ids, "attention_mask": attention_mask},
-            strict=False,
+            plain, params, args=(), kwargs={"input_ids": input_ids, "attention_mask": attention_mask}, strict=False
         )
         return out.logits.detach()
 
     with torch.no_grad():
         actual = model(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        # Expansion point: zero tangent must reproduce the pretrained forward.
+        # Expansion point: zero update must reproduce the pretrained forward.
         for name, param in model.named_parameters():
             if "lora_B" in name:
                 param.zero_()
@@ -324,10 +321,13 @@ def test_hf_export_round_trips_through_automodel(tmp_path, monkeypatch) -> None:
     assert "f(x; W0) + J(x; W0) . dW" in meta["linearized_warning"]
 
 
-def test_linearized_bind_rejects_a_warm_adapter() -> None:
-    """Binding after loading a trained adapter would make the expansion point
-    'pretrained + frozen adapter' and double-count the delta."""
-    model = get_peft_model(
+def test_binding_order_does_not_move_the_expansion_point() -> None:
+    """The primal is the frozen base weight itself, so binding and THEN loading a
+    trained adapter (the resume order) computes the same function as binding a
+    model whose adapter is already warm -- both expand around W0."""
+    import copy
+
+    cold = get_peft_model(
         _tiny_causal_lm(),
         LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -339,18 +339,29 @@ def test_linearized_bind_rejects_a_warm_adapter() -> None:
             bias="none",
         ),
     )
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if "lora_B" in name:
-                param.fill_(0.1)
+    warm = copy.deepcopy(cold)
+    torch.manual_seed(3)
+    b_vals = {n: 0.1 * torch.randn_like(p) for n, p in cold.named_parameters() if "lora_B" in n}
 
-    with pytest.raises(RuntimeError, match="lora_B == 0"):
+    def _load_b(model):
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if n in b_vals:
+                    p.copy_(b_vals[n])
+
+    _load_b(warm)
+    for model in (cold, warm):
         apply_training_forward_mode(
             model=model,
             forward_mode="linearized_ntk",
             device=torch.device("cpu"),
             output_transform=lambda out: out.logits,
+            output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
         )
+    _load_b(cold)
+
+    ids = torch.randint(2, VOCAB, (2, 8))
+    torch.testing.assert_close(cold(input_ids=ids).logits, warm(input_ids=ids).logits)
 
 
 def test_step_level_eval_lets_early_stopping_fire_inside_one_epoch(tmp_path, monkeypatch) -> None:
@@ -466,7 +477,9 @@ def _resume_loaders(n_rows: int = 20, batch_size: int = 2, seed: int = 0, rank: 
 def _run_resumable(tmp_path, monkeypatch, **overrides):
     info = overrides.get("dist_info")
     train, val = _resume_loaders(
-        rank=getattr(info, "rank", 0), world_size=getattr(info, "world_size", 1)
+        batch_size=overrides.get("batch_size", 2),
+        rank=getattr(info, "rank", 0),
+        world_size=getattr(info, "world_size", 1),
     )
     monkeypatch.setattr(
         train_text.TextLM,
@@ -593,7 +606,7 @@ def test_resume_rejects_a_checkpoint_from_a_different_run(tmp_path, monkeypatch)
     _run_resumable(tmp_path / "first", monkeypatch, max_steps=2)
     ckpt = str(_resume_dir(tmp_path / "first") / "step_0000002.pt")
 
-    with pytest.raises(ValueError, match="accumulate_grad_batches"):
+    with pytest.raises(ValueError, match="rows_per_step"):
         _run_resumable(tmp_path / "b", monkeypatch, resume_from=ckpt, accumulate_grad_batches=1)
     with pytest.raises(ValueError, match="lr"):
         _run_resumable(tmp_path / "c", monkeypatch, resume_from=ckpt, lr=0.02)
@@ -602,6 +615,29 @@ def test_resume_rejects_a_checkpoint_from_a_different_run(tmp_path, monkeypatch)
         tmp_path / "d", monkeypatch, resume_from=ckpt, lr=0.02, resume_allow_lr_change=True, max_steps=3
     )
     assert summary["global_update_step"] == 3
+
+
+def test_bs1_checkpoint_resumes_at_bs2_with_the_same_rows_per_step(tmp_path, monkeypatch) -> None:
+    """bs=1 x 4 and bs=2 x 2 consume the same 4 rows per optimizer step, and the
+    gradient is an exact token-weighted sum over them, so a bs=1 run continues at
+    bs=2 onto the weights an uninterrupted bs=2 run reaches (padding is masked)."""
+    _run_resumable(tmp_path / "straight", monkeypatch, max_steps=4, batch_size=2, accumulate_grad_batches=2)
+    _run_resumable(tmp_path / "first", monkeypatch, max_steps=2, batch_size=1, accumulate_grad_batches=4)
+    summary, _ = _run_resumable(
+        tmp_path / "second",
+        monkeypatch,
+        max_steps=4,
+        batch_size=2,
+        accumulate_grad_batches=2,
+        resume_from=str(_resume_dir(tmp_path / "first") / "step_0000002.pt"),
+    )
+    assert summary["global_update_step"] == 4
+
+    a = torch.load(_resume_dir(tmp_path / "straight") / "step_0000004.pt", weights_only=False)
+    b = torch.load(_resume_dir(tmp_path / "second") / "step_0000004.pt", weights_only=False)
+    assert a["rows_consumed_in_epoch"] == b["rows_consumed_in_epoch"]
+    for name, value in a["trainable_state"].items():
+        torch.testing.assert_close(b["trainable_state"][name], value, rtol=1e-4, atol=1e-6)
 
 
 def test_sigusr1_checkpoints_at_the_next_step_and_exits(tmp_path, monkeypatch) -> None:
@@ -626,106 +662,137 @@ def test_sigusr1_checkpoints_at_the_next_step_and_exits(tmp_path, monkeypatch) -
     assert not (tmp_path / "dummy" / "resume_causal" / "peft_lora__linearized_ntk_hf").exists()
 
 
-# --- lowrank linearization impl ----------------------------------------------
+# --- the linearization against an independent oracle --------------------------
 #
-# jvp along lora_B -> eps * lora_B through PEFT's own forward must be the same
-# function as the dense weight-space jvp, without densifying W0 + s B A.
+# Oracle: g(eps) = f_peft(x; W0, A, eps * B) through PEFT's OWN forward. Then
+# g(0) + g'(0) = f(x; W0) + J_W(x; W0) . (s B A) exactly, with the LoRA scale
+# applied by PEFT and no weight-space tangent anywhere -- a computation that
+# shares nothing with the implementation under test.
+
+ALL_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
-def _peft_pair_with_warm_adapter(dtype=torch.float64):
-    """(dense, lowrank) PEFT models with identical W0, A and a nonzero B."""
-    import copy
-
-    base = _tiny_causal_lm().to(dtype)
-    dense = get_peft_model(
-        base,
+def _warm_peft_fp64(**lora_kwargs):
+    model = get_peft_model(
+        _tiny_causal_lm().double(),
         LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=4,
             lora_alpha=8,
             lora_dropout=0.0,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=ALL_TARGETS,
             bias="none",
+            **lora_kwargs,
         ),
     )
-    lowrank = copy.deepcopy(dense)
-    for model, impl in ((dense, "dense"), (lowrank, "lowrank")):
-        apply_training_forward_mode(
-            model=model,
-            forward_mode="linearized_ntk",
-            device=torch.device("cpu"),
-            output_transform=lambda out: out.logits,
-            output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
-            impl=impl,
-        )
     torch.manual_seed(1)
     with torch.no_grad():
-        for (name, p), (_, q) in zip(dense.named_parameters(), lowrank.named_parameters(), strict=True):
+        for name, p in model.named_parameters():
             if "lora_B" in name:
                 p.normal_(std=0.3)
             elif "lora_A" in name:
                 p.add_(0.1 * torch.randn_like(p))
-            q.copy_(p)
-    return dense, lowrank
+    return model
 
 
-def _loss_and_grads(model, ids):
-    logits = model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
-    loss = train_text._causal_lm_loss(logits, ids)
+def _bind(model):
+    apply_training_forward_mode(
+        model=model,
+        forward_mode="linearized_ntk",
+        device=torch.device("cpu"),
+        output_transform=lambda out: out.logits,
+        output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
+    )
+    return model
+
+
+def _oracle_logits(model, ids, extra=None):
+    """extra: {param name: (p0, p)} for non-LoRA params, tangent p - p0."""
+    extra = extra or {}
+    b = {n: p for n, p in model.named_parameters() if "lora_B" in n}
+
+    def g(eps):
+        params = {n: eps * p for n, p in b.items()}
+        params.update({n: p0 + eps * (p - p0) for n, (p0, p) in extra.items()})
+        return functional_call(
+            model, params, args=(), kwargs={"input_ids": ids, "attention_mask": torch.ones_like(ids)}, strict=False
+        ).logits
+
+    e0 = torch.zeros((), dtype=torch.float64)
+    with forward_ad_safe_attention_context(torch.device("cpu")):  # CPU flash SDPA has no forward AD
+        f0, df = torch.func.jvp(g, (e0,), (torch.ones_like(e0),))
+    return f0 + df
+
+
+def _loss_and_grads(model, logits_fn):
+    logits = logits_fn()
     model.zero_grad(set_to_none=True)
-    loss.backward()
+    train_text._causal_lm_loss(logits, IDS_FOR_GRADS).backward()
     return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.requires_grad}
 
 
-def test_lowrank_linearization_matches_dense_forward_and_gradients() -> None:
-    dense, lowrank = _peft_pair_with_warm_adapter()
-    ids = torch.randint(2, VOCAB, (2, 10))
-
-    y_dense, g_dense = _loss_and_grads(dense, ids)
-    y_low, g_low = _loss_and_grads(lowrank, ids)
-
-    torch.testing.assert_close(y_low, y_dense, rtol=1e-10, atol=1e-10)
-    assert set(g_low) == set(g_dense) and len(g_low) == 28  # A and B of 7 modules x 2 layers
-    for name, grad in g_dense.items():
-        torch.testing.assert_close(g_low[name], grad, rtol=1e-8, atol=1e-10)
+IDS_FOR_GRADS = torch.randint(2, VOCAB, (2, 10), generator=torch.Generator().manual_seed(7))
 
 
-def test_lowrank_linearization_is_linear_in_the_adapter_not_the_nonlinear_model() -> None:
-    """f_lin(2B) - 2 f_lin(B) + f_lin(0) == 0, while the plain PEFT forward curves."""
-    _, lowrank = _peft_pair_with_warm_adapter()
-    b_values = {n: p.detach().clone() for n, p in lowrank.named_parameters() if "lora_B" in n}
+@pytest.mark.parametrize("use_rslora", [False, True])
+def test_linearization_matches_the_oracle_forward_and_gradients(use_rslora) -> None:
+    import copy
+
+    model = _warm_peft_fp64(use_rslora=use_rslora)
+    oracle = copy.deepcopy(model)
+    _bind(model)
+    ids = IDS_FOR_GRADS
+
+    y, g = _loss_and_grads(model, lambda: model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits)
+    y_ref, g_ref = _loss_and_grads(oracle, lambda: _oracle_logits(oracle, ids))
+
+    torch.testing.assert_close(y, y_ref, rtol=1e-10, atol=1e-10)
+    assert set(g) == set(g_ref) and len(g) == 28  # A and B of 7 modules x 2 layers
+    for name, grad in g_ref.items():
+        torch.testing.assert_close(g[name], grad, rtol=1e-8, atol=1e-10)
+
+
+def test_linearization_is_linear_in_the_update_and_exact_at_zero() -> None:
+    """f_lin(2B) - 2 f_lin(B) + f_lin(0) == 0 while the plain PEFT forward curves,
+    and at B == 0 it is exactly the pretrained model."""
+    model = _bind(_warm_peft_fp64())
+    b_values = {n: p.detach().clone() for n, p in model.named_parameters() if "lora_B" in n}
     ids = torch.randint(2, VOCAB, (2, 10))
 
     def _at(scale):
         with torch.no_grad():
-            for n, p in lowrank.named_parameters():
+            for n, p in model.named_parameters():
                 if n in b_values:
                     p.copy_(scale * b_values[n])
-            return lowrank(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
+            return model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
 
     y0, y1, y2 = _at(0.0), _at(1.0), _at(2.0)
     assert (y2 - 2 * y1 + y0).abs().max().item() < 1e-10
-    # ...and at B == 0 it is exactly the pretrained model.
     torch.testing.assert_close(y0, _tiny_causal_lm().double()(input_ids=ids).logits, rtol=1e-10, atol=1e-10)
 
 
-def test_lowrank_linearization_rejects_non_lora_trainable_params() -> None:
-    model = get_peft_model(
-        _tiny_causal_lm(),
-        LoraConfig(task_type=TaskType.CAUSAL_LM, r=4, lora_alpha=8, target_modules=list(TARGET_MODULES)),
-    )
-    for name, p in model.named_parameters():
-        if "lm_head" in name:
-            p.requires_grad = True
-    with pytest.raises(ValueError, match="not LoRA factors"):
-        apply_training_forward_mode(
-            model=model,
-            forward_mode="linearized_ntk",
-            device=torch.device("cpu"),
-            output_transform=lambda out: out.logits,
-            impl="lowrank",
-        )
+def test_non_lora_trainable_params_enter_as_p_minus_p0() -> None:
+    """A trainable non-LoRA param (here lm_head, like a modules_to_save head) is
+    linearized around its value at bind time, alongside the LoRA update."""
+    import copy
+
+    model = _warm_peft_fp64()
+    head = "base_model.model.lm_head.weight"
+    dict(model.named_parameters())[head].requires_grad = True
+    oracle = copy.deepcopy(model)
+    head0 = dict(oracle.named_parameters())[head].detach().clone()
+    _bind(model)
+
+    torch.manual_seed(2)
+    with torch.no_grad():
+        dict(model.named_parameters())[head].add_(0.05 * torch.randn_like(head0))
+    head_now = dict(model.named_parameters())[head].detach().clone()
+
+    ids = torch.randint(2, VOCAB, (2, 10))
+    y = model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
+    y_ref = _oracle_logits(oracle, ids, extra={head: (head0, head_now)})
+    torch.testing.assert_close(y, y_ref, rtol=1e-10, atol=1e-10)
 
 
 # --- data parallelism --------------------------------------------------------
