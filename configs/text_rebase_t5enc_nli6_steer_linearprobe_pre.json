@@ -1,0 +1,64 @@
+{
+  "_comment": "steer_text (linear regime + block_ridge) from google-t5/t5-base to google-t5/t5-large, encoder-only classification, with the TARGET head built by linear probing BEFORE the rebasin method runs (linear_probe_stage='pre'). Base config for scripts/sbatch_text_rebase_t5enc_nli6_linearprobe_pre_sweep.sh, which overrides tasks/seed/method_params per array element.",
+  "_no_head_file": "No target_task_heads here on purpose: linear_probe_head builds B's head in-run and the two are mutually exclusive. This replaces the scripts/build_nearest_mean_head.py step the nearest-mean sbatch scripts run first -- linear_probe_init='nearest_mean' still seeds the probe from the same centroids, it just does it in-process on the pristine base.",
+  "_stage_pre": "With stage='pre' the order is probe -> inject -> prepare/transport -> eval, so steer_text's Stage 1 reads a trained w_b off the live head instead of B's from-scratch random init. alpha=1.0 is therefore meaningful here, unlike the alpha=0 probe baseline.",
+  "_source_ckpts": "Local transformers directories written by scripts/convert_t5_encoder_ckpt.py (t5base_6text_noreg_ntk). _load_tuned_source_state_dict treats a local dir exactly like a Hub id, so source_model_name_or_path must be the pretrained base they were fine-tuned from: google-t5/t5-base (original T5, vocab 32128 -- matches google-t5/t5-large on the target side).",
+  "_how_to_run": "sbatch scripts/sbatch_text_rebase_t5enc_nli6_linearprobe_pre_sweep.sh",
+
+  "suite": "nli6",
+  "tasks": "all",
+
+  "source_model_name_or_path": "google-t5/t5-base",
+  "source_model_arch": "t5",
+  "target_model_name_or_path": "google-t5/t5-large",
+  "target_model_arch": "t5",
+  "model_kind": "encoder_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+
+  "eval_mode": "head_logits",
+  "eval_source_finetuned": true,
+  "linear_probe_head": true,
+  "linear_probe_stage": "pre",
+  "linear_probe_init": "nearest_mean",
+  "linear_probe_epochs": 200,
+  "linear_probe_lr": 0.01,
+  "head_key_pattern": "classification_head",
+
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 8,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 33,
+
+  "method": "steer_text",
+  "method_params": {
+    "feature_regime": "linear",
+    "stage_2_strategy": "block_ridge",
+    "block_group_strategy": "concat",
+    "block_ridge_mode": "independent",
+    "few_shot": 300,
+    "stage1_lambda": 1.0,
+    "ridge_lambda": 1.0,
+    "force_recompute_features": false
+  },
+
+  "alpha_search": false,
+  "alpha": 1.0,
+  "alpha_selection": "shared",
+  "weights": null,
+  "strict_load": false,
+
+  "tuned_ckpts": {
+    "snli": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_t5_converted/t5base_6text_noreg_ntk/snli",
+    "mnli": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_t5_converted/t5base_6text_noreg_ntk/mnli",
+    "sick": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_t5_converted/t5base_6text_noreg_ntk/sick",
+    "qnli": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_t5_converted/t5base_6text_noreg_ntk/qnli",
+    "rte": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_t5_converted/t5base_6text_noreg_ntk/rte",
+    "scitail": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_t5_converted/t5base_6text_noreg_ntk/scitail"
+  }
+}
