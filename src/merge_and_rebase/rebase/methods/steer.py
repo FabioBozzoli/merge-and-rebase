@@ -217,6 +217,7 @@ def _fit_block_ridge(
     regularization: float,
     mode: str,
     rho: float = 0.9,
+    lambda_scaling: str = "fixed",
 ) -> list[torch.Tensor]:
     """
     Fit per-block ridge coefficients, chained with a smoothed-residual carry.
@@ -226,11 +227,40 @@ def _fit_block_ridge(
     coefficients can be applied to *any* new block activations at predict
     time -- this is the split-fit/predict factoring of steer4rebase's
     stage2.block_ridge (which fits and predicts in a single call).
+
+    ``lambda_scaling`` controls how ``regularization`` (Eq. 36's beta) is spread
+    over the blocks:
+
+    ``"fixed"``
+        The literal shared scalar, as the paper writes it and as
+        steer4rebase does it. Default, so existing results are reproduced.
+    ``"per_block_gram"``
+        ``regularization * tr(X_l X_l^T) / n`` per block. Ridge depends on
+        ``lambda / ||X_l||^2``, not on lambda, so one shared scalar means
+        blocks whose activations differ in scale get different effective
+        shrinkage. That is harmless when the inputs are comparable (CLIP ViT)
+        and not when they are not: a T5 encoder's residual stream grows ~75x
+        from the first block to the last and is never normalized, while the
+        trailing block's input is the model's own pooled feature *after* the
+        final RMSNorm. Measured on a t5-base -> t5-large MNLI transfer, the
+        effective ``lambda/gram`` spans 1.7e-01 on the output block down to
+        3.2e-10 on the deepest residual block: every residual block is the
+        minimum-norm interpolant whatever ``ridge_lambda`` is set to, which is
+        why sweeping it changes nothing. This option makes the effective
+        shrinkage equal across blocks, so the scalar means the same thing
+        everywhere and becomes tunable again.
+
+    Note that under ``"fixed"`` with interpolating blocks the
+    ``smoothed_residual`` carry is inert (an exact fit leaves no residual to
+    propagate, so ``state`` stays at zero); it only starts doing work once the
+    blocks are actually regularized.
     """
     if mode not in {"independent", "smoothed_residual"}:
         raise ValueError(f"Unknown steer block_ridge mode: {mode}")
     if mode == "smoothed_residual" and not 0.0 <= rho <= 1.0:
         raise ValueError("steer block_ridge rho must be in [0, 1]")
+    if lambda_scaling not in {"fixed", "per_block_gram"}:
+        raise ValueError(f"Unknown steer block_ridge lambda_scaling: {lambda_scaling}")
 
     num_blocks = train_targets.shape[1]
     state = torch.zeros_like(train_targets[:, 0])
@@ -240,7 +270,10 @@ def _fit_block_ridge(
         local_target = train_targets[:, block_id]
         compensation = rho * state if mode == "smoothed_residual" else torch.zeros_like(state)
         fitted_target = local_target + compensation
-        coefficient = _ridge(x_train, fitted_target, regularization)
+        block_regularization = regularization
+        if lambda_scaling == "per_block_gram":
+            block_regularization = regularization * float((x_train * x_train).sum()) / x_train.shape[0]
+        coefficient = _ridge(x_train, fitted_target, block_regularization)
         coefficients.append(coefficient)
         if mode == "smoothed_residual":
             block_train_prediction = x_train @ coefficient

@@ -469,6 +469,7 @@ class SteerTextRebase:
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
+        block_ridge_lambda_scaling: str = "fixed",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -484,6 +485,10 @@ class SteerTextRebase:
             raise ValueError("steer_text block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer_text block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
+        # Checked here rather than only inside _fit_block_ridge so a typo in a
+        # config fails now, not after the per-block jvp has already run.
+        if block_ridge_lambda_scaling not in {"fixed", "per_block_gram"}:
+            raise ValueError("steer_text block_ridge_lambda_scaling must be 'fixed' or 'per_block_gram'")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
 
@@ -670,6 +675,7 @@ class SteerTextRebase:
                     regularization=ridge_lambda,
                     mode=block_ridge_mode,
                     rho=rho,
+                    lambda_scaling=block_ridge_lambda_scaling,
                 )
             ]
             stage2_state = {
@@ -680,6 +686,7 @@ class SteerTextRebase:
                 "block_group_strategy": str(block_group_strategy),
                 "block_ridge_mode": str(block_ridge_mode),
                 "rho": float(rho),
+                "lambda_scaling": str(block_ridge_lambda_scaling),
             }
 
             def correction_fn(

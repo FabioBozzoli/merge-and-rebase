@@ -80,6 +80,42 @@ def test_block_ridge_fit_predict_roundtrip() -> None:
         assert torch.isfinite(pred).all()
 
 
+def test_block_ridge_per_block_lambda_scaling() -> None:
+    """``per_block_gram`` must rescale lambda by each block's own Gram, and
+    ``fixed`` (the default) must stay bit-identical to the old behaviour."""
+    g = torch.Generator().manual_seed(5)
+    n_sel, num_blocks, d_block, d_out = 8, 3, 5, 2
+    # Blocks deliberately differing in scale by orders of magnitude, which is
+    # the case a single shared lambda cannot serve (a T5 encoder's residual
+    # stream grows ~75x with depth while the trailing block is normalized).
+    blocks_train = {
+        b: torch.randn(n_sel, d_block, generator=g, dtype=torch.float64) * (10.0**b) for b in range(num_blocks)
+    }
+    train_targets = torch.randn(n_sel, num_blocks, d_out, generator=g, dtype=torch.float64)
+    selected = torch.arange(n_sel)
+    kwargs = dict(selected=selected, regularization=1.0, mode="smoothed_residual", rho=0.9)
+
+    default = steer_mod._fit_block_ridge(blocks_train, train_targets, **kwargs)
+    fixed = steer_mod._fit_block_ridge(blocks_train, train_targets, lambda_scaling="fixed", **kwargs)
+    assert all(torch.equal(a, b) for a, b in zip(default, fixed, strict=True))
+
+    scaled = steer_mod._fit_block_ridge(blocks_train, train_targets, lambda_scaling="per_block_gram", **kwargs)
+    assert len(scaled) == num_blocks
+    pred = steer_mod._predict_block_ridge(scaled, blocks_train)
+    assert pred.shape == (n_sel, d_out)
+    assert torch.isfinite(pred).all()
+    # The large-Gram block is the one whose effective shrinkage changes most,
+    # so its coefficients must differ; a no-op flag would pass everything else.
+    assert not torch.equal(scaled[-1], fixed[-1])
+
+    try:
+        steer_mod._fit_block_ridge(blocks_train, train_targets, lambda_scaling="nope", **kwargs)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown lambda_scaling must be rejected")
+
+
 def test_group_blocks_concat_and_sum_avg() -> None:
     blocks = {b: torch.full((2, 3), float(b)) for b in range(4)}
     concat = steer_mod._group_blocks_concat(blocks, 2)
