@@ -640,6 +640,53 @@ def test_bs1_checkpoint_resumes_at_bs2_with_the_same_rows_per_step(tmp_path, mon
         torch.testing.assert_close(b["trainable_state"][name], value, rtol=1e-4, atol=1e-6)
 
 
+def test_repack_keeps_every_row_and_respects_the_token_budget() -> None:
+    torch.manual_seed(0)
+    lengths = [3, 17, 5, 9, 12, 2, 16, 7]
+    batches = []
+    for pair in (lengths[i : i + 2] for i in range(0, len(lengths), 2)):  # loader batches of 2, right-padded
+        width = max(pair)
+        ids = torch.zeros(2, width, dtype=torch.long)
+        ys = torch.full((2, width), -100, dtype=torch.long)
+        mask = torch.zeros(2, width, dtype=torch.long)
+        for r, n in enumerate(pair):
+            ids[r, :n] = torch.randint(2, VOCAB, (n,))
+            ys[r, n // 2 : n] = ids[r, n // 2 : n]
+            mask[r, :n] = 1
+        batches.append({"input_ids": ids, "attention_mask": mask, "labels": ys})
+
+    def _rows(bs):
+        out = []
+        for b in bs:
+            for r in range(b["input_ids"].shape[0]):
+                n = int(b["attention_mask"][r].sum())
+                out.append((tuple(b["input_ids"][r, :n].tolist()), tuple(b["labels"][r, :n].tolist())))
+        return sorted(out)
+
+    packed = train_text._repack_causal_rows(batches, token_budget=20, pad_id=0)
+    assert _rows(packed) == _rows(batches)  # same rows, same labels, nothing dropped or duplicated
+    for mb in packed:
+        rows, width = mb["input_ids"].shape
+        assert rows == 1 or rows * width <= 20
+        assert bool((mb["labels"][mb["attention_mask"] == 0] == -100).all())  # padding never supervised
+    padded = sum(mb["attention_mask"].numel() for mb in packed)
+    assert padded < sum(b["attention_mask"].numel() for b in batches)  # less padding than loader order
+
+
+def test_token_budget_packing_trains_the_same_weights_as_plain_batches(tmp_path, monkeypatch) -> None:
+    """Same rows per step, exact token-weighted sum: regrouping them inside the
+    step must not change the update."""
+    _run_resumable(tmp_path / "plain", monkeypatch, max_steps=4)
+    summary, _ = _run_resumable(tmp_path / "packed", monkeypatch, max_steps=4, micro_batch_tokens=20)
+    assert summary["hparams"]["micro_batch_tokens"] == 20
+
+    a = torch.load(_resume_dir(tmp_path / "plain") / "step_0000004.pt", weights_only=False)
+    b = torch.load(_resume_dir(tmp_path / "packed") / "step_0000004.pt", weights_only=False)
+    assert a["rows_consumed_in_epoch"] == b["rows_consumed_in_epoch"]
+    for name, value in a["trainable_state"].items():
+        torch.testing.assert_close(b["trainable_state"][name], value, rtol=1e-4, atol=1e-6)
+
+
 def test_sigusr1_checkpoints_at_the_next_step_and_exits(tmp_path, monkeypatch) -> None:
     import os
     import signal

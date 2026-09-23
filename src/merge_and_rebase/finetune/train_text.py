@@ -580,6 +580,50 @@ def _causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _repack_causal_rows(
+    batches: list[dict[str, torch.Tensor]], *, token_budget: int, pad_id: int
+) -> list[dict[str, torch.Tensor]]:
+    """Regroup one optimizer step's rows into micro-batches by padded-token budget.
+
+    The collator right-pads every loader batch to its own longest row, so rows of
+    very different lengths waste most of the compute on padding. Within a step the
+    grouping is free: the gradient is a token-weighted SUM over the step's rows
+    (see _causal_lm_loss_sum), so any partition of the same rows gives the same
+    update. Rows are sorted longest-first and packed while
+    rows x longest <= token_budget; a single row is always allowed on its own.
+    The budget bounds activation memory like a fixed batch of budget/max_length
+    full-length rows (attention per micro-batch <= token_budget x longest row).
+    """
+    rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for b in batches:
+        mask = b["attention_mask"]
+        for r in range(mask.shape[0]):
+            n = int(mask[r].sum())  # right-padded: real tokens are the first n
+            rows.append((b["input_ids"][r, :n], b["labels"][r, :n]))
+    rows.sort(key=lambda row: -row[0].numel())
+
+    groups: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
+    for row in rows:
+        # longest-first: the group's first row sets its padded width
+        if groups and (len(groups[-1]) + 1) * groups[-1][0][0].numel() <= int(token_budget):
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+
+    out = []
+    for group in groups:
+        width = group[0][0].numel()
+        input_ids = torch.full((len(group), width), int(pad_id), dtype=group[0][0].dtype)
+        labels = torch.full((len(group), width), -100, dtype=group[0][1].dtype)
+        attention_mask = torch.zeros((len(group), width), dtype=torch.long)
+        for k, (ids, ys) in enumerate(group):
+            input_ids[k, : ids.numel()] = ids
+            labels[k, : ys.numel()] = ys
+            attention_mask[k, : ids.numel()] = 1
+        out.append({"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels})
+    return out
+
+
 def _causal_lm_loss_sum(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Same CE, summed instead of averaged, with the supervised-token count.
 
@@ -867,6 +911,7 @@ def train_task(
     early_stopping_patience: int,
     eval_every_n_steps: int = 0,
     max_steps: int | None = None,
+    micro_batch_tokens: int | None = None,
     save_every_n_steps: int = 0,
     resume_from: str | Path | None = None,
     resume_allow_lr_change: bool = False,
@@ -1296,6 +1341,18 @@ def train_task(
     if threading.current_thread() is threading.main_thread():
         prev_sigusr1 = signal.signal(signal.SIGUSR1, lambda *_: preempt.set())
 
+    if micro_batch_tokens is not None:
+        if not is_causal:
+            raise ValueError("data.micro_batch_tokens is only supported for model_kind='causal_lm'.")
+        if int(micro_batch_tokens) < int(max_length):
+            raise ValueError(
+                f"data.micro_batch_tokens={micro_batch_tokens} must be >= data.max_length={max_length}: "
+                "a full-length row has to fit a micro-batch on its own."
+            )
+    pad_id = int(getattr(getattr(train_loader.loader, "collate_fn", None), "pad_id", 0))
+    tokens_real = tokens_padded = micro_batches_run = 0
+    t_log = time.time()
+
     stop_training = False
     train_loss = float("nan")
     for epoch in range(start_epoch, epochs + 1):
@@ -1314,6 +1371,7 @@ def train_task(
         window_batch_count = 0
         window_size = 1
         window_items = 0
+        pending: list[dict[str, torch.Tensor]] = []
         with tqdm(
             total=n_train_batches,
             initial=skip,
@@ -1326,27 +1384,49 @@ def train_task(
                     remaining = n_train_batches - i
                     window_size = min(accumulate_grad_batches, remaining)
 
-                input_ids = batch["input_ids"].to(dev, non_blocking=True)
-                attention_mask = batch.get("attention_mask", None)
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(dev, non_blocking=True)
-                labels = batch["labels"].to(dev, non_blocking=True).long()
-
-                if is_causal:
-                    # No labels= into the model: HF would run its own shifted CE
-                    # *inside* the jvp, and under linearized_ntk the loss must be
-                    # computed on f(x;W0) + J.dW after the tangent is added.
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss_sum, n_items = _causal_lm_loss_sum(outputs.logits, labels)
+                # Token-budget mode: collect the step's loader batches and run them as
+                # length-sorted, budget-packed micro-batches when the window is complete.
+                # Same rows per step either way, so resume offsets and the fingerprint
+                # are untouched; only the grouping inside the step changes.
+                if micro_batch_tokens is not None:
+                    pending.append(batch)
+                    if window_batch_count + 1 == window_size:
+                        micro_batches = _repack_causal_rows(pending, token_budget=micro_batch_tokens, pad_id=pad_id)
+                        pending = []
+                    else:
+                        micro_batches = []
                 else:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    logits = outputs.logits
-                    loss_sum = nn.functional.cross_entropy(logits, labels, reduction="sum")
-                    n_items = int(labels.numel())
-                # Divided by a constant only to keep magnitudes near the per-item loss;
-                # the exact 1/total_items factor is applied to the grads at the step.
-                (loss_sum / loss_scale).backward()
-                window_items += n_items
+                    micro_batches = [batch]
+
+                for mb in micro_batches:
+                    input_ids = mb["input_ids"].to(dev, non_blocking=True)
+                    attention_mask = mb.get("attention_mask", None)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(dev, non_blocking=True)
+                        tokens_real += int(attention_mask.sum())
+                        tokens_padded += int(attention_mask.numel())
+                    labels = mb["labels"].to(dev, non_blocking=True).long()
+                    micro_batches_run += 1
+
+                    if is_causal:
+                        # No labels= into the model: HF would run its own shifted CE
+                        # *inside* the jvp, and under linearized_ntk the loss must be
+                        # computed on f(x;W0) + J.dW after the tangent is added.
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                        loss_sum, n_items = _causal_lm_loss_sum(outputs.logits, labels)
+                    else:
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        logits = outputs.logits
+                        loss_sum = nn.functional.cross_entropy(logits, labels, reduction="sum")
+                        n_items = int(labels.numel())
+                    # Divided by a constant only to keep magnitudes near the per-item loss;
+                    # the exact 1/total_items factor is applied to the grads at the step.
+                    (loss_sum / loss_scale).backward()
+                    window_items += n_items
+                    # Running average over items (supervised tokens for causal), matching
+                    # the way the gradient is normalized.
+                    running_loss += float(loss_sum.item())
+                    n_seen += n_items
 
                 window_batch_count += 1
                 should_step = window_batch_count == window_size
@@ -1368,11 +1448,6 @@ def train_task(
                     global_update_step += 1
                     window_batch_count = 0
 
-                # Running average over items (supervised tokens for causal), matching
-                # the way the gradient is normalized.
-                running_loss += float(loss_sum.item())
-                n_seen += n_items
-
                 train_loss = running_loss / max(1, n_seen)
                 pbar.update(1)
                 # refresh=False: let update() redraw at tqdm's mininterval (TQDM_MININTERVAL
@@ -1392,6 +1467,10 @@ def train_task(
                         metrics={
                             f"train/{task}/loss": float(train_loss),
                             f"train/{task}/lr": float(opt.param_groups[0]["lr"]),
+                            # rank 0's own micro-batches since the last log line
+                            f"train/{task}/pad_fraction": 1.0 - tokens_real / max(1, tokens_padded),
+                            f"train/{task}/micro_batches_per_step": micro_batches_run / log_every_n_steps,
+                            f"train/{task}/seconds_per_step": (time.time() - t_log) / log_every_n_steps,
                         },
                         step=int(global_update_step),
                         context={
@@ -1399,6 +1478,8 @@ def train_task(
                             "epoch": int(epoch),
                         },
                     )
+                    tokens_real = tokens_padded = micro_batches_run = 0
+                    t_log = time.time()
 
                 if not should_step:
                     continue
@@ -1546,6 +1627,7 @@ def train_task(
             "max_length": int(max_length),
             "eval_every_n_steps": int(eval_every_n_steps),
             "max_steps": None if max_steps is None else int(max_steps),
+            "micro_batch_tokens": None if micro_batch_tokens is None else int(micro_batch_tokens),
             "save_every_n_steps": int(save_every_n_steps),
             "scheduler_name": str(scheduler_name),
             "early_stopping": bool(early_stopping),
@@ -1788,6 +1870,8 @@ def main() -> None:
             early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
             early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
             eval_every_n_steps = int(_get(task_cfg, "train.eval_every_n_steps", 0))
+            micro_batch_tokens_raw = _get(task_cfg, "data.micro_batch_tokens", None)
+            micro_batch_tokens = None if micro_batch_tokens_raw is None else int(micro_batch_tokens_raw)
             max_steps_raw = _get(task_cfg, "train.max_steps", None)
             max_steps = None if max_steps_raw is None else int(max_steps_raw)
             save_every_n_steps = int(_get(task_cfg, "train.save_every_n_steps", 0))
@@ -1842,6 +1926,7 @@ def main() -> None:
                 early_stopping_patience=early_stopping_patience,
                 eval_every_n_steps=eval_every_n_steps,
                 max_steps=max_steps,
+                micro_batch_tokens=micro_batch_tokens,
                 save_every_n_steps=save_every_n_steps,
                 resume_from=resume_from,
                 resume_allow_lr_change=resume_allow_lr_change,
