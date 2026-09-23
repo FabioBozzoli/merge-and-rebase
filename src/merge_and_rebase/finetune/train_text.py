@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import re
+import signal
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -23,6 +26,7 @@ from merge_and_rebase.utils.helpers import parse_csv
 from ..data.text_loaders import (
     NLI_TASKS,
     CausalTokenizedData,
+    ResumableRandomSampler,
     build_causal_task_data,
     build_causal_tokenized_loader,
     build_nli_task_data,
@@ -31,6 +35,14 @@ from ..data.text_loaders import (
     split_causal_task_data,
 )
 from ..models.text_lm import TextBuildConfig, TextLM
+from ..utils.distributed import (
+    DistInfo,
+    all_reduce_sum_,
+    broadcast_flag,
+    init_distributed,
+    reduce_gradients_,
+    shutdown_distributed,
+)
 from .forward_mode import apply_training_forward_mode, resolve_training_forward_mode
 from .schedulers import build_lr_scheduler
 
@@ -268,6 +280,8 @@ def _build_causal_task_loaders(
     num_workers: int,
     max_length: int,
     task_cfg: dict[str, Any],
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[CausalTokenizedData, CausalTokenizedData, CausalTokenizedData, dict[str, Any]]:
     hf_path = _get(task_cfg, "data.hf_path", None)
     if not isinstance(hf_path, str) or not hf_path.strip():
@@ -315,6 +329,9 @@ def _build_causal_task_loaders(
         num_workers=num_workers,
         max_length=max_length,
         shuffle=True,
+        seed=int(_get(task_cfg, "seed", 42)),
+        rank=int(rank),
+        world_size=int(world_size),
     )
     val_loader = build_causal_tokenized_loader(
         task_data=val_data,
@@ -349,6 +366,8 @@ def _build_task_loaders(
     head_num_labels: int,
     task_cfg: dict[str, Any],
     model_kind: str = "sequence_classification",
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[Any, Any, Any, dict[str, Any]]:
     if str(model_kind) == "causal_lm":
         return _build_causal_task_loaders(
@@ -358,6 +377,8 @@ def _build_task_loaders(
             num_workers=num_workers,
             max_length=max_length,
             task_cfg=task_cfg,
+            rank=rank,
+            world_size=world_size,
         )
 
     max_train_samples = _get(task_cfg, "data.max_train_samples", None)
@@ -504,6 +525,9 @@ def _configure_text_strategy(
             target_modules=[str(x) for x in target_modules],
             bias=str(peft_cfg.get("bias", "none")),
             modules_to_save=[str(x) for x in modules_to_save] if modules_to_save else None,
+            # rsLoRA: scale alpha/sqrt(r) instead of alpha/r. Downstream delta-W
+            # reconstruction (merge.subspaces.core_space, eval.llm_merge) reads the same key.
+            use_rslora=bool(peft_cfg.get("use_rslora", False)),
         )
         model = get_peft_model(model, lora_cfg)
         peft_cfg_out = {
@@ -515,6 +539,7 @@ def _configure_text_strategy(
             "target_modules": [str(x) for x in target_modules],
             "bias": str(peft_cfg.get("bias", "none")),
             "modules_to_save": [str(x) for x in modules_to_save] if modules_to_save else [],
+            "use_rslora": bool(peft_cfg.get("use_rslora", False)),
         }
 
     else:
@@ -555,16 +580,40 @@ def _causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _causal_lm_loss_sum(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Same CE, summed instead of averaged, with the supervised-token count.
+
+    The training loop accumulates summed-loss gradients and divides once per
+    optimizer step by the window's total token count (all-reduced under data
+    parallelism). That makes the step an exact token-weighted mean, independent
+    of how rows are grouped into micro-batches or spread across ranks -- a
+    per-micro-batch mean would silently up-weight short rows.
+    """
+    flat_labels = labels[:, 1:].reshape(-1)
+    loss_sum = nn.functional.cross_entropy(
+        logits[:, :-1, :].reshape(-1, logits.size(-1)).float(),
+        flat_labels,
+        ignore_index=-100,
+        reduction="sum",
+    )
+    return loss_sum, int((flat_labels != -100).sum().item())
+
+
 @torch.no_grad()
-def _eval_causal(model: nn.Module, loader, device: str) -> dict[str, float]:
+def _eval_causal(model: nn.Module, loader, device: str, dist_info: DistInfo | None = None) -> dict[str, float]:
     dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
     model.to(dev)
     model.eval()
 
+    info = dist_info or DistInfo()
     total_loss = 0.0
     total_tokens = 0
     correct = 0
-    for batch in loader:
+    for i, batch in enumerate(loader):
+        # Each rank evaluates its stride of the val set; the sums are reduced below,
+        # so all ranks end up with the same metrics and take the same stop decision.
+        if info.enabled and i % info.world_size != info.rank:
+            continue
         input_ids = batch["input_ids"].to(dev, non_blocking=True)
         attention_mask = batch.get("attention_mask", None)
         if attention_mask is not None:
@@ -586,6 +635,11 @@ def _eval_causal(model: nn.Module, loader, device: str) -> dict[str, float]:
         )
         total_tokens += n_tokens
         correct += int((flat_logits.argmax(dim=-1) == flat_labels)[supervised].sum().item())
+
+    if info.enabled:
+        totals = torch.tensor([total_loss, float(total_tokens), float(correct)], dtype=torch.float64, device=dev)
+        all_reduce_sum_(totals, info)
+        total_loss, total_tokens, correct = float(totals[0]), int(totals[1].item()), int(totals[2].item())
 
     if total_tokens == 0:
         return {"val_loss": float("nan"), "val_ppl": float("nan"), "val_token_acc": float("nan")}
@@ -712,6 +766,79 @@ def _export_hf_merged_model(
     return meta
 
 
+# What must agree for a resumed run to continue the *same* run: the LR curve is
+# a pure function of (scheduler, warmup, total_steps) and the data order of
+# (seed, rows, batch_size). lr itself is checked separately so a deliberate
+# LR-override continuation stays possible (train.resume_allow_lr_change).
+#
+# world_size is deliberately NOT here. Rank r's j-th micro-batch of step k is
+# shard_r[k*A/N + j] = perm[k*A + j*N + r] (bs=1; blocks of bs rows otherwise),
+# so every optimizer step consumes the same A rows for any N dividing A, and the
+# summed-then-normalized gradient over them is identical. A sweep on 4 GPUs can
+# therefore continue on 8; total_steps still guards the horizon.
+_RESUME_STRUCTURAL_KEYS = (
+    "model_name_or_path",
+    "model_kind",
+    "strategy",
+    "forward_mode",
+    "peft",
+    "optimizer_name",
+    "scheduler_name",
+    "warmup_length",
+    "steps_per_epoch",
+    "total_steps",
+    "accumulate_grad_batches",
+    "batch_size",
+    "max_length",
+    "seed",
+    "num_train_rows",
+)
+
+
+def _rng_state() -> dict[str, Any]:
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _save_resume_checkpoint(resume_dir: Path, payload: dict[str, Any]) -> Path:
+    """step_{N}.pt plus a resume_last.pt symlink. Written via a temp file so a
+    kill mid-write never leaves a truncated checkpoint behind the symlink."""
+    _ensure_dir(resume_dir)
+    path = resume_dir / f"step_{int(payload['global_update_step']):07d}.pt"
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
+    last = resume_dir / "resume_last.pt"
+    if last.is_symlink() or last.exists():
+        last.unlink()
+    last.symlink_to(path.name)
+    return path
+
+
+def _load_resume_checkpoint(
+    path: str | Path,
+    *,
+    fingerprint: dict[str, Any],
+    allow_lr_change: bool,
+) -> dict[str, Any]:
+    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
+    saved = ckpt.get("fingerprint", {})
+    keys = list(_RESUME_STRUCTURAL_KEYS) + ([] if allow_lr_change else ["lr"])
+    mismatched = {k: (saved.get(k), fingerprint.get(k)) for k in keys if saved.get(k) != fingerprint.get(k)}
+    if mismatched:
+        details = ", ".join(f"{k}: checkpoint={a!r} run={b!r}" for k, (a, b) in mismatched.items())
+        raise ValueError(f"Resume checkpoint {path} does not match this run ({details}).")
+    return ckpt
+
+
 def train_task(
     *,
     task: str,
@@ -733,6 +860,11 @@ def train_task(
     early_stopping: bool,
     early_stopping_patience: int,
     eval_every_n_steps: int = 0,
+    max_steps: int | None = None,
+    save_every_n_steps: int = 0,
+    resume_from: str | Path | None = None,
+    resume_allow_lr_change: bool = False,
+    save_best_to_disk: bool = True,
     seed: int,
     deterministic: bool,
     device: str,
@@ -742,9 +874,29 @@ def train_task(
     task_cfg: dict[str, Any] | None = None,
     log_every_n_steps: int = 50,
     run_logger: Any | None = None,
+    dist_info: DistInfo | None = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     if accumulate_grad_batches <= 0:
         raise ValueError("accumulate_grad_batches must be >= 1.")
+    ddp = dist_info or DistInfo()
+
+    def _print(*args: Any) -> None:
+        """Rank 0 owns stdout; the other ranks would only duplicate every line."""
+        if ddp.is_main:
+            print(*args)
+
+    # train.accumulate_grad_batches is the GLOBAL window: N ranks each cover 1/N of it,
+    # so the effective batch and the LR schedule's step count do not depend on N.
+    accumulate_grad_batches_global = int(accumulate_grad_batches)
+    if ddp.enabled:
+        if accumulate_grad_batches_global % ddp.world_size != 0:
+            raise ValueError(
+                f"train.accumulate_grad_batches={accumulate_grad_batches_global} must be divisible by "
+                f"world_size={ddp.world_size}."
+            )
+        accumulate_grad_batches = accumulate_grad_batches_global // ddp.world_size
+    if max_steps is not None and int(max_steps) <= 0:
+        raise ValueError("max_steps must be >= 1 (or null for no cap).")
 
     dev = _device(device)
     _set_seed(seed, deterministic=deterministic)
@@ -773,6 +925,8 @@ def train_task(
         head_num_labels=head_num_labels,
         task_cfg=task_cfg or {},
         model_kind=build_cfg.model_kind,
+        rank=ddp.rank,
+        world_size=ddp.world_size,
     )
     if not is_causal:
         expected_num_labels = int(len(task_meta.get("labels", [])))
@@ -815,8 +969,16 @@ def train_task(
         device=dev,
         model_kind=build_cfg.model_kind,
     )
+    # 'lowrank' computes the same function without densifying the adapter (see
+    # forward_mode._apply_lowrank_linearized_forward) and is 1.6x faster on CPU, but measured
+    # 0.68x on an A100 at seq 1024 (0.97 vs 0.66 s/micro-batch) for ~2 GiB less: the dense
+    # dW . x is cheap on tensor cores while the low-rank path adds many small kernels. Dense
+    # stays the default; 'lowrank' is kept for CPU runs and as the equivalence reference.
+    linearization_impl = str((strategy_cfg or {}).get("linearization_impl", "dense"))
     trainable_info = dict(trainable_info)
     trainable_info["forward_mode"] = forward_mode
+    if forward_mode != "standard":
+        trainable_info["linearization_impl"] = linearization_impl
     trainable_info.update(
         apply_training_forward_mode(
             model=model,
@@ -824,6 +986,7 @@ def train_task(
             device=dev,
             output_transform=lambda out: out.logits,
             output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
+            impl=linearization_impl,
         )
     )
 
@@ -840,7 +1003,88 @@ def train_task(
     global_update_step = 0
     ckpt_stem = str(strategy) if forward_mode == "standard" else f"{strategy}__{forward_mode}"
     hf_export_dir = task_dir / f"{ckpt_stem}_hf"
+    best_ckpt_path = task_dir / f"{ckpt_stem}_best_ep.pt"
+    resume_dir = task_dir / "resume"
     best_trainable_state: dict[str, torch.Tensor] = {}
+    best_step = -1
+    last_eval_step = -1
+    stop_reason = "completed"
+    last_resume_path: Path | None = None
+
+    n_train_batches = len(train_loader.loader)
+    train_sampler = getattr(train_loader.loader, "sampler", None)
+    if not isinstance(train_sampler, ResumableRandomSampler):
+        train_sampler = None
+    fingerprint: dict[str, Any] = {
+        "model_name_or_path": build_cfg.model_name_or_path,
+        "model_kind": build_cfg.model_kind,
+        "strategy": strategy,
+        "forward_mode": forward_mode,
+        "peft": dict(peft_cfg_out),
+        "optimizer_name": str(optimizer_name),
+        "lr": float(lr),
+        "scheduler_name": str(scheduler_name),
+        "warmup_length": int(warmup_length),
+        "steps_per_epoch": int(steps_per_epoch),
+        "total_steps": int(total_steps),
+        "accumulate_grad_batches": int(accumulate_grad_batches_global),
+        "world_size": int(ddp.world_size),
+        "batch_size": int(batch_size),
+        "max_length": int(max_length),
+        "seed": int(seed),
+        "num_train_rows": int(train_sampler.num_rows) if train_sampler is not None else int(n_train_batches),
+    }
+
+    def _trainable_params() -> dict[str, nn.Parameter]:
+        return {n: p for n, p in model.named_parameters() if p.requires_grad}
+
+    trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+    loss_scale = float(max_length if is_causal else 1)
+
+    start_epoch = 1
+    resume_skip_batches = 0
+    resumed_ckpt: dict[str, Any] | None = None
+    if resume_from is not None:
+        resumed_ckpt = _load_resume_checkpoint(
+            resume_from, fingerprint=fingerprint, allow_lr_change=resume_allow_lr_change
+        )
+        # Loaded strictly after apply_training_forward_mode: the dense impl
+        # snapshots its linearization point with lora_B == 0 (the pretrained
+        # weights) and would refuse a warm adapter. The lowrank impl has no
+        # snapshot, so the order is harmless there.
+        params = _trainable_params()
+        saved_params = resumed_ckpt["trainable_state"]
+        if set(params) != set(saved_params):
+            diff = sorted(set(params) ^ set(saved_params))
+            raise ValueError(f"Resume checkpoint trainable params differ from the model's (e.g. {diff[:3]}).")
+        with torch.no_grad():
+            for n, p in params.items():
+                p.copy_(saved_params[n].to(device=p.device, dtype=p.dtype))
+        opt.load_state_dict(resumed_ckpt["optimizer"])
+        global_update_step = int(resumed_ckpt["global_update_step"])
+        start_epoch = int(resumed_ckpt["epoch"])
+        saved_world = int(resumed_ckpt.get("world_size", resumed_ckpt["fingerprint"].get("world_size", 1)))
+        rows_consumed = int(
+            resumed_ckpt.get(
+                "rows_consumed_in_epoch",
+                int(resumed_ckpt["micro_batches_consumed_in_epoch"]) * int(batch_size) * saved_world,
+            )
+        )
+        rows_per_micro_batch = int(batch_size) * int(ddp.world_size)
+        if rows_consumed % rows_per_micro_batch != 0:
+            raise ValueError(
+                f"Cannot resume {rows_consumed} consumed rows on world_size={ddp.world_size} with "
+                f"batch_size={batch_size}: the offset does not split evenly across ranks."
+            )
+        resume_skip_batches = rows_consumed // rows_per_micro_batch
+        if resume_skip_batches >= n_train_batches:
+            start_epoch += 1
+            resume_skip_batches = 0
+        if max_steps is not None and global_update_step >= int(max_steps):
+            raise ValueError(
+                f"Resuming at step {global_update_step} with max_steps={max_steps}: nothing to do. "
+                "Raise or clear train.max_steps for the continuation."
+            )
 
     def _build_checkpoint_payload(
         *,
@@ -919,9 +1163,11 @@ def train_task(
         early stopping with nothing to act on.
         """
         nonlocal best_val, best_state, best_head_payload, best_epoch, last_epoch, last_metrics, patience_left
+        nonlocal best_step, last_eval_step
 
+        last_eval_step = global_update_step
         if is_causal:
-            metrics = _eval_causal(model, val_loader.loader, str(dev))
+            metrics = _eval_causal(model, val_loader.loader, str(dev), ddp)
             score = -float(metrics["val_loss"])
             desc = (
                 f"val_loss={metrics['val_loss']:.4f}  "
@@ -952,19 +1198,35 @@ def train_task(
             patience_left = int(early_stopping_patience)
             best_epoch = int(epoch)
             best_val = float(score)
+            best_step = int(global_update_step)
             best_state, best_head_payload = _build_checkpoint_payload(
                 epoch_i=best_epoch,
                 metrics_i=metrics,
                 kind="best_ep",
             )
+            best_state["best_step"] = best_step
+            if save_best_to_disk and ddp.is_main:
+                # A killed job keeps its best so far. For save_format='hf' the
+                # payload is metadata only, so the LoRA factors go alongside.
+                torch.save(best_state, best_ckpt_path)
+                if save_format == "hf":
+                    torch.save(
+                        {
+                            "best_step": best_step,
+                            "best_epoch": best_epoch,
+                            "metrics": dict(best_state["metrics"]),
+                            "trainable_state": dict(best_trainable_state),
+                        },
+                        task_dir / f"{ckpt_stem}_best_trainable.pt",
+                    )
         else:
             patience_left -= 1
             if early_stopping and patience_left <= 0:
-                print(f"[{task}] Early stopping triggered.")
+                _print(f"[{task}] Early stopping triggered.")
                 stop = True
 
         where = f"epoch {epoch:03d}/{epochs}" + ("" if step is None else f" step {step}")
-        print(
+        _print(
             f"[{task}] {where}  "
             f"loss={train_loss:.4f}  {desc} "
             f"patience={patience_left}/{early_stopping_patience}"
@@ -989,19 +1251,82 @@ def train_task(
         model.train()
         return stop
 
+    def _resume_payload(*, epoch_i: int, consumed: int) -> dict[str, Any]:
+        return {
+            "fingerprint": dict(fingerprint),
+            "global_update_step": int(global_update_step),
+            "epoch": int(epoch_i),
+            "micro_batches_consumed_in_epoch": int(consumed),
+            # Global, so a resume on a different number of ranks can find its offset.
+            "rows_consumed_in_epoch": int(consumed) * int(batch_size) * int(ddp.world_size),
+            "world_size": int(ddp.world_size),
+            "trainable_state": {n: p.detach().cpu().clone() for n, p in _trainable_params().items()},
+            "optimizer": opt.state_dict(),
+            "best_val": float(best_val),
+            "best_epoch": int(best_epoch),
+            "best_step": int(best_step),
+            "patience_left": int(patience_left),
+            "last_metrics": dict(last_metrics),
+            "best_trainable_state": dict(best_trainable_state),
+            # 'full' payloads carry the whole state_dict; only the small ones ride along.
+            "best_state": best_state if save_format in {"hf", "peft"} else None,
+            "rng": _rng_state(),
+        }
+
+    if resumed_ckpt is not None:
+        best_val = float(resumed_ckpt["best_val"])
+        best_epoch = int(resumed_ckpt["best_epoch"])
+        best_step = int(resumed_ckpt["best_step"])
+        patience_left = int(resumed_ckpt["patience_left"])
+        last_metrics = dict(resumed_ckpt.get("last_metrics", {}))
+        best_trainable_state.update(resumed_ckpt.get("best_trainable_state", {}))
+        if resumed_ckpt.get("best_state") is not None:
+            best_state, best_head_payload = resumed_ckpt["best_state"], {}
+        _restore_rng_state(resumed_ckpt["rng"])
+        last_eval_step = global_update_step if best_step == global_update_step else -1
+        _print(
+            f"[{task}] resumed from {resume_from} at step {global_update_step} (saved on {saved_world} "
+            f"rank(s), now {ddp.world_size}) "
+            f"(epoch {start_epoch}, micro-batch {resume_skip_batches}/{n_train_batches}, "
+            f"best_step={best_step}, patience={patience_left}/{early_stopping_patience})"
+        )
+        del resumed_ckpt
+
+    # Slurm sends SIGUSR1 ahead of the walltime (sbatch --signal=USR1@<secs>):
+    # finish the current optimizer step, write a resume checkpoint, exit cleanly.
+    preempt = threading.Event()
+    prev_sigusr1 = None
+    if threading.current_thread() is threading.main_thread():
+        prev_sigusr1 = signal.signal(signal.SIGUSR1, lambda *_: preempt.set())
+
     stop_training = False
-    for epoch in range(1, epochs + 1):
+    train_loss = float("nan")
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         running_loss = 0.0
         n_seen = 0
         opt.zero_grad(set_to_none=True)
 
+        skip = resume_skip_batches if epoch == start_epoch else 0
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch, start_index=skip * batch_size)
+            batches = iter(train_loader.loader)
+        else:
+            batches = itertools.islice(iter(train_loader.loader), skip, None)
+
         window_batch_count = 0
         window_size = 1
-        with tqdm(total=len(train_loader.loader), desc=f"[{task}] Epoch {epoch}/{epochs}", unit="batch") as pbar:
-            for i, batch in enumerate(train_loader.loader):
+        window_items = 0
+        with tqdm(
+            total=n_train_batches,
+            initial=skip,
+            desc=f"[{task}] Epoch {epoch}/{epochs}",
+            unit="batch",
+            disable=not ddp.is_main,
+        ) as pbar:
+            for i, batch in enumerate(batches, start=skip):
                 if window_batch_count == 0:
-                    remaining = len(train_loader.loader) - i
+                    remaining = n_train_batches - i
                     window_size = min(accumulate_grad_batches, remaining)
 
                 input_ids = batch["input_ids"].to(dev, non_blocking=True)
@@ -1015,19 +1340,29 @@ def train_task(
                     # *inside* the jvp, and under linearized_ntk the loss must be
                     # computed on f(x;W0) + J.dW after the tangent is added.
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    raw_loss = _causal_lm_loss(outputs.logits, labels)
+                    loss_sum, n_items = _causal_lm_loss_sum(outputs.logits, labels)
                 else:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    raw_loss = outputs.loss
-                    if raw_loss is None:
-                        logits = outputs.logits
-                        raw_loss = nn.CrossEntropyLoss()(logits, labels)
-                loss = raw_loss / window_size
-                loss.backward()
+                    logits = outputs.logits
+                    loss_sum = nn.functional.cross_entropy(logits, labels, reduction="sum")
+                    n_items = int(labels.numel())
+                # Divided by a constant only to keep magnitudes near the per-item loss;
+                # the exact 1/total_items factor is applied to the grads at the step.
+                (loss_sum / loss_scale).backward()
+                window_items += n_items
 
                 window_batch_count += 1
                 should_step = window_batch_count == window_size
                 if window_batch_count == window_size:
+                    # One flat all-reduce per optimizer step, then the single division that
+                    # turns the accumulated sums into the token-weighted mean gradient.
+                    # Clipping must see the final gradient, so both happen before it.
+                    total_items = torch.tensor([float(window_items)], dtype=torch.float64, device=dev)
+                    all_reduce_sum_(total_items, ddp)
+                    reduce_gradients_(
+                        trainable_params_list, ddp, scale=loss_scale / max(1.0, float(total_items.item()))
+                    )
+                    window_items = 0
                     if clip_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
                     scheduler(global_update_step)
@@ -1036,15 +1371,18 @@ def train_task(
                     global_update_step += 1
                     window_batch_count = 0
 
-                # Causal loss is a per-token mean, so the running average has to
-                # weight by supervised tokens, not rows.
-                bs = int((labels != -100).sum().item()) if is_causal else int(labels.numel())
-                running_loss += float(raw_loss.item()) * bs
-                n_seen += bs
+                # Running average over items (supervised tokens for causal), matching
+                # the way the gradient is normalized.
+                running_loss += float(loss_sum.item())
+                n_seen += n_items
 
                 train_loss = running_loss / max(1, n_seen)
                 pbar.update(1)
-                pbar.set_postfix({"loss": f"{train_loss:.4f}", "lr": f"{opt.param_groups[0]['lr']:.6f}"})
+                # refresh=False: let update() redraw at tqdm's mininterval (TQDM_MININTERVAL
+                # in batch jobs) instead of once per batch, which bloats multi-day logs.
+                pbar.set_postfix(
+                    {"loss": f"{train_loss:.4f}", "lr": f"{opt.param_groups[0]['lr']:.6f}"}, refresh=False
+                )
                 if (
                     run_logger is not None
                     and log_every_n_steps > 0
@@ -1065,26 +1403,74 @@ def train_task(
                         },
                     )
 
+                if not should_step:
+                    continue
+
                 if (
-                    should_step
-                    and eval_every_n_steps > 0
+                    eval_every_n_steps > 0
                     and global_update_step > 0
                     and global_update_step % eval_every_n_steps == 0
                 ):
                     if _validate_and_track(epoch=epoch, train_loss=train_loss, step=global_update_step):
+                        stop_reason = "early_stopping"
                         stop_training = True
                         break
 
-        if stop_training or _validate_and_track(epoch=epoch, train_loss=train_loss):
+                preempted = broadcast_flag(preempt.is_set(), ddp, device=dev)
+                hit_cap = max_steps is not None and global_update_step >= int(max_steps)
+                if hit_cap and last_eval_step != global_update_step:
+                    # The sweep's comparison point: every trial ends with a val number.
+                    _validate_and_track(epoch=epoch, train_loss=train_loss, step=global_update_step)
+                if (
+                    hit_cap
+                    or preempted
+                    or (save_every_n_steps > 0 and global_update_step % save_every_n_steps == 0)
+                ):
+                    if ddp.is_main:
+                        last_resume_path = _save_resume_checkpoint(
+                            resume_dir, _resume_payload(epoch_i=epoch, consumed=i + 1)
+                        )
+                        _print(f"[{task}] resume checkpoint: {last_resume_path}")
+                if hit_cap or preempted:
+                    stop_reason = "max_steps" if hit_cap else "preempted"
+                    _print(f"[{task}] stopping at step {global_update_step} ({stop_reason}).")
+                    stop_training = True
+                    break
+
+        if stop_training:
+            break
+        # Skip the epoch-end eval when a step-level eval just ran on this exact step.
+        if last_eval_step != global_update_step and _validate_and_track(epoch=epoch, train_loss=train_loss):
+            stop_reason = "early_stopping"
             break
 
+    if prev_sigusr1 is not None:
+        signal.signal(signal.SIGUSR1, prev_sigusr1)
     seconds = time.time() - t_start
+
+    if stop_reason == "preempted":
+        # Walltime is close: skip the merged HF export (minutes at 3B) and leave
+        # the resume checkpoint as the artifact. The best .pt is already on disk
+        # when save_best_to_disk is on.
+        summary = {
+            "task": task,
+            "status": "preempted",
+            "stop_reason": stop_reason,
+            "global_update_step": int(global_update_step),
+            "best_step": int(best_step),
+            "resume_ckpt_path": str(last_resume_path),
+            "seconds": float(seconds),
+        }
+        if ddp.is_main:
+            _save_json(task_dir / f"{ckpt_stem}.json", summary)
+        _print(f"[{task}] preempted at step {global_update_step}; resume from {last_resume_path}")
+        return summary, {}
 
     if best_state is None or best_head_payload is None:
         fallback_best_epoch = best_epoch if best_epoch > 0 else last_epoch
         if not last_metrics:
             last_metrics = (
-                _eval_causal(model, val_loader.loader, str(dev))
+                _eval_causal(model, val_loader.loader, str(dev), ddp)
                 if is_causal
                 else {"val_top1": float("nan"), "test_top1": _top1(model, test_loader.loader, str(dev))}
             )
@@ -1094,8 +1480,8 @@ def train_task(
             kind="best_ep",
         )
 
-    best_ckpt_path = task_dir / f"{ckpt_stem}_best_ep.pt"
-    torch.save(best_state, best_ckpt_path)
+    if ddp.is_main:
+        torch.save(best_state, best_ckpt_path)
 
     last_ckpt_path: Path | None = None
     if save_last_epoch:
@@ -1107,9 +1493,10 @@ def train_task(
             kind="last_ep",
         )
         last_ckpt_path = task_dir / f"{ckpt_stem}_last_ep.pt"
-        torch.save(last_state, last_ckpt_path)
+        if ddp.is_main:
+            torch.save(last_state, last_ckpt_path)
 
-    if save_format == "hf":
+    if save_format == "hf" and ddp.is_main:
         best_state["hf_meta"] = _export_hf_merged_model(
             model=model,
             tokenizer=tokenizer,
@@ -1121,7 +1508,7 @@ def train_task(
             data_meta=task_meta,
         )
         torch.save(best_state, best_ckpt_path)
-        print(f"[{task}] saved merged HF model: {hf_export_dir}")
+        _print(f"[{task}] saved merged HF model: {hf_export_dir}")
 
     summary = {
         "task": task,
@@ -1136,7 +1523,15 @@ def train_task(
         "seconds": float(seconds),
         "trainable": trainable_info,
         "best_epoch": int(best_state.get("best_epoch", -1)),
+        "best_step": int(best_step),
         "last_epoch": int(last_epoch),
+        "global_update_step": int(global_update_step),
+        "total_steps": int(total_steps),
+        "status": "finished",
+        "stop_reason": stop_reason,
+        "resume_from": None if resume_from is None else str(resume_from),
+        "resume_ckpt_path": None if last_resume_path is None else str(last_resume_path),
+        "last_metrics": {k: float(v) for k, v in last_metrics.items()},
         "meta": task_meta,
         "hparams": {
             "epochs": int(epochs),
@@ -1145,22 +1540,28 @@ def train_task(
             "optimizer": str(optimizer_name),
             "warmup_length": int(warmup_length),
             "clip_grad_norm": float(clip_grad_norm),
-            "accumulate_grad_batches": int(accumulate_grad_batches),
+            "accumulate_grad_batches": int(accumulate_grad_batches_global),
+            "accumulate_grad_batches_per_rank": int(accumulate_grad_batches),
+            "world_size": int(ddp.world_size),
             "batch_size": int(batch_size),
-            "effective_batch_size": int(batch_size * accumulate_grad_batches),
+            "effective_batch_size": int(batch_size * accumulate_grad_batches_global),
             "num_workers": int(num_workers),
             "max_length": int(max_length),
             "eval_every_n_steps": int(eval_every_n_steps),
+            "max_steps": None if max_steps is None else int(max_steps),
+            "save_every_n_steps": int(save_every_n_steps),
+            "scheduler_name": str(scheduler_name),
             "early_stopping": bool(early_stopping),
             "early_stopping_patience": int(early_stopping_patience),
             "seed": int(seed),
         },
     }
-    _save_json(task_dir / f"{ckpt_stem}.json", summary)
+    if ddp.is_main:
+        _save_json(task_dir / f"{ckpt_stem}.json", summary)
 
-    print(f"[{task}] saved best: {best_ckpt_path}")
+    _print(f"[{task}] saved best: {best_ckpt_path}")
     if last_ckpt_path is not None:
-        print(f"[{task}] saved last: {last_ckpt_path}")
+        _print(f"[{task}] saved last: {last_ckpt_path}")
     if run_logger is not None:
         run_logger.log_event(
             "task_end",
@@ -1211,6 +1612,7 @@ def resolve_tasks(args, cfg_file: dict[str, Any]) -> list[str]:
 
 def main() -> None:
     run_logger = None
+    ddp = DistInfo()
     try:
         parser = build_parser()
         args = parser.parse_args()
@@ -1247,6 +1649,13 @@ def main() -> None:
         use_fast_tokenizer = bool(_get(global_cfg, "backbone.use_fast_tokenizer", True))
 
         device = str(args.device) if args.device is not None else str(_get(global_cfg, "device", "cuda"))
+        # One process per GPU (srun --ntasks-per-node=N): join the group and pin this rank's
+        # device before anything allocates. A plain single-process run gets world_size == 1.
+        ddp = init_distributed(device=device)
+        if ddp.enabled and device.startswith("cuda"):
+            device = f"cuda:{ddp.local_rank}"
+        if ddp.enabled:
+            print(f"[rank {ddp.rank}/{ddp.world_size}] device={device}", flush=True)
         dtype = _get(global_cfg, "dtype", None)
         deterministic = bool(_get(global_cfg, "deterministic", False))
 
@@ -1310,16 +1719,18 @@ def main() -> None:
             },
             "results": {},
         }
-        run_logger = start_run(
-            entrypoint="finetune.train_text",
-            logging_cfg=logging_cfg,
-            summary_path=run_path,
-            metadata={
-                "config_path": args.text_config,
-                "summary_path": str(run_path),
-                "resolved_config": startup_cfg,
-            },
-        )
+        # Rank 0 owns the run log: N ranks writing the same jsonl would interleave.
+        if ddp.is_main:
+            run_logger = start_run(
+                entrypoint="finetune.train_text",
+                logging_cfg=logging_cfg,
+                summary_path=run_path,
+                metadata={
+                    "config_path": args.text_config,
+                    "summary_path": str(run_path),
+                    "resolved_config": startup_cfg,
+                },
+            )
 
         extracted_heads: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -1380,6 +1791,13 @@ def main() -> None:
             early_stopping = bool(_get(task_cfg, "train.early_stopping", False))
             early_stopping_patience = int(_get(task_cfg, "train.early_stopping_patience", 5))
             eval_every_n_steps = int(_get(task_cfg, "train.eval_every_n_steps", 0))
+            max_steps_raw = _get(task_cfg, "train.max_steps", None)
+            max_steps = None if max_steps_raw is None else int(max_steps_raw)
+            save_every_n_steps = int(_get(task_cfg, "train.save_every_n_steps", 0))
+            resume_from_raw = _get(task_cfg, "train.resume_from", None)
+            resume_from = str(resume_from_raw) if resume_from_raw else None
+            resume_allow_lr_change = bool(_get(task_cfg, "train.resume_allow_lr_change", False))
+            save_best_to_disk = bool(_get(task_cfg, "train.save_best_to_disk", True))
 
             task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
             save_format = str(_get(task_cfg, "output.save_format", save_format_default))
@@ -1426,6 +1844,11 @@ def main() -> None:
                 early_stopping=early_stopping,
                 early_stopping_patience=early_stopping_patience,
                 eval_every_n_steps=eval_every_n_steps,
+                max_steps=max_steps,
+                save_every_n_steps=save_every_n_steps,
+                resume_from=resume_from,
+                resume_allow_lr_change=resume_allow_lr_change,
+                save_best_to_disk=save_best_to_disk,
                 seed=seed,
                 deterministic=deterministic,
                 device=str(device),
@@ -1435,17 +1858,19 @@ def main() -> None:
                 task_cfg=task_cfg,
                 log_every_n_steps=int(task_logging_cfg.get("log_every_n_steps", 50)),
                 run_logger=run_logger,
+                dist_info=ddp,
             )
 
             all_summaries["results"][task] = summary
             if extract_heads:
                 extracted_heads[task] = head_payload
 
-        _save_json(run_path, all_summaries)
-        run_logger.log_summary(all_summaries)
-        print(f"\nSaved run summary: {run_path}")
+        if ddp.is_main:
+            _save_json(run_path, all_summaries)
+            run_logger.log_summary(all_summaries)
+            print(f"\nSaved run summary: {run_path}")
 
-        if extracted_heads:
+        if extracted_heads and ddp.is_main:
             heads_path_raw = heads_path_default
             if isinstance(heads_path_raw, str) and heads_path_raw.strip():
                 heads_path = Path(heads_path_raw)
@@ -1462,9 +1887,12 @@ def main() -> None:
                     "path": str(heads_path),
                 },
             )
-        run_logger.finish("success")
+        if run_logger is not None:
+            run_logger.finish("success")
+        shutdown_distributed(ddp)
     except Exception as exc:
         finish_with_error(run_logger, exc)
+        shutdown_distributed(ddp)
         raise
 
 

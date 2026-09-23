@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 NLI_TASKS = ("snli", "mnli", "sick", "qnli", "rte", "scitail")
 
@@ -587,6 +587,65 @@ class _TokenizedCausalDataset(Dataset):
         return self.rows[int(idx)]
 
 
+class ResumableRandomSampler(Sampler[int]):
+    """Seeded per-epoch permutation that can start mid-epoch.
+
+    DataLoader(shuffle=True) draws its order from the global RNG, so a restarted
+    job cannot reproduce it. Here epoch ``e`` is ``randperm(n, seed + e)`` and a
+    resume skips the consumed prefix by index -- no batch is loaded to be thrown
+    away. ``start_index`` must be a multiple of the batch size so the remaining
+    batches are the same batches the uninterrupted run would have seen.
+
+    Under data parallelism every rank draws the same permutation and keeps its
+    own stride of it, truncated so all ranks get the same number of rows -- the
+    ranks must run the same number of optimizer steps or the collectives hang.
+    ``start_index`` counts rows within a rank's own shard.
+    """
+
+    def __init__(self, num_rows: int, *, seed: int, rank: int = 0, world_size: int = 1) -> None:
+        if not 0 <= int(rank) < int(world_size):
+            raise ValueError(f"rank={rank} outside [0, world_size={world_size}).")
+        self.num_rows = int(num_rows)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.epoch = 0
+        self.start_index = 0
+
+    @property
+    def num_rows_per_rank(self) -> int:
+        return self.num_rows // self.world_size
+
+    def set_epoch(self, epoch: int, *, start_index: int = 0) -> None:
+        if not 0 <= int(start_index) <= self.num_rows_per_rank:
+            raise ValueError(f"start_index={start_index} outside [0, {self.num_rows_per_rank}].")
+        self.epoch = int(epoch)
+        self.start_index = int(start_index)
+
+    def permutation(self) -> list[int]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        return torch.randperm(self.num_rows, generator=generator).tolist()
+
+    def rank_indices(self) -> list[int]:
+        perm = self.permutation()
+        usable = self.num_rows_per_rank * self.world_size  # drop the ragged tail
+        return perm[:usable][self.rank :: self.world_size]
+
+    def __iter__(self):
+        return iter(self.rank_indices()[self.start_index :])
+
+    def __len__(self) -> int:
+        return self.num_rows_per_rank - self.start_index
+
+
+def _ignore_sigusr1(_worker_id: int) -> None:
+    """Slurm's pre-walltime SIGUSR1 is for the trainer; its default action
+    would kill a DataLoader worker and take the epoch down with it."""
+    import signal
+
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+
+
 @dataclass(frozen=True)
 class _CausalCollator:
     """Right-pads to the batch max. A module-level class, not a closure, so
@@ -615,6 +674,9 @@ def build_causal_tokenized_loader(
     num_workers: int = 0,
     max_length: int = 512,
     shuffle: bool = False,
+    seed: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> CausalTokenizedData:
     if int(batch_size) <= 0:
         raise ValueError("batch_size must be > 0.")
@@ -665,14 +727,21 @@ def build_causal_tokenized_loader(
             f"truncation at max_length={max_length}."
         )
 
+    # shuffle=True means a ResumableRandomSampler, so a restarted job replays
+    # the same order and can skip straight to where the checkpoint left off.
     loader = DataLoader(
         _TokenizedCausalDataset(rows),
         batch_size=int(batch_size),
-        shuffle=bool(shuffle),
+        sampler=(
+            ResumableRandomSampler(len(rows), seed=int(seed), rank=int(rank), world_size=int(world_size))
+            if shuffle
+            else None
+        ),
         num_workers=int(num_workers),
         pin_memory=True,
         drop_last=False,
         collate_fn=_CausalCollator(pad_id=int(pad_id)),
+        worker_init_fn=_ignore_sigusr1 if int(num_workers) > 0 else None,
     )
 
     meta = dict(task_data.meta)
@@ -684,6 +753,8 @@ def build_causal_tokenized_loader(
             "batch_size": int(batch_size),
             "num_workers": int(num_workers),
             "shuffle": bool(shuffle),
+            "shuffle_seed": int(seed) if shuffle else None,
+            "world_size": int(world_size) if shuffle else 1,
         }
     )
     return CausalTokenizedData(task=task_data.task, loader=loader, meta=meta)
