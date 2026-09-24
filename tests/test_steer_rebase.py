@@ -80,6 +80,31 @@ def test_block_ridge_fit_predict_roundtrip() -> None:
         assert torch.isfinite(pred).all()
 
 
+def test_block_ridge_fit_predict_roundtrip_with_heterogeneous_block_widths() -> None:
+    """Residual blocks 3x wider than the output block (steer_text's segment pooling
+    triples only the residual blocks' width, never the output block's) -- the
+    structural assumption the whole change rests on: _fit_block_ridge/
+    _predict_block_ridge index per block and never assume a shared width."""
+    g = torch.Generator().manual_seed(4)
+    n_sel, num_residual, d_residual, d_output, d_out = 10, 3, 12, 4, 3
+    blocks_train = {b: torch.randn(n_sel, d_residual, generator=g, dtype=torch.float64) for b in range(num_residual)}
+    blocks_train[num_residual] = torch.randn(n_sel, d_output, generator=g, dtype=torch.float64)
+    train_targets = torch.randn(n_sel, num_residual + 1, d_out, generator=g, dtype=torch.float64)
+    selected = torch.arange(n_sel)
+
+    coefficients = steer_mod._fit_block_ridge(
+        blocks_train, train_targets, selected=selected, regularization=1.0, mode="independent"
+    )
+    assert len(coefficients) == num_residual + 1
+    for b in range(num_residual):
+        assert coefficients[b].shape == (d_residual, d_out)
+    assert coefficients[num_residual].shape == (d_output, d_out)
+
+    pred = steer_mod._predict_block_ridge(coefficients, blocks_train)
+    assert pred.shape == (n_sel, d_out)
+    assert torch.isfinite(pred).all()
+
+
 def test_group_blocks_concat_and_sum_avg() -> None:
     blocks = {b: torch.full((2, 3), float(b)) for b in range(4)}
     concat = steer_mod._group_blocks_concat(blocks, 2)
@@ -90,6 +115,27 @@ def test_group_blocks_concat_and_sum_avg() -> None:
     assert set(avg) == {0, 1}
     assert avg[0].shape == (2, 3)
     assert torch.allclose(avg[0], torch.full((2, 3), 0.5))
+
+
+def test_group_blocks_last_keeps_the_deepest_member_of_each_group() -> None:
+    import pytest
+
+    blocks = {b: torch.full((2, 3), float(b)) for b in range(4)}
+    last = steer_mod._group_blocks_last(blocks, 2)
+    assert set(last) == {0, 1}
+    assert last[0].shape == (2, 3) and last[1].shape == (2, 3)  # not 2x wide, unlike concat
+    assert torch.equal(last[0], blocks[1]) and torch.equal(last[1], blocks[3])
+
+    # Same number of blocks and groups: nothing to group, returned as-is.
+    assert set(steer_mod._group_blocks_last(blocks, 4)) == {0, 1, 2, 3}
+    assert "last" in steer_mod._BLOCK_GROUP_STRATEGIES
+
+    with pytest.raises(ValueError):
+        steer_mod._group_blocks_last(blocks, 0)
+    with pytest.raises(ValueError):
+        steer_mod._group_blocks_last(blocks, 5)
+    with pytest.raises(ValueError):
+        steer_mod._group_blocks_last({}, 2)
 
 
 def test_clip_vit_parameter_blocks() -> None:

@@ -319,9 +319,29 @@ def _group_blocks_sum_avg(blocks: Mapping[int, torch.Tensor], num_groups: int) -
     return grouped
 
 
+def _group_blocks_last(blocks: Mapping[int, torch.Tensor], num_groups: int) -> dict[int, torch.Tensor]:
+    """Group B blocks by keeping only the deepest member of each group (the others are discarded)."""
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive")
+    block_ids = sorted(blocks)
+    if not block_ids:
+        raise ValueError("blocks dict is empty")
+    if len(block_ids) < num_groups:
+        raise ValueError(f"Cannot group {len(block_ids)} blocks into {num_groups} groups")
+    if len(block_ids) == num_groups:
+        return dict(blocks)
+    boundaries = [round(i * len(block_ids) / num_groups) for i in range(num_groups + 1)]
+    grouped: dict[int, torch.Tensor] = {}
+    for g in range(num_groups):
+        members = block_ids[boundaries[g] : boundaries[g + 1]]
+        grouped[g] = blocks[members[-1]]
+    return grouped
+
+
 _BLOCK_GROUP_STRATEGIES: dict[str, Callable[[Mapping[int, torch.Tensor], int], dict[int, torch.Tensor]]] = {
     "concat": _group_blocks_concat,
     "sum_avg": _group_blocks_sum_avg,
+    "last": _group_blocks_last,
 }
 
 

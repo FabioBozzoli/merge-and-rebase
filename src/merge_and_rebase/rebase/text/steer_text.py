@@ -94,7 +94,7 @@ from ..methods.steer import (
 )
 from ..registry import register
 from .adapters import head_linear
-from .encoder_classifier import masked_mean
+from .encoder_classifier import masked_mean, segment_pooled
 
 # Matched with ``search`` against ``name + "."`` and anchored on a preceding dot
 # or the string start, so a task-head wrapper's prefix does not hide the stack:
@@ -323,24 +323,45 @@ class _TextBlockCapture:
     T5's unnormalized residual stream gives a few tokens very large norms, and a
     plain mean is dominated by them; normalizing each token first gives every token
     the same weight in the average. Attention outputs have no such tokens.
+
+    ``segment_pooling=True`` replaces the single masked mean with
+    :func:`~merge_and_rebase.rebase.text.encoder_classifier.segment_pooled`
+    (premise mean, hypothesis mean, global mean concatenated), for a pair-encoded
+    row split at its two EOS tokens -- mutually exclusive with ``pooling != "mean"``
+    (there is no unitnorm/rmsnorm-before-segment-split yet). Callers set
+    ``capture.input_ids`` per batch, next to ``capture.attention_mask``.
     """
 
-    def __init__(self, model: nn.Module, pooling: str = "mean", source: str = "residual") -> None:
+    def __init__(
+        self, model: nn.Module, pooling: str = "mean", source: str = "residual", segment_pooling: bool = False
+    ) -> None:
         if pooling not in BLOCK_POOLINGS:
             raise ValueError(f"block pooling must be one of {BLOCK_POOLINGS}, got {pooling!r}")
         if source not in BLOCK_SOURCES:
             raise ValueError(f"block source must be one of {BLOCK_SOURCES}, got {source!r}")
         if source == "attention" and pooling == "rmsnorm":
             raise ValueError("rmsnorm pooling applies the residual stream's final norm; it is undefined for attention outputs")
+        if segment_pooling and pooling != "mean":
+            raise ValueError("segment_pooling is defined for pooling='mean' only (no unitnorm/rmsnorm composition yet)")
         self.source = source
         self.modules = block_modules(model) if source == "residual" else block_attention_out_projections(model)
         self.pooling = pooling
         self.norms = block_final_norms(model) if pooling == "rmsnorm" else None
+        self.segment_pooling = segment_pooling
+        self.eos_token_id: int | None = None
+        if segment_pooling:
+            eos_token_id = getattr(model.config, "eos_token_id", None)
+            if eos_token_id is None:
+                raise ValueError("segment_pooling requires model.config.eos_token_id to be set.")
+            self.eos_token_id = int(eos_token_id)
         self.activations: dict[int, torch.Tensor] = {}
         self.attention_mask: torch.Tensor | None = None
+        self.input_ids: torch.Tensor | None = None
         self._handles: list[Any] = []
 
     def _pool(self, block_id: int, out: torch.Tensor) -> torch.Tensor:
+        if out.ndim == 3 and self.segment_pooling:
+            return segment_pooled(out, self.attention_mask, self.input_ids, self.eos_token_id)
         if out.ndim == 3 and self.pooling == "unitnorm":
             out = out / out.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         elif out.ndim == 3 and self.pooling == "rmsnorm":
@@ -433,6 +454,7 @@ def _collect_linear_split(
     source_loader: Any,
     target_loader: Any,
     device: torch.device,
+    target_block_pooling: str = "global",
 ) -> dict[str, Any]:
     """Linear regime: Taylor-linearized ``delta_A`` via ``LinearizedModule``, split per block.
 
@@ -440,6 +462,12 @@ def _collect_linear_split(
     per-block residuals sum to the full linearized delta by construction; a
     mismatch is reported rather than silently accepted, exactly as in
     ``steer._collect_linear_split``.
+
+    ``target_block_pooling="segments"`` pools B's *residual* blocks with
+    :func:`_TextBlockCapture`'s segment-split pooling instead of a single
+    global mean (see ``SteerTextRebase.prepare``'s validation for the
+    restrictions this requires); the output block (``out_b`` below) is always
+    the model's own pooled feature, unaffected either way.
     """
     num_target_residual = num_residual_blocks(target)
 
@@ -502,8 +530,10 @@ def _collect_linear_split(
             delta_a_blocks.append(block_residuals)
             labels.append(batch_a["labels"].cpu())
 
-            with _TextBlockCapture(target) as capture:
+            with _TextBlockCapture(target, segment_pooling=(target_block_pooling == "segments")) as capture:
                 capture.attention_mask = batch_b.get("attention_mask")
+                if target_block_pooling == "segments":
+                    capture.input_ids = batch_b["input_ids"]
                 with torch.no_grad():
                     out_b = _pooled_features(target, batch_b, device)
             for b in range(num_target_residual):
@@ -523,19 +553,32 @@ def _collect_linear_split(
 
 @torch.no_grad()
 def _collect_target_blocks(
-    *, target: nn.Module, target_loader: Any, device: torch.device, pooling: str, source: str = "residual"
+    *,
+    target: nn.Module,
+    target_loader: Any,
+    device: torch.device,
+    pooling: str,
+    source: str = "residual",
+    segment_pooling: bool = False,
 ) -> dict[int, torch.Tensor]:
     """B's per-block features for ``source``/``pooling``, from a plain forward of B alone.
 
     Only B's side changes with the source or pooling rule, so this never re-runs A's
     jvps: the rows line up with the cached split because ``target_loader`` is the same
-    ``shuffle=False`` loader ``_collect_linear_split`` walked.
+    ``shuffle=False`` loader ``_collect_linear_split`` walked. ``segment_pooling=True``
+    (only meaningful for ``source="attention"`` here -- the ``source="residual"`` case is
+    handled directly in ``_collect_linear_split`` instead, see ``prepare()``) additionally
+    sets ``capture.input_ids`` per batch.
     """
-    with _head_as_identity(target), _TextBlockCapture(target, pooling=pooling, source=source) as capture:
+    with _head_as_identity(target), _TextBlockCapture(
+        target, pooling=pooling, source=source, segment_pooling=segment_pooling
+    ) as capture:
         num_blocks = len(capture.modules)
         chunks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_blocks)}
         for batch in target_loader:
             capture.attention_mask = batch["attention_mask"].to(device) if "attention_mask" in batch else None
+            if segment_pooling:
+                capture.input_ids = batch["input_ids"].to(device)
             capture.activations.clear()
             _pooled_features(target, batch, device)
             for b in range(num_blocks):
@@ -543,11 +586,12 @@ def _collect_target_blocks(
     return {b: torch.cat(v, dim=0) for b, v in chunks.items()}
 
 
-def _block_cache_name(source: str, pooling: str) -> str:
+def _block_cache_name(source: str, pooling: str, segment_pooling: bool = False) -> str:
     # The residual name predates block_source and is kept so existing caches stay valid.
+    suffix = "_segpool" if segment_pooling else ""
     if source == "residual":
-        return f"features_B_blocks_pool-{pooling}.pt"
-    return f"features_B_blocks_src-{source}_pool-{pooling}.pt"
+        return f"features_B_blocks_pool-{pooling}{suffix}.pt"
+    return f"features_B_blocks_src-{source}_pool-{pooling}{suffix}.pt"
 
 
 def _load_or_compute_pooled_blocks(
@@ -558,6 +602,7 @@ def _load_or_compute_pooled_blocks(
     compute_fn: Callable[[], dict[int, torch.Tensor]],
     verbose: bool,
     source: str = "residual",
+    segment_pooling: bool = False,
 ) -> dict[int, torch.Tensor]:
     """B's block features under a non-default source/pooling, cached beside the split's other files.
 
@@ -566,8 +611,8 @@ def _load_or_compute_pooled_blocks(
     source block per batch. Jobs are expected to have their own ``feature_cache_dir``;
     the write is atomic only so that a killed job never leaves a partial file behind.
     """
-    path = cache_dir / _block_cache_name(source, pooling)
-    label = f"'{source}/{pooling}' block features"
+    path = cache_dir / _block_cache_name(source, pooling, segment_pooling)
+    label = f"'{source}/{pooling}'{' segment-pooled' if segment_pooling else ''} block features"
     if path.exists() and not force_recompute:
         if verbose:
             print(f"[steer_text] using cached {label} at {path}")
@@ -671,6 +716,7 @@ class SteerTextRebase:
         block_pooling: str = "mean",
         block_source: str = "residual",
         block_feature_preprocessing: str = "none",
+        target_block_pooling: str = "global",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -717,6 +763,19 @@ class SteerTextRebase:
             )
         if block_residuals_weighting_strategy not in {"identity", "mean"}:
             raise ValueError("steer_text block_residuals_weighting_strategy must be 'identity' or 'mean'")
+        if target_block_pooling not in {"global", "segments"}:
+            raise ValueError("steer_text target_block_pooling must be 'global' or 'segments'")
+        if target_block_pooling == "segments":
+            if stage_2_strategy != "block_ridge":
+                raise ValueError(
+                    "steer_text target_block_pooling='segments' requires stage_2_strategy='block_ridge' "
+                    f"(got {stage_2_strategy!r}); joint_ridge support is a separate, later change."
+                )
+            if block_pooling != "mean":
+                raise ValueError(
+                    "steer_text target_block_pooling='segments' requires block_pooling='mean' "
+                    "(no unitnorm/rmsnorm composition with segment pooling yet)."
+                )
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
 
@@ -726,6 +785,20 @@ class SteerTextRebase:
         source_model = llm_source.model
         source_pretrained_model = llm_source_pretrained.model
         target_model = llm_target.model
+
+        if target_block_pooling == "segments":
+            # A decoder block sees only the decoder's own (typically single-token) input,
+            # never the encoder's premise/hypothesis sequence, so a segment split by the
+            # encoder's EOS positions has no meaning on it. This rejects e.g.
+            # T5ForSequenceClassification (encoder+decoder); only an encoder-only target
+            # (T5EncoderForSequenceClassification) is valid here.
+            target_stacks = {stack for stack, _ in _ordered_block_keys(target_model)}
+            if "decoder" in target_stacks:
+                raise ValueError(
+                    "steer_text target_block_pooling='segments' requires an encoder-only target "
+                    "(e.g. T5EncoderForSequenceClassification): the target has a 'decoder' stack "
+                    f"({sorted(target_stacks)}), whose blocks never see the premise/hypothesis sequence."
+                )
 
         w_a, _ = _head_tensors(source_model)
         w_b, b_b = _head_tensors(target_model)
@@ -774,14 +847,32 @@ class SteerTextRebase:
                 source_loader=source_loader,
                 target_loader=target_loader,
                 device=dev,
+                # Segment-pool the primary split's *residual* blocks only when block_source
+                # itself is "residual" -- otherwise those residual blocks are discarded
+                # below in favor of the recomputed block_source="attention" ones anyway, so
+                # segment-pooling them here would be pure waste (and would wrongly force
+                # this expensive A-side jvp pass to recompute under a decorated cache key,
+                # see cache_feature_regime below).
+                target_block_pooling=(target_block_pooling if block_source == "residual" else "global"),
             )
 
+        # features_B_blocks' residual entries change width (D -> 3D) under segment pooling
+        # of the *residual* source, and the pooling scheme is not otherwise part of the
+        # cache key -- decorate the regime segment of the cache path so a "segments" run
+        # never reads or clobbers a "global" run's cache (_cache_split_dir only ever uses
+        # this string as a literal path component; _compute() above closes over the real
+        # feature_regime, so the branch logic is unaffected). block_source="attention"
+        # needs no decoration here: its segment-pooled blocks live in their own cache file
+        # below, and everything else in this split cache is identical either way.
+        cache_feature_regime = (
+            f"{feature_regime}__segpool" if target_block_pooling == "segments" and block_source == "residual" else feature_regime
+        )
         cache_args = {
             "feature_cache_dir": feature_cache_dir,
             "source_tag": source_tag,
             "target_tag": target_tag,
             "task": task,
-            "feature_regime": feature_regime,
+            "feature_regime": cache_feature_regime,
             "force_recompute_features": force_recompute_features,
             "need_blocks": need_blocks,
             "verbose": verbose,
@@ -789,6 +880,7 @@ class SteerTextRebase:
         train_data = _load_or_compute_split(split="train", compute_fn=lambda: _compute("train"), **cache_args)
         test_data = _load_or_compute_split(split="test", compute_fn=lambda: _compute("test"), **cache_args)
 
+        recompute_segment_pooling = target_block_pooling == "segments" and block_source != "residual"
         if need_blocks and (block_pooling != "mean" or block_source != "residual"):
             # Swap B's per-block features for the recollected ones; f_B (the output block)
             # and everything on A's side stay as cached.
@@ -797,10 +889,11 @@ class SteerTextRebase:
                     cache_dir=_cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, split),
                     pooling=block_pooling,
                     source=block_source,
+                    segment_pooling=recompute_segment_pooling,
                     force_recompute=force_recompute_features,
                     compute_fn=lambda split=split: _collect_target_blocks(
                         target=target_model, target_loader=getattr(target_loaders, split), device=dev,
-                        pooling=block_pooling, source=block_source,
+                        pooling=block_pooling, source=block_source, segment_pooling=recompute_segment_pooling,
                     ),
                     verbose=verbose,
                 )
@@ -1026,6 +1119,7 @@ class SteerTextRebase:
                 "block_pooling": str(block_pooling),
                 "block_source": str(block_source),
                 "block_feature_preprocessing": str(block_feature_preprocessing),
+                "target_block_pooling": str(target_block_pooling),
                 "weights": weights,
             }
             if stage_2_strategy == "block_ridge":
@@ -1095,6 +1189,7 @@ class SteerTextRebase:
             "feature_regime": feature_regime,
             "block_pooling": block_pooling,
             "block_source": block_source,
+            "target_block_pooling": target_block_pooling,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             # The fitted transforms themselves, so a run can be inspected or
@@ -1154,9 +1249,13 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     need_blocks = prepared.get("stage_2_strategy") in {"block_ridge", "joint_ridge"}
 
     # Pool the live blocks exactly as the fit's features were pooled.
+    segment_pooling = prepared.get("target_block_pooling", "global") == "segments"
     capture = (
         _TextBlockCapture(
-            model, pooling=prepared.get("block_pooling", "mean"), source=prepared.get("block_source", "residual")
+            model,
+            pooling=prepared.get("block_pooling", "mean"),
+            source=prepared.get("block_source", "residual"),
+            segment_pooling=segment_pooling,
         )
         if need_blocks
         else None
@@ -1167,6 +1266,15 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
         if capture is not None:
             capture.attention_mask = kwargs.get("attention_mask")
             capture.activations.clear()
+            if capture.segment_pooling:
+                input_ids = kwargs.get("input_ids")
+                if input_ids is None:
+                    raise RuntimeError(
+                        "steer_text: target_block_pooling='segments' needs 'input_ids' as a forward "
+                        "keyword argument to locate the premise/hypothesis boundary, but the model was "
+                        "called without it (positional call, or a caller that omits it)."
+                    )
+                capture.input_ids = input_ids
 
     def _head_pre_hook(_module: nn.Module, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
         feature = inputs[0]

@@ -66,7 +66,11 @@ def masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor | None) -> to
     stack: ``steer_text._masked_mean`` is an alias to it, so the pooled "CLS"
     feature this model returns and the per-block activations
     ``steer_text._TextBlockCapture`` records are pooled identically by
-    construction rather than by two functions happening to agree.
+    construction rather than by two functions happening to agree -- except for
+    ``_TextBlockCapture``'s residual blocks under ``segment_pooling=True``,
+    which call :func:`segment_pooled` instead (itself built from three calls
+    to this function); the output block (always the plain pooled feature) is
+    unaffected either way.
 
     Tensors that are not ``[B, T, D]`` pass through unchanged, which is what
     lets the block-capture hook feed it whatever a block returns without
@@ -78,6 +82,65 @@ def masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor | None) -> to
         return hidden.mean(dim=1)
     mask = attention_mask.to(dtype=hidden.dtype, device=hidden.device).unsqueeze(-1)
     return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+
+def segment_masks_from_eos(
+    input_ids: torch.Tensor, attention_mask: torch.Tensor, eos_token_id: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two ``[B, T]`` boolean masks splitting a pair-encoded row at its EOS tokens.
+
+    T5's pair encoding (``build_nli_tokenized_loader``) lays out
+    ``premise <eos> hypothesis <eos>`` with no other separator. Segment 1 is
+    every token strictly before the first EOS, segment 2 every token strictly
+    between the first and second EOS; both exclude the EOS tokens themselves.
+
+    Padding sits after the second EOS under right-padding and is excluded by
+    construction (its cumulative EOS count is 2), but every row is also
+    intersected with ``attention_mask`` as a defensive measure against any
+    other padding convention.
+
+    Raises ``ValueError`` if any row has fewer than two EOS tokens, rather
+    than degrading to a whole-row mask: on this repo's NLI tasks that means
+    truncation or an upstream tokenization change removed the
+    premise/hypothesis boundary, and a silent fallback would produce
+    plausible-looking but wrong numbers.
+    """
+    is_eos = input_ids == int(eos_token_id)
+    counts = is_eos.sum(dim=1)
+    if bool((counts < 2).any()):
+        bad = int((counts < 2).sum())
+        raise ValueError(
+            f"segment_masks_from_eos: {bad} row(s) have fewer than 2 EOS tokens "
+            f"(eos_token_id={eos_token_id}); cannot locate the premise/hypothesis boundary. "
+            "This happens with a single-string premise_hypothesis_template (one EOS per row) "
+            "or if truncation removed the second segment entirely."
+        )
+    cumcount = is_eos.cumsum(dim=1)
+    real = attention_mask.bool()
+    segment1 = (cumcount == 0) & real
+    segment2 = (cumcount == 1) & ~is_eos & real
+    return segment1, segment2
+
+
+def segment_pooled(
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    input_ids: torch.Tensor,
+    eos_token_id: int,
+) -> torch.Tensor:
+    """``[premise_mean ; hypothesis_mean ; global_mean]``, each via :func:`masked_mean`.
+
+    A strict superset of the plain global mean: the global third is not
+    linearly recoverable from the first two alone (their implicit weights are
+    the two segments' lengths, which vary per example), so a ridge regressing
+    on this vector can always zero the first two blocks' coefficients and
+    recover today's global-only behaviour.
+    """
+    segment1, segment2 = segment_masks_from_eos(input_ids, attention_mask, eos_token_id)
+    return torch.cat(
+        [masked_mean(hidden, segment1), masked_mean(hidden, segment2), masked_mean(hidden, attention_mask)],
+        dim=-1,
+    )
 
 
 class T5EncoderClassificationHead(nn.Module):

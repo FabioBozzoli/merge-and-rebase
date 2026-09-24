@@ -113,9 +113,12 @@ key-coverage report at the start of each task so the actual overlap is visible e
 - **`steer_text`** — never touches weights, so it is largely immune to this. `global_ridge` /
   `global_mlp` fit Stage 1/2 from A's feature dimension to B's, whatever those are. `block_ridge`
   explicitly handles a depth mismatch instead of dropping it: when B has more residual blocks
-  than A, `block_group_strategy` (`concat` / `sum_avg`) groups B's blocks down to A's block
-  count first, so every one of B's blocks participates in the fit — not just a name-matching
-  prefix.
+  than A, `block_group_strategy` (`concat` / `sum_avg` / `last`) groups B's blocks down to A's
+  block count first, so B's blocks participate in the fit — not just a name-matching prefix.
+  `concat` concatenates the members of each group, `sum_avg` averages them, and `last` keeps
+  only the deepest member of each group and discards the others (with
+  `target_block_pooling="segments"` that leaves the deeper block's 3 segments, `3D` wide,
+  instead of the `6D` of `concat`).
 
 ## Producing the inputs
 

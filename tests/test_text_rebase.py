@@ -1067,6 +1067,296 @@ def test_steer_text_attention_source_is_cached_apart_and_used_live(tmp_path) -> 
     assert torch.allclose(corrected, expected, atol=1e-4)
 
 
+# ---------------------------------------------------------------------------
+# target_block_pooling="segments": premise/hypothesis-split block regressors
+# ---------------------------------------------------------------------------
+
+
+class _PairDictDataset(Dataset):
+    """Pair-encoded rows: ``premise <eos> hypothesis <eos>``, fixed length, no padding.
+
+    Twin of ``_DictDataset`` (single segment, one trailing eos) but laid out the
+    way ``build_nli_tokenized_loader`` pair-encodes premise/hypothesis, which
+    ``target_block_pooling="segments"`` needs to locate the two segments.
+    """
+
+    def __init__(self, n: int, premise_len: int = 3, hyp_len: int = 2, seed: int = 0, classes: int = 2) -> None:
+        g = torch.Generator().manual_seed(seed)
+        premise = torch.randint(2, VOCAB, (n, premise_len), generator=g)
+        hypothesis = torch.randint(2, VOCAB, (n, hyp_len), generator=g)
+        eos_col = torch.full((n, 1), EOS, dtype=torch.long)
+        self.input_ids = torch.cat([premise, eos_col, hypothesis, eos_col], dim=1)
+        self.attention_mask = torch.ones_like(self.input_ids)
+        self.local = torch.arange(n) % classes
+        self.head_class_ids = [0, 2] if classes == 2 else list(range(classes))
+        self.labels = torch.tensor([self.head_class_ids[int(y)] for y in self.local])
+
+    def __len__(self) -> int:
+        return self.input_ids.shape[0]
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx],
+            "labels": self.labels[idx],
+        }
+
+
+def _pair_text_loaders(n: int = 16, seed: int = 0) -> SimpleNamespace:
+    train, test = _PairDictDataset(n, seed=seed), _PairDictDataset(n, seed=seed + 1)
+    return SimpleNamespace(
+        train=_loader(train),
+        test=_loader(test),
+        local_labels={"train": train.local.tolist(), "test": test.local.tolist()},
+        mask_class=sorted(set(train.head_class_ids)),
+    )
+
+
+def _steer_prepare_encoder(tmp_path, *, target_loaders=None, target_layers: int = 2, **overrides):
+    """``_steer_prepare`` twin for an encoder-only target (the only architecture
+    ``target_block_pooling="segments"`` accepts), with pair-encoded loaders by
+    default so the premise/hypothesis boundary actually exists."""
+    source_pre = _tiny_t5_encoder(d_model=32, seed=0)
+    source_ft = _tiny_t5_encoder(d_model=32, seed=1)
+    target = _tiny_t5_encoder(d_model=48, num_layers=target_layers, seed=2)
+
+    params = {
+        "feature_regime": "linear",
+        "stage_2_strategy": "block_ridge",
+        "few_shot": 4,
+        "feature_cache_dir": str(tmp_path / "cache"),
+        "seed": 0,
+        "verbose": False,
+    }
+    params.update(overrides)
+
+    prepared = get_method("steer_text").prepare(
+        llm_source=SimpleNamespace(model=source_ft),
+        llm_source_pretrained=SimpleNamespace(model=source_pre),
+        llm_target=SimpleNamespace(model=target),
+        source_loaders=_pair_text_loaders(),
+        target_loaders=target_loaders if target_loaders is not None else _pair_text_loaders(),
+        task="rte",
+        mask_class=[0, 2],
+        device="cpu",
+        source_tag="src_enc",
+        target_tag="tgt_enc",
+        **params,
+    )
+    return prepared, target
+
+
+def test_target_block_pooling_rejects_a_decoder_having_target(tmp_path) -> None:
+    """A decoder block never sees the encoder's premise/hypothesis sequence."""
+    with pytest.raises(ValueError, match="encoder-only target"):
+        _steer_prepare(
+            tmp_path, feature_regime="linear", stage_2_strategy="block_ridge", target_block_pooling="segments"
+        )
+
+
+def test_target_block_pooling_rejects_non_default_block_pooling(tmp_path) -> None:
+    with pytest.raises(ValueError, match="requires block_pooling='mean'"):
+        _steer_prepare(
+            tmp_path, feature_regime="linear", stage_2_strategy="block_ridge",
+            target_block_pooling="segments", block_pooling="unitnorm",
+        )
+
+
+def test_target_block_pooling_segments_composes_with_attention_source(tmp_path) -> None:
+    """segments + block_source='attention' recomputes B's attention blocks under their
+    own segment-pooled cache file, leaving both the plain attention cache and the
+    residual "linear" split (features_A/delta_A/etc, which do not depend on B's block
+    source at all) untouched -- unlike block_source='residual', where segments changes
+    the *primary* split's own residual blocks and needs a whole separate cache dir."""
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    _steer_prepare_encoder(tmp_path, block_source="attention", block_ridge_lambda_scaling="trace", ridge_lambda=0.1)
+    base = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / "linear"
+    before_split = torch.load(base / "train" / "features_A.pt")
+    before_attn = torch.load(base / "train" / "features_B_blocks_src-attention_pool-mean.pt")
+
+    prepared, target = _steer_prepare_encoder(
+        tmp_path, target_block_pooling="segments", block_source="attention",
+        block_ridge_lambda_scaling="trace", ridge_lambda=0.1,
+    )
+    for split in ("train", "test"):
+        assert (base / split / "features_B_blocks_src-attention_pool-mean_segpool.pt").exists()
+    assert torch.equal(before_split, torch.load(base / "train" / "features_A.pt")), (
+        "the A-side jvp split must not be recomputed under a decorated cache key"
+    )
+    after_attn = torch.load(base / "train" / "features_B_blocks_src-attention_pool-mean.pt")
+    assert all(torch.equal(before_attn[b], after_attn[b]) for b in before_attn), (
+        "the plain (non-segment-pooled) attention cache must be left untouched"
+    )
+    assert prepared["target_block_pooling"] == "segments"
+    assert prepared["block_source"] == "attention"
+
+    # Every block is 3x the plain attention source's own width (num_heads*d_kv, not
+    # necessarily d_model -- see block_attention_out_projections).
+    segpool_train = torch.load(base / "train" / "features_B_blocks_src-attention_pool-mean_segpool.pt")
+    for b, v in segpool_train.items():
+        assert v.shape[-1] == 3 * before_attn[b].shape[-1]
+
+    # Live: the hook must segment-pool the *attention* blocks, exactly as the fit did.
+    _, head = text_rebase_head(target)
+    batch = _collate([_PairDictDataset(4)[i] for i in range(4)])
+    kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, source="attention", segment_pooling=True) as capture:
+            capture.attention_mask = batch["attention_mask"]
+            capture.input_ids = batch["input_ids"]
+            pooled = target(**kwargs).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kwargs).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kwargs).logits
+    expected = baseline + prepared["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
+
+
+def test_target_block_pooling_rejects_joint_ridge(tmp_path) -> None:
+    with pytest.raises(ValueError, match="requires stage_2_strategy='block_ridge'"):
+        _steer_prepare(
+            tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge", target_block_pooling="segments"
+        )
+
+
+def test_target_block_pooling_rejects_a_row_with_a_single_eos(tmp_path) -> None:
+    """A single-segment (one-eos) target row has no hypothesis boundary to split at."""
+    with pytest.raises(ValueError, match="fewer than 2 EOS"):
+        _steer_prepare_encoder(tmp_path, target_block_pooling="segments", target_loaders=_text_loaders())
+
+
+def test_block_capture_segment_pooling_matches_the_pair_split() -> None:
+    from merge_and_rebase.rebase.text.encoder_classifier import segment_pooled
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    model = _tiny_t5_encoder(seed=0)
+    batch = _collate([_PairDictDataset(4)[i] for i in range(4)])
+    raw: dict[int, torch.Tensor] = {}
+    hooks = [
+        m.register_forward_hook(lambda _m, _i, out, b=b: raw.__setitem__(b, out[0] if isinstance(out, tuple) else out))
+        for b, m in enumerate(block_modules(model))
+    ]
+    with torch.no_grad(), _TextBlockCapture(model, segment_pooling=True) as capture:
+        capture.attention_mask = batch["attention_mask"]
+        capture.input_ids = batch["input_ids"]
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    for h in hooks:
+        h.remove()
+
+    assert set(capture.activations) == set(raw)
+    for b, h in raw.items():
+        expected = segment_pooled(h, batch["attention_mask"], batch["input_ids"], EOS)
+        assert torch.allclose(capture.activations[b], expected, atol=1e-6)
+        assert capture.activations[b].shape[-1] == 3 * h.shape[-1]
+
+    with pytest.raises(ValueError, match="pooling='mean' only"):
+        _TextBlockCapture(model, pooling="unitnorm", segment_pooling=True)
+
+
+def test_steer_text_segment_pooled_blocks_are_cached_apart_and_used_live(tmp_path) -> None:
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    _steer_prepare_encoder(tmp_path, block_ridge_lambda_scaling="trace", ridge_lambda=0.1)
+    base_global = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / "linear"
+    base_segpool = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / "linear__segpool"
+    before = torch.load(base_global / "train" / "features_B_blocks.pt")
+
+    prepared, target = _steer_prepare_encoder(
+        tmp_path, target_block_pooling="segments", block_ridge_lambda_scaling="trace", ridge_lambda=0.1,
+    )
+    for split in ("train", "test"):
+        assert (base_segpool / split / "features_B_blocks.pt").exists()
+    after = torch.load(base_global / "train" / "features_B_blocks.pt")
+    assert all(torch.equal(before[b], after[b]) for b in before), "the global-pooled cache must be left untouched"
+    assert prepared["target_block_pooling"] == "segments"
+    assert prepared["artifacts"]["stage2_state"]["target_block_pooling"] == "segments"
+
+    # Residual blocks are 3D wide (premise/hypothesis/global); the output block stays D.
+    segpool_train = torch.load(base_segpool / "train" / "features_B_blocks.pt")
+    num_residual = len(segpool_train) - 1
+    d_model = 48
+    for b in range(num_residual):
+        assert segpool_train[b].shape[-1] == 3 * d_model
+    assert segpool_train[num_residual].shape[-1] == d_model
+
+    # Live: the hook must segment-pool the blocks exactly as the fit did.
+    _, head = text_rebase_head(target)
+    batch = _collate([_PairDictDataset(4)[i] for i in range(4)])
+    kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, segment_pooling=True) as capture:
+            capture.attention_mask = batch["attention_mask"]
+            capture.input_ids = batch["input_ids"]
+            pooled = target(**kwargs).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kwargs).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kwargs).logits
+    expected = baseline + prepared["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
+
+
+def test_block_group_strategy_last_keeps_only_the_deepest_block_of_each_group(tmp_path) -> None:
+    """A 4-layer target grouped down to A's 2 blocks: 'concat' yields 6D regressors under
+    segment pooling (blocks 2g and 2g+1 side by side); 'last' keeps only block 2g+1's 3D."""
+    from merge_and_rebase.rebase.methods.steer import _predict_block_ridge
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    kwargs = dict(
+        target_block_pooling="segments", target_layers=4, block_ridge_lambda_scaling="trace", ridge_lambda=0.1
+    )
+    concat_run, _ = _steer_prepare_encoder(tmp_path, block_group_strategy="concat", **kwargs)
+    last_run, target = _steer_prepare_encoder(tmp_path, block_group_strategy="last", **kwargs)
+
+    d_model = 48
+    num_groups = concat_run["num_source_blocks"] - 1
+    concat_coefs = concat_run["artifacts"]["stage2_state"]["coefficients"]
+    last_coefs = last_run["artifacts"]["stage2_state"]["coefficients"]
+    assert last_run["artifacts"]["stage2_state"]["block_group_strategy"] == "last"
+    for g in range(num_groups):
+        assert concat_coefs[g].shape[0] == 6 * d_model
+        assert last_coefs[g].shape[0] == 3 * d_model
+    assert last_coefs[num_groups].shape[0] == d_model  # the output block is never grouped
+
+    # correction_fn == the fit's coefficients applied to the deepest block of each pair only.
+    base = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / "linear__segpool"
+    test_blocks = {int(b): v.double() for b, v in torch.load(base / "test" / "features_B_blocks.pt").items()}
+    grouped = {g: test_blocks[2 * g + 1] for g in range(num_groups)}
+    grouped[num_groups] = test_blocks[len(test_blocks) - 1]
+    got = last_run["correction_fn"]({"global": test_blocks[len(test_blocks) - 1], "blocks": test_blocks})
+    assert torch.allclose(got.double(), _predict_block_ridge(last_coefs, grouped), atol=1e-6)
+
+    # Live: the hook applies the same grouping as the fit.
+    _, head = text_rebase_head(target)
+    batch = _collate([_PairDictDataset(4)[i] for i in range(4)])
+    kw = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, segment_pooling=True) as capture:
+            capture.attention_mask = batch["attention_mask"]
+            capture.input_ids = batch["input_ids"]
+            pooled = target(**kw).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kw).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), last_run, alpha=1.0):
+            corrected = target(**kw).logits
+    expected = baseline + last_run["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
+
+
+def test_steer_text_correction_context_raises_without_input_ids_kwarg(tmp_path) -> None:
+    """Defensive guard: the hook must not silently fall back to global pooling."""
+    prepared, target = _steer_prepare_encoder(tmp_path, target_block_pooling="segments")
+    batch = _collate([_PairDictDataset(4)[i] for i in range(4)])
+    with torch.no_grad(), steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+        with pytest.raises(RuntimeError, match="needs 'input_ids'"):
+            target(batch["input_ids"], attention_mask=batch["attention_mask"])
+
+
 def test_steer_text_detects_an_unloaded_checkpoint(tmp_path) -> None:
     same = _tiny_t5(seed=0)
     with pytest.raises(ValueError, match="identical to the pretrained"):

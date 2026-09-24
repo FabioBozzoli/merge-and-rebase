@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import torch
 import torch.nn as nn
 from transformers import T5Config, T5ForConditionalGeneration
@@ -10,6 +11,8 @@ from merge_and_rebase.rebase.text.adapters import head_intermediate_linears, hea
 from merge_and_rebase.rebase.text.encoder_classifier import (
     T5EncoderForSequenceClassification,
     masked_mean,
+    segment_masks_from_eos,
+    segment_pooled,
 )
 from merge_and_rebase.rebase.text.steer_text import (
     _head_as_identity,
@@ -168,6 +171,62 @@ def test_pooled_feature_responds_to_padding() -> None:
         masked = model(input_ids=ids, attention_mask=mask).logits
         unmasked = model(input_ids=ids, attention_mask=torch.ones_like(mask)).logits
     assert not torch.allclose(masked, unmasked, atol=1e-5)
+
+
+def test_segment_masks_from_eos_splits_premise_and_hypothesis() -> None:
+    """``premise <eos> hypothesis <eos>``, two different segment lengths plus trailing pad."""
+    eos = 1
+    input_ids = torch.tensor(
+        [
+            [5, 6, eos, 7, eos, 0],  # premise=2 tok, hyp=1 tok, no pad
+            [5, eos, 6, 7, eos, 0],  # premise=1 tok, hyp=2 tok, no pad
+            [5, eos, 6, eos, 0, 0],  # premise=1 tok, hyp=1 tok, 2 pad
+        ]
+    )
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 0, 0],
+        ]
+    )
+    seg1, seg2 = segment_masks_from_eos(input_ids, attention_mask, eos)
+    assert seg1.tolist() == [
+        [True, True, False, False, False, False],
+        [True, False, False, False, False, False],
+        [True, False, False, False, False, False],
+    ]
+    assert seg2.tolist() == [
+        [False, False, False, True, False, False],
+        [False, False, True, True, False, False],
+        [False, False, True, False, False, False],
+    ]
+    # Padding never leaks into either segment, even where an all-real mask would allow it.
+    assert not (seg1 & ~attention_mask.bool()).any()
+    assert not (seg2 & ~attention_mask.bool()).any()
+
+
+def test_segment_pooled_matches_masked_mean_on_each_slice() -> None:
+    eos = 1
+    input_ids = torch.tensor([[5, 6, eos, 7, eos, 0], [5, eos, 6, 7, eos, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 0]])
+    hidden = torch.randn(2, 6, 4)
+
+    seg1, seg2 = segment_masks_from_eos(input_ids, attention_mask, eos)
+    pooled = segment_pooled(hidden, attention_mask, input_ids, eos)
+    expected = torch.cat(
+        [masked_mean(hidden, seg1), masked_mean(hidden, seg2), masked_mean(hidden, attention_mask)], dim=-1
+    )
+    assert pooled.shape == (2, 4 * 3)
+    assert torch.allclose(pooled, expected)
+
+
+def test_segment_masks_from_eos_rejects_a_row_with_a_single_eos() -> None:
+    eos = 1
+    input_ids = torch.tensor([[5, 6, eos, 7, 8]])  # only one EOS: no hypothesis boundary
+    attention_mask = torch.ones_like(input_ids)
+    with pytest.raises(ValueError, match="fewer than 2 EOS"):
+        segment_masks_from_eos(input_ids, attention_mask, eos)
 
 
 # ---------------------------------------------------------------------------
