@@ -34,9 +34,9 @@
   "target_task_heads": "/work/intesasanpaolo_phd/merge-and-rebase/text_rebase_heads/t5-large_snli_nearest_mean_enc_seed33_fewshot300.pt",
   "method_params": {
     "feature_regime": "linear",
-    "few_shot": 1000,
     "stage1_lambda": 1.0,
     "force_recompute_features": false,
+    "few_shot": 1000,
     "feature_cache_dir": "results/block_ridge_ntk_attention/snli/snli_residual_block_ridge_trace_carry_fs1000_seed54/feature_cache/",
     "stage_2_strategy": "block_ridge",
     "block_ridge_lambda_scaling": "trace",
