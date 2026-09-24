@@ -997,6 +997,76 @@ def test_steer_text_pooled_blocks_are_cached_apart_and_used_live(tmp_path) -> No
     assert torch.allclose(corrected, expected, atol=1e-4)
 
 
+@pytest.mark.parametrize("pooling", ["mean", "unitnorm"])
+def test_block_capture_attention_source_reads_the_input_of_the_output_projection(pooling) -> None:
+    from merge_and_rebase.rebase.text.encoder_classifier import masked_mean
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture, block_modules
+
+    model = _tiny_t5(seed=0)
+    batch = _collate([_DictDataset(4)[i] for i in range(4)])
+    batch["attention_mask"][:, :2] = 0
+    raw: dict[int, torch.Tensor] = {}
+    projections = [b.get_submodule("layer.0.SelfAttention.o") for b in block_modules(model)]
+    hooks = [o.register_forward_pre_hook(lambda _m, inp, b=b: raw.__setitem__(b, inp[0])) for b, o in enumerate(projections)]
+    with torch.no_grad(), _TextBlockCapture(model, pooling=pooling, source="attention") as capture:
+        capture.attention_mask = batch["attention_mask"]
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    for h in hooks:
+        h.remove()
+    assert set(capture.activations) == set(raw) == set(range(len(projections)))
+    for b, h in raw.items():
+        if pooling == "unitnorm":
+            h = h / h.norm(dim=-1, keepdim=True)
+        assert torch.allclose(capture.activations[b], masked_mean(h, batch["attention_mask"]), atol=1e-6)
+    with pytest.raises(ValueError, match="undefined for attention outputs"):
+        _TextBlockCapture(model, pooling="rmsnorm", source="attention")
+
+
+def test_steer_text_attention_source_is_cached_apart_and_used_live(tmp_path) -> None:
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    _steer_prepare(tmp_path, feature_regime="linear", stage_2_strategy="block_ridge")
+    base = tmp_path / "cache" / "src_to_tgt" / "rte" / "linear"
+    before = torch.load(base / "train" / "features_B_blocks.pt")
+
+    prepared, target = _steer_prepare(
+        tmp_path, feature_regime="linear", stage_2_strategy="block_ridge", block_source="attention",
+        block_ridge_lambda_scaling="trace", ridge_lambda=0.1, block_ridge_mode="smoothed_residual", rho=1.0,
+    )
+    for split in ("train", "test"):
+        assert (base / split / "features_B_blocks_src-attention_pool-mean.pt").exists()
+    after = torch.load(base / "train" / "features_B_blocks.pt")
+    assert all(torch.equal(before[b], after[b]) for b in before), "the residual cache must be left untouched"
+    assert prepared["block_source"] == "attention"
+    assert prepared["artifacts"]["stage2_state"]["block_source"] == "attention"
+
+    # A second run reads the cache and reproduces the fit exactly.
+    again, _ = _steer_prepare(
+        tmp_path, feature_regime="linear", stage_2_strategy="block_ridge", block_source="attention",
+        block_ridge_lambda_scaling="trace", ridge_lambda=0.1, block_ridge_mode="smoothed_residual", rho=1.0,
+    )
+    for a, b in zip(prepared["artifacts"]["stage2_state"]["coefficients"],
+                    again["artifacts"]["stage2_state"]["coefficients"], strict=True):
+        assert torch.equal(a, b)
+    assert again["diagnostics"] == prepared["diagnostics"]
+
+    # Live: the hook must capture attention outputs, exactly as the fit's features were.
+    _, head = text_rebase_head(target)
+    batch = _collate([_DictDataset(4)[i] for i in range(4)])
+    kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, source="attention") as capture:
+            capture.attention_mask = batch["attention_mask"]
+            pooled = target(**kwargs).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kwargs).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kwargs).logits
+    expected = baseline + prepared["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
+
+
 def test_steer_text_detects_an_unloaded_checkpoint(tmp_path) -> None:
     same = _tiny_t5(seed=0)
     with pytest.raises(ValueError, match="identical to the pretrained"):

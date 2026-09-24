@@ -4,9 +4,11 @@ This continues `docs/block-ridge-regression-diagnostics.md`. That report ended w
 as an interpolator: every intermediate block's ridge fits its support exactly, and the fix
 tried there (trace-scaled λ, joint fit) only tied `global_ridge`. This report follows the
 investigation from a review of new Stage-2 target strategies, through why the correction
-scale α matters so much, to the two changes that finally let a block-based Stage 2 beat
-`global_ridge`: a **label-free support larger than the block dimension**, and **normalizing
-tokens before pooling** B's blocks. It ends with the production options that implement them.
+scale α matters so much, to the changes that let a block-based Stage 2 beat `global_ridge`:
+a **label-free support larger than the block dimension**, **normalizing tokens before pooling**
+B's blocks, and above all **using B's attention outputs instead of its residual stream** as the
+block features (§13), where block_ridge with trace λ and carry beats `global_ridge` by ≈ 2.4
+points. It ends with the production options that implement them and reproducible configs.
 
 Setting everywhere unless stated: t5-base ntk checkpoints (A) → t5-large encoder (B),
 `model_kind=encoder_classification`, `feature_regime=linear`, the grid's nearest-mean B heads,
@@ -337,6 +339,15 @@ ENTRYPOINT=scripts.block_ridge_experiments.dump_prepare_inputs RESULTS_ROOT=$BR_
 #       --b-pooled $BR_LABELFREE_ROOT/b_pooled/bpool_<task>/<task>_b_pooled.pt --pooling <pooling> --out pool_curve/<task>_<pooling>.json
 #     python scripts/block_ridge_experiments/pool_table.py ; python scripts/block_ridge_experiments/pool_geometry.py <task>
 # §9  python scripts/block_ridge_experiments/support_sensitivity.py mnli rmsnorm 0 1.0 0.1
+# §13 ENTRYPOINT=scripts.block_ridge_experiments.collect_b_attn RESULTS_ROOT=$BR_LABELFREE_ROOT/b_attn \
+#       scripts/slurm/submit_text_rebase.sh battn_<task> configs/text_rebase_t5enc_steer.json <grid overrides> eval_source_finetuned=false
+#     python scripts/block_ridge_experiments/preprocess_curve.py $BR_LABELFREE_ROOT/dump --task <task> --preps none zscore \
+#       --b-pooled $BR_LABELFREE_ROOT/b_attn/battn_<task>/<task>_b_attn.pt --pooling <mean|unitnorm|headnorm> \
+#       --out attn_curve/<task>_replace_<pooling>.json
+#     python scripts/block_ridge_experiments/preprocess_curve.py ... --b-pooled <b_pooled file> --pooling unitnorm \
+#       --add-pooled <b_attn file> --add-pooling <unitnorm|headnorm> --out attn_curve/<task>_add_<pooling>.json
+#     python scripts/block_ridge_experiments/attn_table.py
+#     production runs: configs/block_ridge_ntk_attention/README.md
 ```
 
 The curve scripts are CPU-only (8 cores, 48 GB for n = 3400; ~15 min per task); the
@@ -344,11 +355,78 @@ entrypoints need one GPU for a few minutes per task.
 
 ## 12. Open questions
 
-- **Other pooling sources inside the block.** Any per-token linear map (Q/K/V, W_O, the FFN
-  output projection) commutes with mean pooling and adds no information for a linear
-  Stage 2. Points after token mixing or a nonlinearity can: the attention output before
-  W_O (`SelfAttention.o`'s input) pools values weighted by how much attention each token
-  receives; the FFN hidden activations are nonlinear (4096-d per layer). Next experiment.
-- Per-block targets (`reuse_logitmap`) are what separate block_ridge from joint ridge;
-  joint wins where it wins by not using them.
-- The gap to the oracle is still ≈ 6 points on average and keeps closing with n.
+- The FFN hidden activations (input of `DenseReluDense.wo`, nonlinear, 4096-d per layer) are
+  the other untested pooling source; their size needs dimensionality reduction first.
+- Per-block targets (`reuse_logitmap`) are what separate block_ridge from joint ridge; with
+  attention features block_ridge now matches or beats joint ridge (§13).
+- The gap to the oracle is ≈ 4 points with attention features and still closing with n.
+
+## 13. Attention outputs as B's block features
+
+**Idea.** Any per-token *linear* map commutes with mean pooling, so pooling after Q/K/V, W_O or
+the FFN output projection adds nothing a linear Stage 2 does not already have. The input of
+each block's `SelfAttention.o` is different: each token there is a mix `Σ_j a_tj v_j` of value
+vectors, so its mean over tokens weights the values by how much attention each token
+*receives*, per head — a token weighting the model computes itself, which no rescaling of the
+pooled residual stream can reproduce. And it is a block's own contribution, not the cumulative
+stream.
+
+**Hypothesis.** Pooled attention outputs carry task information the pooled residual stream
+lacks, and are not near-identical from block to block.
+
+**Experiment.** `collect_b_attn.py` (a `text_rebase` entrypoint, B forward only) pools each
+block's `o` input three ways (mean; `unitnorm`, the 1024-d token normalized; `headnorm`, each
+64-d head normalized) and checks that W_O applied to the pooled input equals the pooled output
+of `o` (≤ 2.7e-7: the hook read the right tensor). `preprocess_curve.py` refits with the same
+label-free protocol as §5–7, either *replacing* the residual blocks or *adding* the attention
+blocks to the residual unit-norm ones in one joint ridge (`joint_plus`). `attn_table.py`
+tabulates; its consistency check confirms the add-mode `joint` reproduces §7 exactly.
+
+**Result** (mean over 5 tasks × 3 seeds, α = 1; oracle 0.858):
+
+| n | global | residual: joint, unitnorm | attention: joint | attention: block_ridge trace + carry | residual + attention: joint |
+|---|---|---|---|---|---|
+| 600 | 0.746 | 0.743 | 0.765 | **0.769** | 0.764 |
+| 1500 | 0.772 | 0.779 | 0.793 | **0.796** | 0.792 |
+| 3400 | 0.796 | 0.800 | 0.818 | **0.819** | 0.819 |
+
+- Paired against global_ridge (15 task-seeds): block_ridge trace + carry on attention outputs,
+  +2.3 ± 0.5 points at n = 600 (12/15 wins) and +2.4 ± 0.4 at n = 3400 (13/15); joint +
+  z-score +2.6 ± 0.5 (14/15). Without the carry, per-block trace λ gains +1.3.
+- Every task improves at n = 3400 (best attention fit vs global): mnli 0.761 vs 0.723, qnli
+  0.840 vs 0.807, snli 0.813 vs 0.775, **scitail 0.904 vs 0.888** (the first block fit to beat
+  global there), sick 0.788 vs 0.786, rte 0.698 vs 0.648 (noisy).
+- The pooling rule no longer matters (mean, unitnorm, headnorm within 0.1–0.4 points), and
+  adding the residual stream to the attention outputs adds nothing (0.819 vs 0.818).
+- Geometry (mnli, snli; residual stream → attention output): cosine with the previous block
+  0.98–0.999 → −0.04 to 0.04; top principal direction up to 0.98 → 0.06–0.09 of the variance;
+  five largest channels 0.44–0.72 → 0.03–0.14 of the energy; class share of the variance in
+  upper blocks 0.0–0.3% → 0.5–1.3%.
+
+**Conclusion.** The block features, not the ridge, were block_ridge's bottleneck. On attention
+outputs, block_ridge with trace λ and carry is the best fit at every support size, and the gap
+to the oracle drops from ≈ 6 to ≈ 4 points.
+
+### In production
+
+`steer_text.prepare` gained `block_source` (`"residual"`, the default, | `"attention"`),
+implemented in `_TextBlockCapture` with forward pre-hooks on each block's self-attention output
+projection (`SelfAttention.o` in T5, `self_attn.o_proj` in Llama/Qwen), used identically at fit
+time and in the live correction hook, and recollected from B alone into
+`features_B_blocks_src-attention_pool-<pooling>.pt`. Tests check the captured tensor against the
+input of `o`, the separate cache, a bit-identical second fit, and the live path.
+
+`configs/block_ridge_ntk_attention/` holds the reproducible runs for snli at few_shot = 1000
+(the grid's largest support), 3 seeds, with global_ridge and residual block_ridge on the same
+support as references, generated by `make_configs.py` and verified by `check_results.py`.
+Each config has its own feature cache, so runs share no files. Live test accuracy:
+
+| snli, few_shot 1000 | seed 33 | seed 54 | seed 89 | mean ± sd |
+|---|---|---|---|---|
+| **attention block_ridge trace + carry** | 0.8044 | 0.7978 | 0.8072 | **0.803 ± 0.005** |
+| global_ridge | 0.7772 | 0.7811 | 0.7739 | 0.777 ± 0.004 |
+| residual block_ridge trace + carry | 0.7667 | 0.7628 | 0.7494 | 0.760 ± 0.009 |
+
+Live equals cached Stage-2 accuracy in every run, and the numbers were bit-identical across a
+first run, a warm rerun of all nine, a fresh cache filled from scratch, and all nine run
+concurrently cold with per-run caches.

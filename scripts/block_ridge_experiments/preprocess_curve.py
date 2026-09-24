@@ -20,7 +20,12 @@ target; test accuracy at alpha=1 and at the alpha picked on V (by accuracy).
 --b-pooled FILE --pooling P swaps B's per-block features (not f_B) for the ones
 collect_b_pooled.py recollected with another pooling rule (unitnorm, rmsnorm and their
 centered versions),
-so global -- which only sees f_B -- stays an unchanged reference.
+so global -- which only sees f_B -- stays an unchanged reference. collect_b_attn.py's file
+(attention outputs, poolings mean / unitnorm / headnorm) has the same format.
+
+--add-pooled FILE --add-pooling P appends a *second* set of B blocks (grouped the same way)
+to the joint ridge only, reported as the extra variant "joint_plus": does that source carry
+information the first one lacks? The per-block fits keep their one-to-one map to A's blocks.
 
 Usage: python preprocess_curve.py <dump-dir> --task T [--seeds ...] [--sizes ...] [--out f.json]
                                   [--b-pooled <task>_b_pooled.pt --pooling rmsnorm]
@@ -48,7 +53,11 @@ parser.add_argument("--n-val", type=int, default=600)
 parser.add_argument("--preps", nargs="+", default=["none", "center", "zscore", "center_drop1", "rownorm"])
 parser.add_argument("--out", default=None)
 parser.add_argument("--b-pooled", default=None)
-parser.add_argument("--pooling", default="rmsnorm", choices=["unitnorm", "rmsnorm", "center_unitnorm", "center_rmsnorm"])
+parser.add_argument("--pooling", default="rmsnorm",
+                    choices=["mean", "unitnorm", "rmsnorm", "center_unitnorm", "center_rmsnorm", "headnorm"])
+parser.add_argument("--add-pooled", default=None)
+parser.add_argument("--add-pooling", default="unitnorm",
+                    choices=["mean", "unitnorm", "rmsnorm", "center_unitnorm", "center_rmsnorm", "headnorm"])
 args = parser.parse_args()
 
 BETAS = [1000.0, 100.0, 10.0, 1.0, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
@@ -91,6 +100,16 @@ def grouped(features_b_blocks):
 
 
 X_tr, X_te = grouped(tr["features_B_blocks"]), grouped(te["features_B_blocks"])
+ADD_tr = ADD_te = None
+if args.add_pooled:
+    ap = torch.load(args.add_pooled, weights_only=False)
+    n_add = len(ap["train"][args.add_pooling])
+    group = lambda d: _BLOCK_GROUP_STRATEGIES["concat"]({int(b): v.double() for b, v in d.items()}, L - 1)  # noqa: E731
+    ADD_tr, ADD_te = group(ap["train"][args.add_pooling]), group(ap["test"][args.add_pooling])
+    assert ADD_tr[0].shape[0] == X_tr[0].shape[0] and ADD_te[0].shape[0] == X_te[0].shape[0]
+    print(f"[preprocess_curve] joint_plus adds {n_add} '{args.add_pooling}' blocks from {args.add_pooled} "
+          f"as {len(ADD_tr)} groups", flush=True)
+    del ap
 del tr, te
 
 
@@ -176,6 +195,15 @@ for seed in args.seeds:
                 sum(k.K / k.trace_mean for k in ks), sum(k.Kv / k.trace_mean for k in ks),
                 sum(k.Kt / k.trace_mean for k in ks), icpt,
             )
+            joint_plus = None
+            if ADD_tr is not None:
+                ks_add = [Kern(*preprocess(ADD_tr[g], ADD_te[g], S, V, prep), icpt) for g in range(len(ADD_tr))]
+                all_k = ks + ks_add
+                joint_plus = Kern.from_kernels(
+                    sum(k.K / k.trace_mean for k in all_k), sum(k.Kv / k.trace_mean for k in all_k),
+                    sum(k.Kt / k.trace_mean for k in all_k), icpt,
+                )
+                del ks_add, all_k
 
             def per_block(beta, carry):
                 pv = torch.zeros(V.numel(), T_Sl.shape[1], dtype=torch.float64)
@@ -197,6 +225,7 @@ for seed in args.seeds:
                 "br_trace": {bt: per_block(bt, False) for bt in BETAS},
                 "br_trace_carry": {bt: per_block(bt, True) for bt in BETAS},
                 "joint": {bt: total(joint, bt) for bt in BETAS},
+                **({"joint_plus": {bt: total(joint_plus, bt) for bt in BETAS}} if joint_plus is not None else {}),
                 # global: lambda relative to f_B's own mean eigenvalue, the same scale-free grid
                 "global": {bt: total(glob, bt * glob.trace_mean) for bt in BETAS},
             }
@@ -211,7 +240,7 @@ for seed in args.seeds:
                     "test_acc_valalpha": acc(f_te, pt, y_te, a_best),
                 }
             row[prep] = out
-            del ks, glob, joint, variants
+            del ks, glob, joint, joint_plus, variants
             print(json.dumps({"task": task, "seed": seed, "n": n, "prep": prep,
                               **{k: (round(v["test_acc_a1"], 4), round(v["test_r2"], 3), v["penalty"]) for k, v in out.items()}}),
                   flush=True)

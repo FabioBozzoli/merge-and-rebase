@@ -55,6 +55,11 @@ other strategy rejects them rather than ignoring them):
   tokens are pooled; see ``_TextBlockCapture``. Non-mean poolings are recollected
   from B alone and cached as ``features_B_blocks_pool-<name>.pt`` next to the
   split's other files; the live correction hook pools the same way.
+- ``block_source`` (``"residual"`` | ``"attention"``): which tensor each block
+  contributes -- its output (the residual stream) or the input of its self-attention
+  output projection (the heads' attention outputs before W_O); see
+  ``_TextBlockCapture``. The attention source is recollected like a non-mean pooling
+  and cached as ``features_B_blocks_src-attention_pool-<name>.pt``.
 - ``block_feature_preprocessing`` (``"none"`` | ``"zscore"``): standardize every
   block with support-set statistics and fit an unpenalized intercept; folded into
   the coefficients and a bias vector, so evaluation needs no extra state.
@@ -270,28 +275,65 @@ _masked_mean = masked_mean
 
 
 BLOCK_POOLINGS: tuple[str, ...] = ("mean", "unitnorm", "rmsnorm")
+BLOCK_SOURCES: tuple[str, ...] = ("residual", "attention")
+
+# Path, inside one block, of the self-attention output projection whose *input* is the
+# attention output: T5Block, then Llama/Qwen decoder layers.
+_ATTENTION_OUT_PATHS: tuple[str, ...] = ("layer.0.SelfAttention.o", "self_attn.o_proj")
+
+
+def block_attention_out_projections(model: nn.Module) -> list[nn.Module]:
+    """Each block's self-attention output projection, in the same order as ``block_modules``."""
+    found = []
+    for block in block_modules(model):
+        for path in _ATTENTION_OUT_PATHS:
+            try:
+                found.append(block.get_submodule(path))
+                break
+            except AttributeError:
+                continue
+        else:
+            raise ValueError(
+                f"No self-attention output projection ({', '.join(_ATTENTION_OUT_PATHS)}) in block "
+                f"{type(block).__name__}; block_source='attention' does not support this architecture yet."
+            )
+    return found
 
 
 class _TextBlockCapture:
     """Capture pooled per-block activations during a forward pass.
 
-    ``pooling`` decides what each block's ``[B, T, D]`` output becomes before the
-    masked mean over real tokens:
+    ``source`` decides which tensor each block contributes:
 
-    - ``"mean"``: nothing -- the raw residual stream (what the feature cache holds);
+    - ``"residual"``: the block's output, i.e. the residual stream after the block;
+    - ``"attention"``: the *input* of the block's self-attention output projection
+      (T5 ``SelfAttention.o``), i.e. the heads' attention outputs before W_O. Each
+      token there is a mix ``sum_j a_tj v_j`` of value vectors, so its mean over tokens
+      weights the values by how much attention each token receives -- information a
+      per-token linear map of the residual stream cannot supply, and unlike the
+      cumulative residual stream it is not near-identical from block to block.
+
+    ``pooling`` decides what each token becomes before the masked mean over real tokens:
+
+    - ``"mean"``: nothing (for the residual source, what the feature cache holds);
     - ``"unitnorm"``: every token divided by its own L2 norm;
     - ``"rmsnorm"``: every token through its stack's final norm (``block_final_norms``),
-      i.e. pooled the way the model pools its own output feature.
+      i.e. pooled the way the model pools its own output feature. Residual source only.
 
     T5's unnormalized residual stream gives a few tokens very large norms, and a
     plain mean is dominated by them; normalizing each token first gives every token
-    the same weight in the average.
+    the same weight in the average. Attention outputs have no such tokens.
     """
 
-    def __init__(self, model: nn.Module, pooling: str = "mean") -> None:
+    def __init__(self, model: nn.Module, pooling: str = "mean", source: str = "residual") -> None:
         if pooling not in BLOCK_POOLINGS:
             raise ValueError(f"block pooling must be one of {BLOCK_POOLINGS}, got {pooling!r}")
-        self.modules = block_modules(model)
+        if source not in BLOCK_SOURCES:
+            raise ValueError(f"block source must be one of {BLOCK_SOURCES}, got {source!r}")
+        if source == "attention" and pooling == "rmsnorm":
+            raise ValueError("rmsnorm pooling applies the residual stream's final norm; it is undefined for attention outputs")
+        self.source = source
+        self.modules = block_modules(model) if source == "residual" else block_attention_out_projections(model)
         self.pooling = pooling
         self.norms = block_final_norms(model) if pooling == "rmsnorm" else None
         self.activations: dict[int, torch.Tensor] = {}
@@ -313,9 +355,19 @@ class _TextBlockCapture:
 
         return hook
 
+    def _make_pre_hook(self, block_id: int) -> Callable[..., None]:
+        def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+            if inputs and torch.is_tensor(inputs[0]):
+                self.activations[block_id] = self._pool(block_id, inputs[0]).detach()
+
+        return hook
+
     def __enter__(self) -> _TextBlockCapture:
         for block_id, module in enumerate(self.modules):
-            self._handles.append(module.register_forward_hook(self._make_hook(block_id)))
+            if self.source == "attention":
+                self._handles.append(module.register_forward_pre_hook(self._make_pre_hook(block_id)))
+            else:
+                self._handles.append(module.register_forward_hook(self._make_hook(block_id)))
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -471,24 +523,31 @@ def _collect_linear_split(
 
 @torch.no_grad()
 def _collect_target_blocks(
-    *, target: nn.Module, target_loader: Any, device: torch.device, pooling: str
+    *, target: nn.Module, target_loader: Any, device: torch.device, pooling: str, source: str = "residual"
 ) -> dict[int, torch.Tensor]:
-    """B's residual blocks, pooled with ``pooling``, from a plain forward of B alone.
+    """B's per-block features for ``source``/``pooling``, from a plain forward of B alone.
 
-    Only B's side changes with the pooling rule, so this never re-runs A's jvps: the
-    rows line up with the cached split because ``target_loader`` is the same
+    Only B's side changes with the source or pooling rule, so this never re-runs A's
+    jvps: the rows line up with the cached split because ``target_loader`` is the same
     ``shuffle=False`` loader ``_collect_linear_split`` walked.
     """
-    num_residual = num_residual_blocks(target)
-    chunks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_residual)}
-    with _head_as_identity(target), _TextBlockCapture(target, pooling=pooling) as capture:
+    with _head_as_identity(target), _TextBlockCapture(target, pooling=pooling, source=source) as capture:
+        num_blocks = len(capture.modules)
+        chunks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_blocks)}
         for batch in target_loader:
             capture.attention_mask = batch["attention_mask"].to(device) if "attention_mask" in batch else None
             capture.activations.clear()
             _pooled_features(target, batch, device)
-            for b in range(num_residual):
+            for b in range(num_blocks):
                 chunks[b].append(capture.activations[b].cpu())
     return {b: torch.cat(v, dim=0) for b, v in chunks.items()}
+
+
+def _block_cache_name(source: str, pooling: str) -> str:
+    # The residual name predates block_source and is kept so existing caches stay valid.
+    if source == "residual":
+        return f"features_B_blocks_pool-{pooling}.pt"
+    return f"features_B_blocks_src-{source}_pool-{pooling}.pt"
 
 
 def _load_or_compute_pooled_blocks(
@@ -498,24 +557,25 @@ def _load_or_compute_pooled_blocks(
     force_recompute: bool,
     compute_fn: Callable[[], dict[int, torch.Tensor]],
     verbose: bool,
+    source: str = "residual",
 ) -> dict[int, torch.Tensor]:
-    """``features_B_blocks`` under a non-default pooling, cached beside the split's other files.
+    """B's block features under a non-default source/pooling, cached beside the split's other files.
 
     A separate file rather than a separate regime directory: the A-side tensors in the
-    split do not depend on B's pooling, and recomputing them costs one jvp per source
-    block per batch.
+    split do not depend on B's block features, and recomputing them costs one jvp per
+    source block per batch. Jobs are expected to have their own ``feature_cache_dir``;
+    the write is atomic only so that a killed job never leaves a partial file behind.
     """
-    path = cache_dir / f"features_B_blocks_pool-{pooling}.pt"
+    path = cache_dir / _block_cache_name(source, pooling)
+    label = f"'{source}/{pooling}' block features"
     if path.exists() and not force_recompute:
         if verbose:
-            print(f"[steer_text] using cached '{pooling}' block features at {path}")
+            print(f"[steer_text] using cached {label} at {path}")
         return torch.load(path, map_location="cpu", weights_only=True)
     if verbose:
-        print(f"[steer_text] computing '{pooling}' block features for {path}")
+        print(f"[steer_text] computing {label} for {path}")
     blocks = compute_fn()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Several seeds of one task typically start together and all miss this file; write
-    # to a private temp name and rename, so a concurrent reader never sees a partial file.
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     torch.save(blocks, tmp)
     os.replace(tmp, path)
@@ -609,6 +669,7 @@ class SteerTextRebase:
         block_residuals_weighting_strategy: str = "identity",
         block_ridge_blockwise_stage1_lambda: float = 1.0,
         block_pooling: str = "mean",
+        block_source: str = "residual",
         block_feature_preprocessing: str = "none",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
@@ -632,11 +693,18 @@ class SteerTextRebase:
         uses_blocks = stage_2_strategy in {"block_ridge", "joint_ridge"}
         if block_pooling not in BLOCK_POOLINGS:
             raise ValueError(f"steer_text block_pooling must be one of: {', '.join(BLOCK_POOLINGS)}")
+        if block_source not in BLOCK_SOURCES:
+            raise ValueError(f"steer_text block_source must be one of: {', '.join(BLOCK_SOURCES)}")
+        if block_source == "attention" and block_pooling == "rmsnorm":
+            raise ValueError("steer_text block_pooling='rmsnorm' is defined for the residual source only")
         if block_feature_preprocessing not in {"none", "zscore"}:
             raise ValueError("steer_text block_feature_preprocessing must be 'none' or 'zscore'")
-        if not uses_blocks and (block_pooling != "mean" or block_feature_preprocessing != "none"):
+        if not uses_blocks and (
+            block_pooling != "mean" or block_source != "residual" or block_feature_preprocessing != "none"
+        ):
             raise ValueError(
-                "steer_text block_pooling / block_feature_preprocessing only apply to block_ridge and joint_ridge; "
+                "steer_text block_pooling / block_source / block_feature_preprocessing only apply to block_ridge "
+                "and joint_ridge; "
                 f"stage_2_strategy={stage_2_strategy!r} would silently ignore them."
             )
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
@@ -721,28 +789,38 @@ class SteerTextRebase:
         train_data = _load_or_compute_split(split="train", compute_fn=lambda: _compute("train"), **cache_args)
         test_data = _load_or_compute_split(split="test", compute_fn=lambda: _compute("test"), **cache_args)
 
-        if need_blocks and block_pooling != "mean":
-            # Swap B's residual blocks for the re-pooled ones; f_B (the output block) and
-            # everything on A's side stay as cached.
+        if need_blocks and (block_pooling != "mean" or block_source != "residual"):
+            # Swap B's per-block features for the recollected ones; f_B (the output block)
+            # and everything on A's side stay as cached.
             for split, data in (("train", train_data), ("test", test_data)):
                 pooled = _load_or_compute_pooled_blocks(
                     cache_dir=_cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, split),
                     pooling=block_pooling,
+                    source=block_source,
                     force_recompute=force_recompute_features,
                     compute_fn=lambda split=split: _collect_target_blocks(
                         target=target_model, target_loader=getattr(target_loaders, split), device=dev,
-                        pooling=block_pooling,
+                        pooling=block_pooling, source=block_source,
                     ),
                     verbose=verbose,
                 )
                 blocks = dict(data["features_B_blocks"])
                 keys = {int(k): k for k in blocks}
+                if len(pooled) != len(blocks) - 1:
+                    raise ValueError(
+                        f"steer_text: {len(pooled)} '{block_source}' blocks but the cached split has "
+                        f"{len(blocks) - 1} residual blocks."
+                    )
                 for b, value in pooled.items():
                     old = blocks[keys[int(b)]]
-                    if tuple(value.shape) != tuple(old.shape):
+                    # Rows must line up with the cache; the width may differ for the attention
+                    # source (heads * d_head need not equal d_model).
+                    bad_rows = value.shape[0] != old.shape[0]
+                    bad_width = block_source == "residual" and tuple(value.shape) != tuple(old.shape)
+                    if bad_rows or bad_width:
                         raise ValueError(
-                            f"steer_text: '{block_pooling}' block {b} has shape {tuple(value.shape)} but the cached "
-                            f"split has {tuple(old.shape)}; rerun with force_recompute_features=true."
+                            f"steer_text: '{block_source}/{block_pooling}' block {b} has shape {tuple(value.shape)} "
+                            f"but the cached split has {tuple(old.shape)}; rerun with force_recompute_features=true."
                         )
                     blocks[keys[int(b)]] = value
                 data["features_B_blocks"] = blocks
@@ -946,6 +1024,7 @@ class SteerTextRebase:
                 "num_source_residual_blocks": int(num_source_residual_blocks),
                 "block_group_strategy": str(block_group_strategy),
                 "block_pooling": str(block_pooling),
+                "block_source": str(block_source),
                 "block_feature_preprocessing": str(block_feature_preprocessing),
                 "weights": weights,
             }
@@ -1015,6 +1094,7 @@ class SteerTextRebase:
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
             "block_pooling": block_pooling,
+            "block_source": block_source,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             # The fitted transforms themselves, so a run can be inspected or
@@ -1074,7 +1154,13 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     need_blocks = prepared.get("stage_2_strategy") in {"block_ridge", "joint_ridge"}
 
     # Pool the live blocks exactly as the fit's features were pooled.
-    capture = _TextBlockCapture(model, pooling=prepared.get("block_pooling", "mean")) if need_blocks else None
+    capture = (
+        _TextBlockCapture(
+            model, pooling=prepared.get("block_pooling", "mean"), source=prepared.get("block_source", "residual")
+        )
+        if need_blocks
+        else None
+    )
     handles: list[Any] = []
 
     def _mask_hook(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:

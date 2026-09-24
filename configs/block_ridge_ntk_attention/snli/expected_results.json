@@ -1,0 +1,56 @@
+{
+  "snli_attention_block_ridge_trace_carry_fs1000_seed33": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8738888888888889,
+    "stage2_cached": 0.8044444444444444,
+    "stage2_live": 0.8044444444444444
+  },
+  "snli_attention_block_ridge_trace_carry_fs1000_seed54": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8722222222222222,
+    "stage2_cached": 0.7977777777777778,
+    "stage2_live": 0.7977777777777778
+  },
+  "snli_attention_block_ridge_trace_carry_fs1000_seed89": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8711111111111111,
+    "stage2_cached": 0.8072222222222222,
+    "stage2_live": 0.8072222222222222
+  },
+  "snli_global_ridge_fs1000_seed33": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8738888888888889,
+    "stage2_cached": 0.7772222222222223,
+    "stage2_live": 0.7772222222222223
+  },
+  "snli_global_ridge_fs1000_seed54": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8722222222222222,
+    "stage2_cached": 0.7811111111111111,
+    "stage2_live": 0.7811111111111111
+  },
+  "snli_global_ridge_fs1000_seed89": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8711111111111111,
+    "stage2_cached": 0.7738888888888888,
+    "stage2_live": 0.7738888888888888
+  },
+  "snli_residual_block_ridge_trace_carry_fs1000_seed33": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8738888888888889,
+    "stage2_cached": 0.7666666666666667,
+    "stage2_live": 0.7666666666666667
+  },
+  "snli_residual_block_ridge_trace_carry_fs1000_seed54": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8722222222222222,
+    "stage2_cached": 0.7627777777777778,
+    "stage2_live": 0.7627777777777778
+  },
+  "snli_residual_block_ridge_trace_carry_fs1000_seed89": {
+    "stage0": 0.5911111111111111,
+    "stage1": 0.8711111111111111,
+    "stage2_cached": 0.7494444444444445,
+    "stage2_live": 0.7494444444444445
+  }
+}
