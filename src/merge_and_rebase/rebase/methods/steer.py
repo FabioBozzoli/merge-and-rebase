@@ -27,11 +27,11 @@ steer4rebase (https://github.com internal repo at rebasin_linear/steer4rebase):
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -41,7 +41,6 @@ from torch.utils.data import DataLoader
 from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
 from ..registry import register
-
 
 _LINEARIZED_PARAM_PATTERN = re.compile(r"(?:^|.*\.)(params0|delta)\.(\d+)$")
 
@@ -217,6 +216,7 @@ def _fit_block_ridge(
     regularization: float,
     mode: str,
     rho: float = 0.9,
+    regularization_scaling: str = "none",
 ) -> list[torch.Tensor]:
     """
     Fit per-block ridge coefficients, chained with a smoothed-residual carry.
@@ -226,11 +226,19 @@ def _fit_block_ridge(
     coefficients can be applied to *any* new block activations at predict
     time -- this is the split-fit/predict factoring of steer4rebase's
     stage2.block_ridge (which fits and predicts in a single call).
+
+    ``regularization_scaling="trace"`` fits block ``b`` with
+    ``regularization * tr(X_b X_bᵀ) / n``, i.e. relative to the mean
+    eigenvalue of that block's Gram matrix. This makes the scalar
+    ``regularization`` a dimensionless sweep parameter with comparable
+    effective shrinkage across blocks whose activation scales differ.
     """
     if mode not in {"independent", "smoothed_residual"}:
         raise ValueError(f"Unknown steer block_ridge mode: {mode}")
     if mode == "smoothed_residual" and not 0.0 <= rho <= 1.0:
         raise ValueError("steer block_ridge rho must be in [0, 1]")
+    if regularization_scaling not in {"none", "trace"}:
+        raise ValueError(f"Unknown steer block_ridge regularization_scaling: {regularization_scaling}")
 
     num_blocks = train_targets.shape[1]
     state = torch.zeros_like(train_targets[:, 0])
@@ -240,7 +248,10 @@ def _fit_block_ridge(
         local_target = train_targets[:, block_id]
         compensation = rho * state if mode == "smoothed_residual" else torch.zeros_like(state)
         fitted_target = local_target + compensation
-        coefficient = _ridge(x_train, fitted_target, regularization)
+        block_regularization = regularization
+        if regularization_scaling == "trace":
+            block_regularization = regularization * float(x_train.square().sum()) / x_train.shape[0]
+        coefficient = _ridge(x_train, fitted_target, block_regularization)
         coefficients.append(coefficient)
         if mode == "smoothed_residual":
             block_train_prediction = x_train @ coefficient
@@ -362,6 +373,22 @@ _RESNET_ATTNPOOL_PREFIX = "attnpool."
 _RESNET_RESBLOCK_PATTERN = re.compile(r"^layer(\d+)\.(\d+)\.")
 _RESNET_STAGE_BLOCKS = {1: 3, 2: 4, 3: 6, 4: 3}
 
+_BLOCK_GRANULARITIES = {"residual", "attention", "linear", "model"}
+
+
+@dataclass(frozen=True)
+class _LinearActivationSite:
+    """A linear operation and the activation used to predict its correction.
+
+    ``module_name`` is ``None`` only for raw projection parameters such as a
+    CLIP ViT's final ``visual.proj`` matrix.  Those sites use the encoder's
+    final output, supplied by the caller after the forward pass.
+    """
+
+    name: str
+    module_name: str | None
+    hook: str  # "pre", "post", or "final"
+
 
 def _is_resnet_visual(visual: nn.Module) -> bool:
     return hasattr(visual, "layer1") and not hasattr(visual, "transformer")
@@ -435,9 +462,211 @@ def _clip_resnet_parameter_blocks(parameter_names: Iterable[str]) -> tuple[tuple
     return tuple(block_ids), output_block_id + 1
 
 
-def _parameter_blocks_for_visual(visual: nn.Module) -> tuple[tuple[int | None, ...], int]:
+def _linear_activation_sites(visual: nn.Module) -> tuple[_LinearActivationSite, ...]:
+    """Return ordered linear-operation sites for a CLIP visual encoder.
+
+    Besides explicit ``Linear`` and ``Conv2d`` modules, PyTorch's
+    ``MultiheadAttention`` owns a packed QKV projection as raw parameters and
+    calls its ``out_proj`` functionally (so a hook on the child Linear does not
+    fire).  Represent those two operations with pre/post hooks on the parent
+    attention module.  A raw top-level ``proj`` matrix is represented by a
+    final-output site.
+    """
+    modules = dict(visual.named_modules())
+    mha_out_proj_names = {
+        f"{name}.out_proj" for name, module in modules.items() if name and isinstance(module, nn.MultiheadAttention)
+    }
+    sites: list[_LinearActivationSite] = []
+    for name, module in modules.items():
+        if not name:
+            continue
+        if isinstance(module, nn.MultiheadAttention):
+            sites.append(_LinearActivationSite(f"{name}.in_proj", name, "pre"))
+            sites.append(_LinearActivationSite(f"{name}.out_proj", name, "post"))
+        elif isinstance(module, (nn.Linear, nn.Conv2d)) and name not in mha_out_proj_names:
+            sites.append(_LinearActivationSite(name, name, "post"))
+
+    direct_parameters = dict(visual.named_parameters(recurse=False))
+    if "proj" in direct_parameters:
+        sites.append(_LinearActivationSite("proj", None, "final"))
+    if not sites:
+        raise ValueError("No linear operations were found in the CLIP visual encoder.")
+    return tuple(sites)
+
+
+_VIT_LINEAR_SITE_PATTERN = re.compile(r"^transformer\.resblocks\.(\d+)\.(.+)$")
+
+
+def _linear_site_groups(source_visual: nn.Module, target_visual: nn.Module) -> tuple[tuple[int, ...], ...]:
+    """Map target linear sites to source sites, preserving operation roles.
+
+    Equal-depth models map one-to-one. For a deeper target ViT, consecutive
+    target transformer layers are assigned to each source layer, but QKV,
+    attention output, MLP expansion, and MLP projection sites are never mixed
+    with one another. Stem and final projection remain singleton groups.
+    """
+    source_sites = _linear_activation_sites(source_visual)
+    target_sites = _linear_activation_sites(target_visual)
+    target_by_name = {site.name: i for i, site in enumerate(target_sites)}
+    if len(target_by_name) != len(target_sites):
+        raise ValueError("Target visual encoder exposes duplicate linear site names.")
+
+    source_residual = [
+        (i, int(match.group(1)), match.group(2))
+        for i, site in enumerate(source_sites)
+        if (match := _VIT_LINEAR_SITE_PATTERN.match(site.name)) is not None
+    ]
+    target_residual = [
+        (i, int(match.group(1)), match.group(2))
+        for i, site in enumerate(target_sites)
+        if (match := _VIT_LINEAR_SITE_PATTERN.match(site.name)) is not None
+    ]
+
+    if not source_residual and len(source_sites) != len(target_sites):
+        raise ValueError(
+            "Linear granularity can group unequal depths only for ViT transformer.resblocks encoders."
+        )
+    source_depth = max((layer for _, layer, _ in source_residual), default=-1) + 1
+    target_depth = max((layer for _, layer, _ in target_residual), default=-1) + 1
+    if target_depth < source_depth:
+        raise ValueError(
+            f"steer linear granularity cannot map shallower target depth {target_depth} to source depth {source_depth}."
+        )
+    boundaries = [round(i * target_depth / source_depth) for i in range(source_depth + 1)] if source_depth else []
+
+    groups: list[tuple[int, ...]] = []
+    for source_site in source_sites:
+        match = _VIT_LINEAR_SITE_PATTERN.match(source_site.name)
+        if match is None:
+            if source_site.name not in target_by_name:
+                raise ValueError(f"Target visual encoder lacks source linear site {source_site.name!r}.")
+            groups.append((target_by_name[source_site.name],))
+            continue
+        source_layer = int(match.group(1))
+        role = match.group(2)
+        members = tuple(
+            target_id
+            for target_id, target_layer, target_role in target_residual
+            if boundaries[source_layer] <= target_layer < boundaries[source_layer + 1] and target_role == role
+        )
+        if not members:
+            raise ValueError(
+                f"Target visual encoder has no linear sites matching source layer {source_layer} role {role!r}."
+            )
+        groups.append(members)
+    return tuple(groups)
+
+
+def _group_linear_site_activations(
+    blocks: Mapping[int, torch.Tensor],
+    groups: Sequence[Sequence[int]],
+    strategy: str,
+) -> dict[int, torch.Tensor]:
+    grouped: dict[int, torch.Tensor] = {}
+    for source_id, members in enumerate(groups):
+        tensors = [blocks[target_id] for target_id in members]
+        if strategy == "concat":
+            grouped[source_id] = torch.cat(tensors, dim=1) if len(tensors) > 1 else tensors[0]
+        elif strategy == "sum_avg":
+            grouped[source_id] = torch.stack(tensors, dim=0).mean(dim=0) if len(tensors) > 1 else tensors[0]
+        else:
+            raise ValueError(f"Unknown steer block grouping strategy: {strategy}")
+    return grouped
+
+
+def _linear_parameter_blocks(visual: nn.Module) -> tuple[tuple[int, ...], int]:
+    """Assign every visual parameter to its nearest linear-operation site.
+
+    Weight and bias of one operation share a block. Affine normalizations and
+    embeddings, which do not have their own linear activation site, are folded
+    into the next linear operation in parameter order (or the preceding one at
+    the tail). This preserves an exact, exhaustive JVP decomposition while
+    keeping the requested one-block-per-linear-layer semantics.
+    """
+    parameter_names = [name for name, _ in visual.named_parameters()]
+    sites = _linear_activation_sites(visual)
+    owner_by_name: dict[str, int] = {}
+    for block_id, site in enumerate(sites):
+        if site.hook == "pre":
+            attention_name = site.name.removesuffix(".in_proj")
+            prefixes = (
+                f"{attention_name}.in_proj_",
+                f"{attention_name}.bias_k",
+                f"{attention_name}.bias_v",
+            )
+            for name in parameter_names:
+                if name.startswith(prefixes):
+                    owner_by_name[name] = block_id
+        elif site.hook == "final":
+            owner_by_name[site.name] = block_id
+        else:
+            prefix = f"{site.name}."
+            for name in parameter_names:
+                if name.startswith(prefix):
+                    owner_by_name[name] = block_id
+
+    if not owner_by_name:
+        raise ValueError("No visual parameters could be associated with linear-operation sites.")
+
+    def _common_prefix_parts(left: str, right: str) -> int:
+        count = 0
+        for a, b in zip(left.split("."), right.split("."), strict=False):
+            if a != b:
+                break
+            count += 1
+        return count
+
+    block_ids: list[int] = []
+    for name in parameter_names:
+        owner = owner_by_name.get(name)
+        if owner is None:
+            # LayerNorm 1 belongs with attention; LayerNorm 2 belongs with the
+            # MLP. This is both more meaningful and independent of PyTorch's
+            # parameter traversal order (top-level parameters are yielded
+            # before child-module parameters, even when they are used last).
+            residual_prefix = name.split(".ln_", maxsplit=1)[0]
+            if ".ln_1." in name:
+                owner = next(
+                    (i for i, site in enumerate(sites) if site.name.startswith(f"{residual_prefix}.attn")),
+                    None,
+                )
+            elif ".ln_2." in name:
+                owner = next(
+                    (i for i, site in enumerate(sites) if site.name.startswith(f"{residual_prefix}.mlp")),
+                    None,
+                )
+            if owner is None and name in _VIT_OUTPUT_PARAMETERS:
+                owner = len(sites) - 1
+            if owner is None:
+                scores = [_common_prefix_parts(name, site.name) for site in sites]
+                best = max(scores)
+                owner = scores.index(best) if best > 0 else 0
+        block_ids.append(owner)
+
+    used = set(block_ids)
+    expected = set(range(len(sites)))
+    if used != expected:
+        missing = sorted(expected - used)
+        raise ValueError(f"Linear-operation partition produced empty blocks: {missing}")
+    return tuple(block_ids), len(sites)
+
+
+def _parameter_blocks_for_visual(
+    visual: nn.Module, block_granularity: str = "residual"
+) -> tuple[tuple[int | None, ...], int]:
+    if block_granularity == "model":
+        return tuple(0 for _ in visual.parameters()), 1
+    if block_granularity == "linear":
+        return _linear_parameter_blocks(visual)
+    if block_granularity not in {"residual", "attention"}:
+        raise ValueError(f"Unknown steer block granularity: {block_granularity}")
+    # ``attention`` changes B's predictor features, not A's JVP partition:
+    # each source transformer block still contributes one delta target, plus
+    # the trailing output block. This mirrors steer_text's attention source.
     names = [name for name, _ in visual.named_parameters()]
     if _is_resnet_visual(visual):
+        if block_granularity == "attention":
+            raise ValueError("steer attention granularity supports CLIP ViT visual encoders only.")
         return _clip_resnet_parameter_blocks(names)
     return _clip_vit_parameter_blocks(names)
 
@@ -486,7 +715,7 @@ class _BlockActivationCapture:
 
         return hook
 
-    def __enter__(self) -> "_BlockActivationCapture":
+    def __enter__(self) -> _BlockActivationCapture:
         for block_id in self.block_ids:
             module = _get_block_module(self.visual, block_id)
             self._handles.append(module.register_forward_hook(self._make_hook(block_id)))
@@ -496,6 +725,187 @@ class _BlockActivationCapture:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+
+
+class _AttentionActivationCapture:
+    """Capture each ViT block's attention result immediately before ``W_O``.
+
+    Recent OpenCLIP attention modules call an explicit ``out_proj`` child, so
+    a normal forward pre-hook gives exactly the desired tensor. PyTorch
+    ``nn.MultiheadAttention`` instead applies that child's parameters through
+    a functional call and never invokes the child module. For that legacy
+    layout we temporarily run the attention with an identity output projection,
+    save its raw result, and apply the original projection before returning it.
+    The surrounding transformer therefore receives the unchanged value.
+    """
+
+    def __init__(self, visual: nn.Module, block_ids: Sequence[int]) -> None:
+        if _is_resnet_visual(visual):
+            raise ValueError("steer attention granularity supports CLIP ViT visual encoders only.")
+        self.visual = visual
+        self.block_ids = list(block_ids)
+        self.activations: dict[int, torch.Tensor] = {}
+        self._handles: list[Any] = []
+        self._patched_forwards: list[tuple[nn.MultiheadAttention, Callable[..., Any]]] = []
+
+    def _make_pre_hook(self, block_id: int) -> Callable[..., None]:
+        def hook(_module: nn.Module, inputs: Any) -> None:
+            if inputs and torch.is_tensor(inputs[0]):
+                self.activations[block_id] = _pool_block_output(inputs[0]).detach()
+
+        return hook
+
+    def _patch_multihead_attention(self, module: nn.MultiheadAttention, block_id: int) -> None:
+        original_forward = module.forward
+        original_out_proj = module.out_proj
+        identity_out_proj = nn.Linear(
+            original_out_proj.in_features,
+            original_out_proj.out_features,
+            bias=original_out_proj.bias is not None,
+            device=original_out_proj.weight.device,
+            dtype=original_out_proj.weight.dtype,
+        )
+        with torch.no_grad():
+            identity_out_proj.weight.copy_(
+                torch.eye(
+                    original_out_proj.out_features,
+                    original_out_proj.in_features,
+                    device=original_out_proj.weight.device,
+                    dtype=original_out_proj.weight.dtype,
+                )
+            )
+            if identity_out_proj.bias is not None:
+                identity_out_proj.bias.zero_()
+
+        def wrapped_forward(*args: Any, **kwargs: Any) -> Any:
+            module.out_proj = identity_out_proj
+            try:
+                output = original_forward(*args, **kwargs)
+            finally:
+                module.out_proj = original_out_proj
+
+            raw = output[0] if isinstance(output, tuple) else output
+            self.activations[block_id] = _pool_block_output(raw).detach()
+            projected = F.linear(raw, original_out_proj.weight, original_out_proj.bias)
+            if isinstance(output, tuple):
+                return (projected,) + output[1:]
+            return projected
+
+        self._patched_forwards.append((module, original_forward))
+        module.forward = wrapped_forward  # type: ignore[method-assign]
+
+    def __enter__(self) -> _AttentionActivationCapture:
+        for block_id in self.block_ids:
+            block = _get_block_module(self.visual, block_id)
+            attention = getattr(block, "attn", None)
+            out_proj = getattr(attention, "out_proj", None)
+            if not isinstance(attention, nn.Module) or not isinstance(out_proj, nn.Module):
+                raise ValueError(
+                    f"steer attention granularity could not find an attention out_proj in "
+                    f"visual transformer block {block_id} ({type(block).__name__})."
+                )
+            if isinstance(attention, nn.MultiheadAttention):
+                self._patch_multihead_attention(attention, block_id)
+            else:
+                self._handles.append(out_proj.register_forward_pre_hook(self._make_pre_hook(block_id)))
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        for module, original_forward in self._patched_forwards:
+            module.forward = original_forward  # type: ignore[method-assign]
+        self._patched_forwards.clear()
+
+
+class _LinearActivationCapture:
+    """Capture inputs/outputs at the sites returned by `_linear_activation_sites`."""
+
+    def __init__(self, visual: nn.Module, sites: Sequence[_LinearActivationSite]) -> None:
+        self.visual = visual
+        self.sites = list(sites)
+        self.activations: dict[int, torch.Tensor] = {}
+        self._handles: list[Any] = []
+
+    def _make_pre_hook(self, block_id: int) -> Callable[..., None]:
+        def hook(_module: nn.Module, inputs: Any) -> None:
+            self.activations[block_id] = _pool_block_output(inputs).detach()
+
+        return hook
+
+    def _make_post_hook(self, block_id: int) -> Callable[..., None]:
+        def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
+            self.activations[block_id] = _pool_block_output(output).detach()
+
+        return hook
+
+    def __enter__(self) -> _LinearActivationCapture:
+        modules = dict(self.visual.named_modules())
+        for block_id, site in enumerate(self.sites):
+            if site.hook == "final":
+                continue
+            if site.module_name is None or site.module_name not in modules:
+                raise ValueError(f"Cannot find target linear module {site.module_name!r} for site {site.name!r}.")
+            module = modules[site.module_name]
+            if site.hook == "pre":
+                self._handles.append(module.register_forward_pre_hook(self._make_pre_hook(block_id)))
+            else:
+                self._handles.append(module.register_forward_hook(self._make_post_hook(block_id)))
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+
+class _NoopActivationCapture:
+    def __init__(self) -> None:
+        self.activations: dict[int, torch.Tensor] = {}
+
+    def __enter__(self) -> _NoopActivationCapture:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def _activation_capture_for_visual(
+    visual: nn.Module, block_granularity: str
+) -> tuple[Any, tuple[int, ...], int]:
+    """Build a target-side capture and identify sites filled by final output."""
+    if block_granularity == "model":
+        return _NoopActivationCapture(), (0,), 1
+    if block_granularity == "linear":
+        sites = _linear_activation_sites(visual)
+        final_ids = tuple(i for i, site in enumerate(sites) if site.hook == "final")
+        return _LinearActivationCapture(visual, sites), final_ids, len(sites)
+    if block_granularity in {"residual", "attention"}:
+        num_residual = _num_residual_blocks(visual)
+        capture = (
+            _BlockActivationCapture(visual, list(range(num_residual)))
+            if block_granularity == "residual"
+            else _AttentionActivationCapture(visual, list(range(num_residual)))
+        )
+        return capture, (num_residual,), num_residual + 1
+    raise ValueError(f"Unknown steer block granularity: {block_granularity}")
+
+
+def _complete_captured_activations(
+    capture: Any,
+    *,
+    final_output: torch.Tensor,
+    final_ids: Sequence[int],
+    expected_blocks: int,
+) -> dict[int, torch.Tensor]:
+    blocks = dict(capture.activations)
+    for block_id in final_ids:
+        blocks[block_id] = final_output
+    missing = sorted(set(range(expected_blocks)) - set(blocks))
+    if missing:
+        raise RuntimeError(f"steer failed to capture target activations for blocks {missing}")
+    return blocks
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +987,7 @@ def _collect_linear_split(
     source_loader: Any,
     target_loader: Any,
     device: torch.device,
+    block_granularity: str = "residual",
 ) -> dict[str, torch.Tensor]:
     """
     Linear regime: Taylor-linearized delta_A via LinearizedModule (torch.func.jvp),
@@ -584,24 +995,24 @@ def _collect_linear_split(
     primitive (utils/linearization.py) instead of porting steer4rebase's
     deprecated-functorch LinearizedModelV2.
     """
-    block_ids, num_a_blocks = _parameter_blocks_for_visual(source_pretrained_visual)
+    block_ids, num_a_blocks = _parameter_blocks_for_visual(source_pretrained_visual, block_granularity)
     param_names = [name for name, _ in source_pretrained_visual.named_parameters()]
     linmod = LinearizedModule.from_module(source_pretrained_visual, device=device, copy_module=False, param_names=param_names)
     theta0 = dict(zip(linmod.param_names, linmod.theta0, strict=True))
 
-    num_target_residual = _num_residual_blocks(target_visual)
+    target_capture, target_final_ids, num_target_blocks = _activation_capture_for_visual(
+        target_visual, block_granularity
+    )
 
     features_a: list[torch.Tensor] = []
     delta_a: list[torch.Tensor] = []
     delta_a_blocks: list[torch.Tensor] = []
     features_b: list[torch.Tensor] = []
-    # Same numbering as the source side (_parameter_blocks_for_visual): keys
-    # 0..num_target_residual-1 are the residual blocks, key num_target_residual
-    # is the final pooled/output feature -- matching steer4rebase's own
-    # create_activation_hooks convention (a hook on model.visual itself at
-    # index num_blocks - 1) and its saved features_B_blocks.pt layout, so a
-    # cache produced by the original pipeline is directly interchangeable.
-    features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_residual + 1)}
+    # For residual granularity this preserves steer4rebase's cache layout:
+    # residual blocks first, then the final pooled/output feature. The new
+    # linear/model granularities use isolated cache directories and store their
+    # own contiguous 0..N-1 site layout.
+    features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_blocks)}
     labels: list[torch.Tensor] = []
 
     for (x_a, y_a), (x_b, _y_b) in zip(_iter_batches(source_loader, device=device), _iter_batches(target_loader, device=device), strict=True):
@@ -635,12 +1046,20 @@ def _collect_linear_split(
         delta_a_blocks.append(block_residuals)
         labels.append(y_a.cpu())
 
-        with _BlockActivationCapture(target_visual, list(range(num_target_residual))) as capture:
+        # Capture object instances can be reused across batches: their hook
+        # handles are removed on exit and each fired site overwrites its last
+        # activation.
+        with target_capture as capture:
             with torch.no_grad():
                 out_b = _l2_normalize(target_visual(x_b))
-        for block_id in range(num_target_residual):
-            features_b_blocks[block_id].append(capture.activations[block_id].cpu())
-        features_b_blocks[num_target_residual].append(out_b.detach().cpu())
+        captured_blocks = _complete_captured_activations(
+            capture,
+            final_output=out_b.detach(),
+            final_ids=target_final_ids,
+            expected_blocks=num_target_blocks,
+        )
+        for block_id in range(num_target_blocks):
+            features_b_blocks[block_id].append(captured_blocks[block_id].cpu())
         features_b.append(out_b.detach().cpu())
 
     return {
@@ -653,8 +1072,17 @@ def _collect_linear_split(
     }
 
 
-def _cache_split_dir(feature_cache_dir: str, source_tag: str, target_tag: str, task: str, regime: str, split: str) -> Path:
-    return Path(feature_cache_dir) / f"{source_tag}_to_{target_tag}" / task / regime / split
+def _cache_split_dir(
+    feature_cache_dir: str,
+    source_tag: str,
+    target_tag: str,
+    task: str,
+    regime: str,
+    split: str,
+    block_granularity: str = "residual",
+) -> Path:
+    cache_regime = regime if block_granularity == "residual" else f"{regime}_{block_granularity}granularity"
+    return Path(feature_cache_dir) / f"{source_tag}_to_{target_tag}" / task / cache_regime / split
 
 
 def _load_cached_head(path: Path) -> torch.Tensor | None:
@@ -706,8 +1134,17 @@ def _load_or_compute_split(
     need_blocks: bool,
     compute_fn: Callable[[], dict[str, Any]],
     verbose: bool,
+    block_granularity: str = "residual",
 ) -> dict[str, Any]:
-    cache_dir = _cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, split)
+    cache_dir = _cache_split_dir(
+        feature_cache_dir,
+        source_tag,
+        target_tag,
+        task,
+        feature_regime,
+        split,
+        block_granularity,
+    )
     if not force_recompute_features:
         cached = _load_cached_split(cache_dir, need_blocks=need_blocks)
         if cached is not None:
@@ -758,6 +1195,7 @@ class SteerRebase:
         device: str = "cuda",
         feature_regime: str = "standard",
         stage_2_strategy: str = "global_ridge",
+        block_granularity: str = "residual",
         block_group_strategy: str = "concat",
         feature_cache_dir: str = "src/.cache/steer_features",
         force_recompute_features: bool = False,
@@ -769,6 +1207,7 @@ class SteerRebase:
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
+        block_ridge_lambda_scaling: str = "none",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -782,8 +1221,12 @@ class SteerRebase:
             raise ValueError("steer stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge")
         if stage_2_strategy == "block_ridge" and feature_regime != "linear":
             raise ValueError("steer block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
+        if block_granularity not in _BLOCK_GRANULARITIES:
+            raise ValueError(f"steer block_granularity must be one of: {sorted(_BLOCK_GRANULARITIES)}")
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
+        if block_ridge_lambda_scaling not in {"none", "trace"}:
+            raise ValueError("steer block_ridge_lambda_scaling must be 'none' or 'trace'")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer requires exactly one of few_shot or total_support_examples")
 
@@ -797,7 +1240,15 @@ class SteerRebase:
         # actually used instead of being silently replaced by a live
         # zero-shot recomputation that may use a different prompt ensemble.
         eval_basis_mismatch = False
-        head_cache_dir = _cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, "train")
+        head_cache_dir = _cache_split_dir(
+            feature_cache_dir,
+            source_tag,
+            target_tag,
+            task,
+            feature_regime,
+            "train",
+            block_granularity,
+        )
         cached_w_a = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_A.pt")
         cached_w_b = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_B.pt")
 
@@ -904,6 +1355,7 @@ class SteerRebase:
                 source_loader=source_loader,
                 target_loader=target_loader,
                 device=dev,
+                block_granularity=block_granularity,
             )
 
         train_data = _load_or_compute_split(
@@ -917,6 +1369,7 @@ class SteerRebase:
             need_blocks=need_blocks,
             compute_fn=lambda: _compute("train"),
             verbose=verbose,
+            block_granularity=block_granularity,
         )
         test_data = _load_or_compute_split(
             feature_cache_dir=feature_cache_dir,
@@ -929,6 +1382,7 @@ class SteerRebase:
             need_blocks=need_blocks,
             compute_fn=lambda: _compute("test"),
             verbose=verbose,
+            block_granularity=block_granularity,
         )
 
         f_a = train_data["features_A"].double()
@@ -976,50 +1430,73 @@ class SteerRebase:
             delta_a_blocks_train = train_data["delta_A_blocks"].double()
             block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T  # [n_sel, num_A_blocks, D_B]
 
-            # Same numbering on both sides: key num_blocks-1 is the final
-            # pooled/output feature, which has a *different* width than the
-            # uniform residual blocks (e.g. transformer hidden dim vs. joint
-            # CLIP embed dim) -- so it must never be concatenated/averaged
-            # together with the residual blocks. It always stands alone as
-            # its own group, mirroring group_grid.py's make_groups (which
-            # keeps B's final layer alone for exactly this reason). This
-            # dict is either our own _collect_linear_split output or an
-            # externally-cached features_B_blocks.pt from steer4rebase's own
-            # pipeline -- both use this exact layout, so either is accepted.
             features_b_full_train = {b: v.double() for b, v in train_data["features_B_blocks"].items()}
             num_target_blocks_total = len(features_b_full_train)
-            num_target_residual = num_target_blocks_total - 1
             num_source_blocks = block_targets.shape[1]
-            num_source_residual_blocks = num_source_blocks - 1
-            if num_source_residual_blocks < 1:
-                raise ValueError("steer block_ridge: source has no residual blocks to target.")
-            if num_target_residual < 1:
-                raise ValueError("steer block_ridge: target has no residual blocks to target.")
+            num_target_residual = None
+            num_source_residual_blocks = None
+            linear_site_groups = None
 
-            residual_train = {b: features_b_full_train[b] for b in range(num_target_residual)}
-            output_train = features_b_full_train[num_target_residual]
+            if block_granularity in {"residual", "attention"}:
+                # Residual and attention layouts both expose one predictor per
+                # transformer block plus the final projected feature. The latter
+                # has a different width and must remain outside block grouping.
+                num_target_residual = num_target_blocks_total - 1
+                num_source_residual_blocks = num_source_blocks - 1
+                if num_source_residual_blocks < 1:
+                    raise ValueError("steer block_ridge: source has no residual blocks to target.")
+                if num_target_residual < 1:
+                    raise ValueError("steer block_ridge: target has no residual blocks to target.")
 
-            if num_target_residual == num_source_residual_blocks:
-                grouped_residual = residual_train
-                block_group_size = 1
-            elif num_target_residual > num_source_residual_blocks:
-                grouped_residual = _BLOCK_GROUP_STRATEGIES[block_group_strategy](residual_train, num_source_residual_blocks)
-                block_group_size = num_target_residual / num_source_residual_blocks
-            else:
-                raise ValueError(
-                    f"steer block_ridge: target has fewer residual blocks ({num_target_residual}) "
-                    f"than source ({num_source_residual_blocks}); cannot group."
+                residual_train = {b: features_b_full_train[b] for b in range(num_target_residual)}
+                output_train = features_b_full_train[num_target_residual]
+                if num_target_residual == num_source_residual_blocks:
+                    grouped_residual = residual_train
+                    block_group_size = 1
+                elif num_target_residual > num_source_residual_blocks:
+                    grouped_residual = _BLOCK_GROUP_STRATEGIES[block_group_strategy](
+                        residual_train, num_source_residual_blocks
+                    )
+                    block_group_size = num_target_residual / num_source_residual_blocks
+                else:
+                    raise ValueError(
+                        f"steer block_ridge: target has fewer residual blocks ({num_target_residual}) "
+                        f"than source ({num_source_residual_blocks}); cannot group."
+                    )
+                grouped_train = dict(grouped_residual)
+                grouped_train[num_source_residual_blocks] = output_train
+            elif block_granularity == "linear":
+                linear_site_groups = _linear_site_groups(source_pretrained_visual, target_visual)
+                if len(linear_site_groups) != num_source_blocks:
+                    raise ValueError(
+                        f"steer linear granularity produced {len(linear_site_groups)} target groups for "
+                        f"{num_source_blocks} source blocks."
+                    )
+                grouped_train = _group_linear_site_activations(
+                    features_b_full_train, linear_site_groups, block_group_strategy
                 )
-
-            grouped_train = dict(grouped_residual)
-            grouped_train[num_source_residual_blocks] = output_train
+                block_group_size = num_target_blocks_total / num_source_blocks
+            else:  # model: exactly one source and one target block
+                if num_source_blocks != 1 or num_target_blocks_total != 1:
+                    raise ValueError(
+                        f"steer model granularity expected one source/target block, got "
+                        f"{num_source_blocks}/{num_target_blocks_total}."
+                    )
+                grouped_train = features_b_full_train
+                block_group_size = 1
 
             local_selected = torch.arange(int(selected.numel()))
             local_blocks_train = {b: v[selected] for b, v in grouped_train.items()}
             coefficients = [
                 c.to(dev)
                 for c in _fit_block_ridge(
-                    local_blocks_train, block_targets, selected=local_selected, regularization=ridge_lambda, mode=block_ridge_mode, rho=rho
+                    local_blocks_train,
+                    block_targets,
+                    selected=local_selected,
+                    regularization=ridge_lambda,
+                    mode=block_ridge_mode,
+                    rho=rho,
+                    regularization_scaling=block_ridge_lambda_scaling,
                 )
             ]
 
@@ -1030,13 +1507,33 @@ class SteerRebase:
                 _num_target_residual=num_target_residual,
                 _num_source_residual_blocks=num_source_residual_blocks,
                 _strategy=block_group_strategy,
+                _granularity=block_granularity,
+                _num_target_blocks_total=num_target_blocks_total,
+                _linear_site_groups=linear_site_groups,
             ) -> torch.Tensor:
                 coef_device = _coefficients[0].device
-                residual = {b: activations["blocks"][b].double().to(coef_device) for b in range(_num_target_residual)}
-                if _num_target_residual != _num_source_residual_blocks:
-                    residual = _BLOCK_GROUP_STRATEGIES[_strategy](residual, _num_source_residual_blocks)
-                blocks = dict(residual)
-                blocks[_num_source_residual_blocks] = activations["blocks"][_num_target_residual].double().to(coef_device)
+                if _granularity in {"residual", "attention"}:
+                    residual = {
+                        b: activations["blocks"][b].double().to(coef_device)
+                        for b in range(_num_target_residual)
+                    }
+                    if _num_target_residual != _num_source_residual_blocks:
+                        residual = _BLOCK_GROUP_STRATEGIES[_strategy](residual, _num_source_residual_blocks)
+                    blocks = dict(residual)
+                    blocks[_num_source_residual_blocks] = (
+                        activations["blocks"][_num_target_residual].double().to(coef_device)
+                    )
+                elif _granularity == "linear":
+                    raw_blocks = {
+                        b: activations["blocks"][b].double().to(coef_device)
+                        for b in range(_num_target_blocks_total)
+                    }
+                    blocks = _group_linear_site_activations(raw_blocks, _linear_site_groups, _strategy)
+                else:
+                    blocks = {
+                        b: activations["blocks"][b].double().to(coef_device)
+                        for b in range(_num_target_blocks_total)
+                    }
                 out = _predict_block_ridge(_coefficients, blocks)
                 return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
@@ -1074,6 +1571,8 @@ class SteerRebase:
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
+            "block_granularity": block_granularity,
+            "block_ridge_lambda_scaling": block_ridge_lambda_scaling,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             "eval_basis_mismatch": eval_basis_mismatch,
@@ -1122,17 +1621,22 @@ def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, al
     visual = clf_target.model.visual
     original_encode_image = clf_target.model.encode_image
     needs_blocks = prepared["stage_2_strategy"] == "block_ridge"
-    num_target_residual = _num_residual_blocks(visual) if needs_blocks else 0
+    block_granularity = str(prepared.get("block_granularity", "residual"))
 
     def patched_encode_image(images: torch.Tensor) -> torch.Tensor:
         if needs_blocks:
-            with _BlockActivationCapture(visual, list(range(num_target_residual))) as capture:
+            capture_context, final_ids, expected_blocks = _activation_capture_for_visual(
+                visual, block_granularity
+            )
+            with capture_context as capture:
                 out = original_encode_image(images)
             out_norm = _l2_normalize(out)
-            # Same numbering as training (see _collect_linear_split): key
-            # num_target_residual is the final pooled/output feature.
-            blocks = dict(capture.activations)
-            blocks[num_target_residual] = out_norm
+            blocks = _complete_captured_activations(
+                capture,
+                final_output=out_norm,
+                final_ids=final_ids,
+                expected_blocks=expected_blocks,
+            )
             activations = {"global": out_norm, "blocks": blocks}
         else:
             out = original_encode_image(images)
