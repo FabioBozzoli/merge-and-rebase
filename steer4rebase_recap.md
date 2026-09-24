@@ -40,6 +40,8 @@ Everything lives in one file: `src/merge_and_rebase/rebase/methods/steer.py` (sa
 | `block_group_strategy` | `"concat"` | `"concat"` \| `"sum_avg"` | Only used by `block_ridge` when source/target depths differ (must be an integer ratio, e.g. 12→24). |
 | `block_ridge_mode` | `"independent"` | `"independent"` \| `"smoothed_residual"` | Chained per-block residual smoothing, controlled by `rho`. |
 | `rho` | `0.9` | `[0, 1]` | Only used when `block_ridge_mode="smoothed_residual"`. |
+| `block_ridge_lambda_scaling` | `"none"` | `"none"` \| `"trace"` | `block_ridge` only. `"trace"` fits block `b` with `ridge_lambda * tr(X_b X_bᵀ) / n`, so one dimensionless `ridge_lambda` gives comparable shrinkage on blocks whose activation scales differ (raw residual blocks vs the L2-normalized output). |
+| `block_granularity` | `"residual"` | `"residual"` \| `"attention"` \| `"linear"` \| `"model"` | Where target features are taken: `"residual"` = end of each resblock. |
 | `few_shot` | — | int | Shots per class. Exactly one of `few_shot` / `total_support_examples` must be set. |
 | `total_support_examples` | — | int | Fixed-size random support set instead of per-class few-shot. |
 | `stage1_lambda` | `1.0` | float | Stage 1 ridge regularization. |

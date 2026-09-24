@@ -353,3 +353,100 @@ def test_steer_block_ridge_cross_arch_dimension_safety(tmp_path) -> None:
             logits = clf_target(x)
         assert logits.shape == (4, len(_CLASSNAMES))
         assert torch.isfinite(logits).all()
+
+
+def test_block_ridge_trace_scaling_matches_hand_scaled_lambda() -> None:
+    """``regularization_scaling="trace"`` fits block b with beta * tr(X_b X_b^T) / n, per block,
+    and leaves the default ("none") exactly as before -- including through the smoothed carry."""
+    import pytest
+
+    g = torch.Generator().manual_seed(5)
+    n_sel, num_blocks, d_block, d_out, beta, rho = 10, 3, 6, 3, 0.1, 0.9
+    # Block scales span two orders of magnitude, like an un-normalized residual stream.
+    blocks = {b: (10.0**b) * torch.randn(n_sel, d_block, generator=g, dtype=torch.float64) for b in range(num_blocks)}
+    targets = torch.randn(n_sel, num_blocks, d_out, generator=g, dtype=torch.float64)
+    selected = torch.arange(n_sel)
+    ridge = steer_mod._ridge
+
+    trace = steer_mod._fit_block_ridge(
+        blocks, targets, selected=selected, regularization=beta, mode="independent", regularization_scaling="trace"
+    )
+    plain = steer_mod._fit_block_ridge(blocks, targets, selected=selected, regularization=beta, mode="independent")
+    for b in range(num_blocks):
+        lam = beta * float(blocks[b].square().sum()) / n_sel
+        assert torch.allclose(trace[b], ridge(blocks[b], targets[:, b], lam))
+        assert torch.allclose(plain[b], ridge(blocks[b], targets[:, b], beta))
+    assert not torch.allclose(trace[2], plain[2])  # the deepest (largest-scale) block is regularized far more
+
+    # smoothed_residual: the carry uses each block's own (trace) fit.
+    carried = steer_mod._fit_block_ridge(
+        blocks, targets, selected=selected, regularization=beta, mode="smoothed_residual", rho=rho,
+        regularization_scaling="trace",
+    )
+    state = torch.zeros(n_sel, d_out, dtype=torch.float64)
+    for b in range(num_blocks):
+        compensation = rho * state
+        lam = beta * float(blocks[b].square().sum()) / n_sel
+        want = ridge(blocks[b], targets[:, b] + compensation, lam)
+        assert torch.allclose(carried[b], want)
+        state = compensation + targets[:, b] - blocks[b] @ want
+
+    with pytest.raises(ValueError, match="regularization_scaling"):
+        steer_mod._fit_block_ridge(
+            blocks, targets, selected=selected, regularization=beta, mode="independent", regularization_scaling="mean"
+        )
+
+
+def test_steer_block_ridge_trace_scaling_end_to_end(tmp_path) -> None:
+    """The recipe used for the vision runs -- residual (end-of-block) features, trace lambda,
+    smoothed_residual with rho=0.9, ridge_lambda=0.1 -- runs through prepare() and the live
+    correction, records the option, and changes the fit relative to the unscaled one."""
+    import pytest
+
+    torch.manual_seed(2)
+    loaders = _tiny_loaders()
+    clf_source_pretrained = _make_tiny_clf(depth=3)
+    clf_source_finetuned = _make_tiny_clf(depth=3)
+    clf_source_finetuned.load_state_dict(clf_source_pretrained.state_dict())
+    _finetune(clf_source_finetuned)
+    clf_target = _make_tiny_clf(depth=3)
+
+    def _prepare(scaling: str):
+        return get_method("steer").prepare(
+            clf_source=clf_source_finetuned,
+            clf_source_pretrained=clf_source_pretrained,
+            clf_target=clf_target,
+            source_loaders=loaders,
+            target_loaders=loaders,
+            classnames=_CLASSNAMES,
+            task="tiny_trace",
+            source_build_cfg_task=_BUILD_CFG,
+            build_cfg_task=_BUILD_CFG,
+            device="cpu",
+            feature_regime="linear",
+            stage_2_strategy="block_ridge",
+            block_granularity="residual",
+            block_ridge_mode="smoothed_residual",
+            rho=0.9,
+            ridge_lambda=0.1,
+            block_ridge_lambda_scaling=scaling,
+            few_shot=2,
+            feature_cache_dir=str(tmp_path / "features"),
+            force_recompute_features=(scaling == "none"),  # the second call reuses the first one's cache
+            verbose=False,
+        )
+
+    plain, trace = _prepare("none"), _prepare("trace")
+    assert plain["block_ridge_lambda_scaling"] == "none" and trace["block_ridge_lambda_scaling"] == "trace"
+
+    x = torch.randn(4, 3, 16, 16)
+    outputs = []
+    for prepared in (plain, trace):
+        with steer_correction_context(clf_target, prepared, alpha=1.0):
+            logits = clf_target(x)
+        assert logits.shape == (4, len(_CLASSNAMES)) and torch.isfinite(logits).all()
+        outputs.append(logits)
+    assert not torch.allclose(outputs[0], outputs[1]), "trace scaling must change the fitted correction"
+
+    with pytest.raises(ValueError, match="block_ridge_lambda_scaling"):
+        _prepare("median")
