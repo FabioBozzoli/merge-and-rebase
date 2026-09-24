@@ -1,0 +1,43 @@
+{
+  "suite": "vision8",
+  "tasks": "all",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-L-14",
+  "target_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "method": "steer",
+  "method_params": {
+    "feature_regime": "linear",
+    "stage_2_strategy": "block_ridge",
+    "block_granularity": "residual",
+    "block_ridge_mode": "smoothed_residual",
+    "rho": 0.9,
+    "block_ridge_lambda_scaling": "trace",
+    "ridge_lambda": 0.1,
+    "stage1_lambda": 1.0,
+    "few_shot": 5,
+    "seed": 54,
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/features/linear_feature_trace",
+    "force_recompute_features": false
+  },
+  "alpha_search": false,
+  "alpha_selection": "shared",
+  "alpha": 1.0,
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "no_humanize": true,
+  "weights": null,
+  "tuned_ckpts": {
+    "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/full__linearized_ntk_best_ep.pt",
+    "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/full__linearized_ntk_best_ep.pt",
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full__linearized_ntk_best_ep.pt",
+    "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/full__linearized_ntk_best_ep.pt",
+    "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/full__linearized_ntk_best_ep.pt",
+    "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/full__linearized_ntk_best_ep.pt",
+    "Cars": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/full__linearized_ntk_best_ep.pt",
+    "SUN397": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/full__linearized_ntk_best_ep.pt"
+  },
+  "seed": 54,
+  "_description": "steer block_ridge trace-lambda, ViT-B/16 -> ViT-L/14, few_shot=5, seed=54."
+}

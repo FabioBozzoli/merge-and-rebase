@@ -6,6 +6,10 @@ vision tasks. Sweep: few_shot in {1, 2, 5, 10, 20} x seed in {33, 54, 89} -> 15 
 
     python configs/vision8_steer_trace/make_configs.py [--ckpt-root DIR] [--feature-cache-dir DIR]
 
+    # ViT-B/16 -> ViT-L/14 (12 -> 24 blocks: the target's blocks are grouped down with `concat`)
+    python configs/vision8_steer_trace/make_configs.py --base configs/vision8_steer_linear_vitb_vitl.json \\
+        --out-dir configs/vision8_steer_trace_vitl --prefix vision8_steer_trace_vitl --pair "ViT-B/16 -> ViT-L/14"
+
 The feature cache is keyed by source/target/task/regime/split (not few_shot or seed), so one shared
 ``--feature-cache-dir`` means the features are computed once per task and every other run only refits.
 """
@@ -23,7 +27,7 @@ SEEDS = (33, 54, 89)
 BASE_CKPT_ROOT = "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints"
 
 
-def build(base: dict, few_shot: int, seed: int, ckpt_root: str, cache_dir: str) -> dict:
+def build(base: dict, few_shot: int, seed: int, ckpt_root: str, cache_dir: str, pair: str) -> dict:
     cfg = json.loads(json.dumps(base))
     for key in ("alpha_min", "alpha_max", "alpha_step", "alpha_patience"):
         cfg.pop(key, None)
@@ -43,7 +47,7 @@ def build(base: dict, few_shot: int, seed: int, ckpt_root: str, cache_dir: str) 
         "feature_cache_dir": cache_dir,
         "force_recompute_features": False,
     }
-    cfg["_description"] = f"steer block_ridge trace-lambda, ViT-B/16 -> ViT-B/16, few_shot={few_shot}, seed={seed}."
+    cfg["_description"] = f"steer block_ridge trace-lambda, {pair}, few_shot={few_shot}, seed={seed}."
     return cfg
 
 
@@ -51,6 +55,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", type=Path, default=BASE)
     parser.add_argument("--out-dir", type=Path, default=HERE)
+    parser.add_argument("--prefix", default="vision8_steer_trace", help="Config file name prefix.")
+    parser.add_argument("--pair", default="ViT-B/16 -> ViT-B/16", help="Label used in the config description.")
     parser.add_argument("--ckpt-root", default=BASE_CKPT_ROOT, help="Replaces the checkpoint root in tuned_ckpts.")
     parser.add_argument("--feature-cache-dir", default="/work/intesasanpaolo_phd/merge-and-rebase/features/linear_feature_trace")
     args = parser.parse_args()
@@ -59,8 +65,8 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for few_shot in FEW_SHOTS:
         for seed in SEEDS:
-            cfg = build(base, few_shot, seed, args.ckpt_root, args.feature_cache_dir)
-            path = args.out_dir / f"vision8_steer_trace_fs{few_shot}_seed{seed}.json"
+            cfg = build(base, few_shot, seed, args.ckpt_root, args.feature_cache_dir, args.pair)
+            path = args.out_dir / f"{args.prefix}_fs{few_shot}_seed{seed}.json"
             path.write_text(json.dumps(cfg, indent=2) + "\n")
     print(f"Wrote {len(FEW_SHOTS) * len(SEEDS)} configs to {args.out_dir}")
 
