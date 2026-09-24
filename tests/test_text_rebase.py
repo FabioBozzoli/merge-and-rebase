@@ -825,6 +825,178 @@ def test_steer_text_rejects_contradictory_params(tmp_path) -> None:
         _steer_prepare(tmp_path, few_shot=None)
 
 
+def test_steer_text_rejects_block_options_it_would_ignore(tmp_path) -> None:
+    with pytest.raises(ValueError, match="only apply to block_ridge and joint_ridge"):
+        _steer_prepare(tmp_path, block_pooling="unitnorm")
+    with pytest.raises(ValueError, match="only apply to block_ridge and joint_ridge"):
+        _steer_prepare(tmp_path, block_feature_preprocessing="zscore")
+    with pytest.raises(ValueError, match="joint_ridge requires feature_regime='linear'"):
+        _steer_prepare(tmp_path, stage_2_strategy="joint_ridge")
+    with pytest.raises(ValueError, match="block_pooling must be one of"):
+        _steer_prepare(tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge", block_pooling="max")
+
+
+def test_block_final_norms_follow_each_blocks_own_stack() -> None:
+    from merge_and_rebase.rebase.text.steer_text import block_final_norms, block_modules
+
+    model = _tiny_t5(seed=0)
+    norms = block_final_norms(model)
+    assert len(norms) == len(block_modules(model)) == 4  # 2 encoder + 2 decoder blocks
+    assert all(n is model.transformer.encoder.final_layer_norm for n in norms[:2])
+    assert all(n is model.transformer.decoder.final_layer_norm for n in norms[2:])
+
+
+@pytest.mark.parametrize("pooling", ["mean", "unitnorm", "rmsnorm"])
+def test_block_capture_pools_normalized_tokens(pooling) -> None:
+    from merge_and_rebase.rebase.text.encoder_classifier import masked_mean
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture, block_final_norms, block_modules
+
+    model = _tiny_t5(seed=0)
+    batch = _collate([_DictDataset(4)[i] for i in range(4)])
+    batch["attention_mask"][:, :2] = 0  # padding must be excluded from the mean
+    raw: dict[int, torch.Tensor] = {}
+    hooks = [
+        m.register_forward_hook(lambda _m, _i, out, b=b: raw.__setitem__(b, out[0] if isinstance(out, tuple) else out))
+        for b, m in enumerate(block_modules(model))
+    ]
+    with torch.no_grad(), _TextBlockCapture(model, pooling=pooling) as capture:
+        capture.attention_mask = batch["attention_mask"]
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    for h in hooks:
+        h.remove()
+
+    norms = block_final_norms(model)
+    for b, h in raw.items():
+        if pooling == "unitnorm":
+            h = h / h.norm(dim=-1, keepdim=True)
+        elif pooling == "rmsnorm":
+            h = norms[b](h)
+        assert torch.allclose(capture.activations[b], masked_mean(h, batch["attention_mask"]), atol=1e-6)
+
+
+def _block_fit_inputs(tmp_path, prepared):
+    """What block/joint ridge fit on, rebuilt from the cache and the run's artifacts."""
+    from merge_and_rebase.rebase.methods.steer import _cache_split_dir, _load_cached_split
+
+    art = prepared["artifacts"]
+    splits = {
+        s: _load_cached_split(_cache_split_dir(str(tmp_path / "cache"), "src", "tgt", "rte", "linear", s), need_blocks=True)
+        for s in ("train", "test")
+    }
+    sel = art["selected"]
+    total = splits["train"]["delta_A"].double()[sel] @ art["stage1_logit_map"].T @ art["stage1_pinv_w_b"].T
+    per_block = splits["train"]["delta_A_blocks"].double()[sel] @ art["stage1_logit_map"].T @ art["stage1_pinv_w_b"].T
+    blocks = {s: {int(b): v.double() for b, v in d["features_B_blocks"].items()} for s, d in splits.items()}
+    return sel, total, per_block, blocks
+
+
+def test_steer_text_block_ridge_defaults_are_the_plain_per_block_fit(tmp_path) -> None:
+    from merge_and_rebase.rebase.methods.steer import _fit_block_ridge, _predict_block_ridge
+
+    prepared, _ = _steer_prepare(tmp_path, feature_regime="linear", stage_2_strategy="block_ridge")
+    state = prepared["artifacts"]["stage2_state"]
+    assert state["bias"] is None and state["block_pooling"] == "mean"
+    sel, _, per_block, blocks = _block_fit_inputs(tmp_path, prepared)
+    # tiny T5: source and target both have 4 residual blocks, so no grouping happens
+    expected = _fit_block_ridge(
+        {b: v[sel] for b, v in blocks["train"].items()}, per_block, selected=torch.arange(sel.numel()),
+        regularization=1.0, mode="independent",
+    )
+    for got, want in zip(state["coefficients"], expected, strict=True):
+        assert torch.allclose(got, want)
+    got = prepared["correction_fn"]({"global": blocks["test"][4], "blocks": blocks["test"]})
+    assert torch.allclose(got, _predict_block_ridge(expected, blocks["test"]).to(got.dtype))
+
+
+@pytest.mark.parametrize("preprocessing", ["none", "zscore"])
+def test_steer_text_joint_ridge_is_one_ridge_on_normalized_concatenated_blocks(tmp_path, preprocessing) -> None:
+    from merge_and_rebase.rebase.methods.steer import _ridge
+
+    prepared, _ = _steer_prepare(
+        tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge", ridge_lambda=0.3,
+        block_feature_preprocessing=preprocessing,
+    )
+    sel, total, _, blocks = _block_fit_inputs(tmp_path, prepared)
+    xs = {b: v[sel] for b, v in blocks["train"].items()}
+    xt = dict(blocks["test"])
+    if preprocessing == "zscore":
+        for b in xs:
+            mu, sd = xs[b].mean(0), xs[b].std(0)
+            sd = sd.clamp_min(1e-2 * float(sd.median()))
+            xs[b], xt[b] = (xs[b] - mu) / sd, (xt[b] - mu) / sd
+    scales = [float(xs[b].square().sum(1).mean().sqrt()) for b in range(len(xs))]
+    z_s = torch.cat([xs[b] / scales[b] for b in range(len(xs))], dim=1)
+    z_t = torch.cat([xt[b] / scales[b] for b in range(len(xt))], dim=1)
+    mean = total.mean(0) if preprocessing == "zscore" else torch.zeros(total.shape[1], dtype=total.dtype)
+    expected = z_t @ _ridge(z_s, total - mean, 0.3) + mean
+
+    got = prepared["correction_fn"]({"global": blocks["test"][4], "blocks": blocks["test"]})
+    assert torch.allclose(got.double(), expected, atol=1e-5)
+    assert prepared["artifacts"]["stage2_state"]["kind"] == "joint_ridge"
+
+
+@pytest.mark.parametrize("mode", ["independent", "smoothed_residual"])
+def test_steer_text_block_ridge_zscore_is_folded_exactly(tmp_path, mode) -> None:
+    from merge_and_rebase.rebase.methods.steer import _fit_block_ridge
+
+    prepared, _ = _steer_prepare(
+        tmp_path, feature_regime="linear", stage_2_strategy="block_ridge", block_feature_preprocessing="zscore",
+        block_ridge_lambda_scaling="trace", ridge_lambda=0.1, block_ridge_mode=mode, rho=1.0,
+    )
+    sel, _, per_block, blocks = _block_fit_inputs(tmp_path, prepared)
+    xs, xt = {}, {}
+    for b, v in blocks["train"].items():
+        mu, sd = v[sel].mean(0), v[sel].std(0)
+        sd = sd.clamp_min(1e-2 * float(sd.median()))
+        xs[b], xt[b] = (v[sel] - mu) / sd, (blocks["test"][b] - mu) / sd
+    intercepts = per_block.mean(0)
+    coefs = _fit_block_ridge(xs, per_block - intercepts, selected=torch.arange(sel.numel()), regularization=0.1,
+                             mode=mode, rho=1.0, regularization_scaling="trace")
+    expected = sum(xt[b] @ c for b, c in enumerate(coefs)) + intercepts.sum(0)
+
+    got = prepared["correction_fn"]({"global": blocks["test"][4], "blocks": blocks["test"]})
+    assert torch.allclose(got.double(), expected, atol=1e-5)
+
+
+def test_steer_text_pooled_blocks_are_cached_apart_and_used_live(tmp_path) -> None:
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    mean_run, _ = _steer_prepare(tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge")
+    base = tmp_path / "cache" / "src_to_tgt" / "rte" / "linear"
+    before = torch.load(base / "train" / "features_B_blocks.pt")
+
+    prepared, target = _steer_prepare(
+        tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge", block_pooling="unitnorm"
+    )
+    for split in ("train", "test"):
+        assert (base / split / "features_B_blocks_pool-unitnorm.pt").exists()
+    after = torch.load(base / "train" / "features_B_blocks.pt")
+    assert all(torch.equal(before[b], after[b]) for b in before), "the mean-pooled cache must be left untouched"
+    assert prepared["block_pooling"] == "unitnorm"
+    assert prepared["diagnostics"]["stage2_test_acc"] is not None
+    assert not all(
+        torch.allclose(a, b) for a, b in zip(
+            mean_run["artifacts"]["stage2_state"]["coefficients"], prepared["artifacts"]["stage2_state"]["coefficients"]
+        )
+    ), "unitnorm pooling must change what the ridge sees"
+
+    # Live: the hook must pool the blocks with unitnorm, exactly as the fit did.
+    _, head = text_rebase_head(target)
+    batch = _collate([_DictDataset(4)[i] for i in range(4)])
+    kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, pooling="unitnorm") as capture:
+            capture.attention_mask = batch["attention_mask"]
+            pooled = target(**kwargs).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kwargs).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kwargs).logits
+    expected = baseline + prepared["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
+
+
 def test_steer_text_detects_an_unloaded_checkpoint(tmp_path) -> None:
     same = _tiny_t5(seed=0)
     with pytest.raises(ValueError, match="identical to the pretrained"):

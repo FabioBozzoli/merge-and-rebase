@@ -40,15 +40,34 @@ Limits, enforced at runtime:
   rule as vision), and the linear regime runs one ``torch.func.jvp`` per block
   per batch through the whole LM. That is affordable for a small T5 and
   punishing for a multi-billion-parameter model; a warning is printed above a
-  parameter threshold.
+  parameter threshold. ``joint_ridge`` has the same requirement: it needs no
+  per-block deltas, but B's per-block activations are only collected there.
+
+Stage-2 options over B's blocks (``block_ridge`` and ``joint_ridge`` only; any
+other strategy rejects them rather than ignoring them):
+
+- ``stage_2_strategy="joint_ridge"``: one ridge on all grouped blocks, each divided
+  by the root of its support mean squared norm and concatenated, fit to the *total*
+  Stage-1 target. ``ridge_lambda`` is then a trace-relative penalty per block. It
+  contains ``global_ridge`` on f_B as the special case of zero coefficients on the
+  residual blocks.
+- ``block_pooling`` (``"mean"`` | ``"unitnorm"`` | ``"rmsnorm"``): how each block's
+  tokens are pooled; see ``_TextBlockCapture``. Non-mean poolings are recollected
+  from B alone and cached as ``features_B_blocks_pool-<name>.pt`` next to the
+  split's other files; the live correction hook pools the same way.
+- ``block_feature_preprocessing`` (``"none"`` | ``"zscore"``): standardize every
+  block with support-set statistics and fit an unpenalized intercept; folded into
+  the coefficients and a bias vector, so evaluation needs no extra state.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -58,6 +77,7 @@ from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
 from ..methods.steer import (
     _BLOCK_GROUP_STRATEGIES,
+    _cache_split_dir,
     _few_shot,
     _fit_block_ridge,
     _fit_global_mlp,
@@ -182,6 +202,33 @@ def num_residual_blocks(model: nn.Module) -> int:
     return len(_ordered_block_keys(model))
 
 
+# Where each stack keeps the norm applied to its last block's output before anything
+# reads it: T5Stack.final_layer_norm, Llama/Qwen's model.norm, GPT-2's transformer.ln_f.
+_FINAL_NORM_ATTRS: tuple[str, ...] = ("final_layer_norm", "norm", "ln_f")
+
+
+def block_final_norms(model: nn.Module) -> list[nn.Module]:
+    """Each block's own stack's final norm, in the same order as ``block_modules``.
+
+    Resolved per block rather than once per model because T5ForSequenceClassification
+    has two stacks with two different final norms: an encoder block must be normalized
+    by the encoder's, a decoder block by the decoder's.
+    """
+    found: dict[tuple[str, int], nn.Module] = {}
+    for name, _module in model.named_modules():
+        key = _block_module_name(name)
+        if key is None or key in found:
+            continue
+        # "transformer.encoder.block.3" -> "transformer.encoder"; "model.layers.3" -> "model".
+        parent_path = name.rsplit(".", 2)[0] if name.count(".") >= 2 else ""
+        parent = model.get_submodule(parent_path) if parent_path else model
+        norm = next((getattr(parent, a) for a in _FINAL_NORM_ATTRS if isinstance(getattr(parent, a, None), nn.Module)), None)
+        if norm is None:
+            raise ValueError(f"No final norm ({'/'.join(_FINAL_NORM_ATTRS)}) found on '{parent_path}' for block '{name}'.")
+        found[key] = norm
+    return [found[key] for key in _ordered_block_keys(model)]
+
+
 # --------------------------------------------------------------------------
 # Pooled-feature extraction
 # --------------------------------------------------------------------------
@@ -222,20 +269,47 @@ def _pooled_features(model: nn.Module, batch: Mapping[str, torch.Tensor], device
 _masked_mean = masked_mean
 
 
-class _TextBlockCapture:
-    """Capture masked-mean-pooled per-block activations during a forward pass."""
+BLOCK_POOLINGS: tuple[str, ...] = ("mean", "unitnorm", "rmsnorm")
 
-    def __init__(self, model: nn.Module) -> None:
+
+class _TextBlockCapture:
+    """Capture pooled per-block activations during a forward pass.
+
+    ``pooling`` decides what each block's ``[B, T, D]`` output becomes before the
+    masked mean over real tokens:
+
+    - ``"mean"``: nothing -- the raw residual stream (what the feature cache holds);
+    - ``"unitnorm"``: every token divided by its own L2 norm;
+    - ``"rmsnorm"``: every token through its stack's final norm (``block_final_norms``),
+      i.e. pooled the way the model pools its own output feature.
+
+    T5's unnormalized residual stream gives a few tokens very large norms, and a
+    plain mean is dominated by them; normalizing each token first gives every token
+    the same weight in the average.
+    """
+
+    def __init__(self, model: nn.Module, pooling: str = "mean") -> None:
+        if pooling not in BLOCK_POOLINGS:
+            raise ValueError(f"block pooling must be one of {BLOCK_POOLINGS}, got {pooling!r}")
         self.modules = block_modules(model)
+        self.pooling = pooling
+        self.norms = block_final_norms(model) if pooling == "rmsnorm" else None
         self.activations: dict[int, torch.Tensor] = {}
         self.attention_mask: torch.Tensor | None = None
         self._handles: list[Any] = []
+
+    def _pool(self, block_id: int, out: torch.Tensor) -> torch.Tensor:
+        if out.ndim == 3 and self.pooling == "unitnorm":
+            out = out / out.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        elif out.ndim == 3 and self.pooling == "rmsnorm":
+            out = self.norms[block_id](out)
+        return _masked_mean(out, self.attention_mask)
 
     def _make_hook(self, block_id: int) -> Callable[..., None]:
         def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
             out = output[0] if isinstance(output, (tuple, list)) else output
             if torch.is_tensor(out):
-                self.activations[block_id] = _masked_mean(out, self.attention_mask).detach()
+                self.activations[block_id] = self._pool(block_id, out).detach()
 
         return hook
 
@@ -395,6 +469,67 @@ def _collect_linear_split(
     }
 
 
+@torch.no_grad()
+def _collect_target_blocks(
+    *, target: nn.Module, target_loader: Any, device: torch.device, pooling: str
+) -> dict[int, torch.Tensor]:
+    """B's residual blocks, pooled with ``pooling``, from a plain forward of B alone.
+
+    Only B's side changes with the pooling rule, so this never re-runs A's jvps: the
+    rows line up with the cached split because ``target_loader`` is the same
+    ``shuffle=False`` loader ``_collect_linear_split`` walked.
+    """
+    num_residual = num_residual_blocks(target)
+    chunks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_residual)}
+    with _head_as_identity(target), _TextBlockCapture(target, pooling=pooling) as capture:
+        for batch in target_loader:
+            capture.attention_mask = batch["attention_mask"].to(device) if "attention_mask" in batch else None
+            capture.activations.clear()
+            _pooled_features(target, batch, device)
+            for b in range(num_residual):
+                chunks[b].append(capture.activations[b].cpu())
+    return {b: torch.cat(v, dim=0) for b, v in chunks.items()}
+
+
+def _load_or_compute_pooled_blocks(
+    *,
+    cache_dir: Path,
+    pooling: str,
+    force_recompute: bool,
+    compute_fn: Callable[[], dict[int, torch.Tensor]],
+    verbose: bool,
+) -> dict[int, torch.Tensor]:
+    """``features_B_blocks`` under a non-default pooling, cached beside the split's other files.
+
+    A separate file rather than a separate regime directory: the A-side tensors in the
+    split do not depend on B's pooling, and recomputing them costs one jvp per source
+    block per batch.
+    """
+    path = cache_dir / f"features_B_blocks_pool-{pooling}.pt"
+    if path.exists() and not force_recompute:
+        if verbose:
+            print(f"[steer_text] using cached '{pooling}' block features at {path}")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    if verbose:
+        print(f"[steer_text] computing '{pooling}' block features for {path}")
+    blocks = compute_fn()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Several seeds of one task typically start together and all miss this file; write
+    # to a private temp name and rename, so a concurrent reader never sees a partial file.
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    torch.save(blocks, tmp)
+    os.replace(tmp, path)
+    return blocks
+
+
+def _standardize_stats(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Support-set mean and std per channel; the std is floored at 1% of its median so a
+    near-constant channel is not blown up into noise."""
+    mean = x.mean(dim=0)
+    std = x.std(dim=0)
+    return mean, std.clamp_min(1e-2 * float(std.median()))
+
+
 def _accuracy(
     features: torch.Tensor,
     weight: torch.Tensor,
@@ -470,6 +605,11 @@ class SteerTextRebase:
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
         block_ridge_lambda_scaling: str = "none",
+        block_ridge_target_strategy: str = "reuse_logitmap",
+        block_residuals_weighting_strategy: str = "identity",
+        block_ridge_blockwise_stage1_lambda: float = 1.0,
+        block_pooling: str = "mean",
+        block_feature_preprocessing: str = "none",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -479,14 +619,36 @@ class SteerTextRebase:
         del kwargs
         if feature_regime not in {"standard", "linear"}:
             raise ValueError("steer_text feature_regime must be 'standard' or 'linear'")
-        if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge"}:
-            raise ValueError("steer_text stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge")
+        if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge", "joint_ridge"}:
+            raise ValueError(
+                "steer_text stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge, joint_ridge"
+            )
         if stage_2_strategy == "block_ridge" and feature_regime != "linear":
             raise ValueError("steer_text block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
+        if stage_2_strategy == "joint_ridge" and feature_regime != "linear":
+            # joint_ridge needs no per-block deltas, only B's per-block activations -- but
+            # those are only collected by the linear-regime pass.
+            raise ValueError("steer_text joint_ridge requires feature_regime='linear' (B's blocks are collected there).")
+        uses_blocks = stage_2_strategy in {"block_ridge", "joint_ridge"}
+        if block_pooling not in BLOCK_POOLINGS:
+            raise ValueError(f"steer_text block_pooling must be one of: {', '.join(BLOCK_POOLINGS)}")
+        if block_feature_preprocessing not in {"none", "zscore"}:
+            raise ValueError("steer_text block_feature_preprocessing must be 'none' or 'zscore'")
+        if not uses_blocks and (block_pooling != "mean" or block_feature_preprocessing != "none"):
+            raise ValueError(
+                "steer_text block_pooling / block_feature_preprocessing only apply to block_ridge and joint_ridge; "
+                f"stage_2_strategy={stage_2_strategy!r} would silently ignore them."
+            )
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer_text block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
         if block_ridge_lambda_scaling not in {"none", "trace"}:
             raise ValueError("steer_text block_ridge_lambda_scaling must be 'none' or 'trace'")
+        if block_ridge_target_strategy not in {"reuse_logitmap", "blockwise_logitmap", "last_only"}:
+            raise ValueError(
+                "steer_text block_ridge_target_strategy must be one of: reuse_logitmap, blockwise_logitmap, last_only"
+            )
+        if block_residuals_weighting_strategy not in {"identity", "mean"}:
+            raise ValueError("steer_text block_residuals_weighting_strategy must be 'identity' or 'mean'")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
 
@@ -523,7 +685,7 @@ class SteerTextRebase:
                 "source model, so delta_A is zero. The tuned checkpoint did not load."
             )
 
-        need_blocks = stage_2_strategy == "block_ridge"
+        need_blocks = uses_blocks
 
         def _compute(split: str) -> dict[str, Any]:
             source_loader = getattr(source_loaders, split)
@@ -558,6 +720,32 @@ class SteerTextRebase:
         }
         train_data = _load_or_compute_split(split="train", compute_fn=lambda: _compute("train"), **cache_args)
         test_data = _load_or_compute_split(split="test", compute_fn=lambda: _compute("test"), **cache_args)
+
+        if need_blocks and block_pooling != "mean":
+            # Swap B's residual blocks for the re-pooled ones; f_B (the output block) and
+            # everything on A's side stay as cached.
+            for split, data in (("train", train_data), ("test", test_data)):
+                pooled = _load_or_compute_pooled_blocks(
+                    cache_dir=_cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, split),
+                    pooling=block_pooling,
+                    force_recompute=force_recompute_features,
+                    compute_fn=lambda split=split: _collect_target_blocks(
+                        target=target_model, target_loader=getattr(target_loaders, split), device=dev,
+                        pooling=block_pooling,
+                    ),
+                    verbose=verbose,
+                )
+                blocks = dict(data["features_B_blocks"])
+                keys = {int(k): k for k in blocks}
+                for b, value in pooled.items():
+                    old = blocks[keys[int(b)]]
+                    if tuple(value.shape) != tuple(old.shape):
+                        raise ValueError(
+                            f"steer_text: '{block_pooling}' block {b} has shape {tuple(value.shape)} but the cached "
+                            f"split has {tuple(old.shape)}; rerun with force_recompute_features=true."
+                        )
+                    blocks[keys[int(b)]] = value
+                data["features_B_blocks"] = blocks
 
         f_a = train_data["features_A"].double()
         delta_a = train_data["delta_A"].double()
@@ -631,16 +819,14 @@ class SteerTextRebase:
                     out = _model(global_act.double().to(model_device))
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
-        else:  # block_ridge
+        else:  # block_ridge / joint_ridge: both read B's grouped per-block activations
             delta_a_blocks_train = train_data["delta_A_blocks"].double()
-            block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T
-
             features_b_full_train = {int(b): v.double() for b, v in train_data["features_B_blocks"].items()}
             num_target_residual = len(features_b_full_train) - 1
-            num_source_blocks = int(block_targets.shape[1])
+            num_source_blocks = int(delta_a_blocks_train.shape[1])
             num_source_residual_blocks = num_source_blocks - 1
             if num_source_residual_blocks < 1 or num_target_residual < 1:
-                raise ValueError("steer_text block_ridge: source or target has no residual blocks to target.")
+                raise ValueError(f"steer_text {stage_2_strategy}: source or target has no residual blocks to target.")
 
             residual_train = {b: features_b_full_train[b] for b in range(num_target_residual)}
             output_train = features_b_full_train[num_target_residual]
@@ -655,7 +841,7 @@ class SteerTextRebase:
                 block_group_size = num_target_residual / num_source_residual_blocks
             else:
                 raise ValueError(
-                    f"steer_text block_ridge: target has fewer residual blocks ({num_target_residual}) "
+                    f"steer_text {stage_2_strategy}: target has fewer residual blocks ({num_target_residual}) "
                     f"than source ({num_source_residual_blocks}); cannot group."
                 )
 
@@ -664,33 +850,124 @@ class SteerTextRebase:
 
             local_selected = torch.arange(int(selected.numel()))
             local_blocks_train = {b: v[selected] for b, v in grouped_train.items()}
-            coefficients = [
-                c.to(dev)
-                for c in _fit_block_ridge(
-                    local_blocks_train,
-                    block_targets,
+            num_blocks = len(local_blocks_train)
+
+            # Optional per-block standardization, with support-set statistics only. It is
+            # folded into the coefficients and one bias vector below, so the live path
+            # never needs the statistics: ((x - mu) / sd) @ C == x @ (C / sd) - (mu / sd) @ C.
+            if block_feature_preprocessing == "zscore":
+                block_stats = {b: _standardize_stats(x) for b, x in local_blocks_train.items()}
+                fit_blocks = {b: (x - block_stats[b][0]) / block_stats[b][1] for b, x in local_blocks_train.items()}
+            else:
+                block_stats = None
+                fit_blocks = local_blocks_train
+            # Centered features get an unpenalized intercept: fit centered targets, add the mean back.
+            fit_intercept = block_stats is not None
+
+            if stage_2_strategy == "block_ridge":
+                if block_ridge_target_strategy == "blockwise_logitmap":
+                    # A separate Stage-1 map per block, fitted on that block's delta alone.
+                    # Named apart from ``logit_map``: that one is the full-delta map the
+                    # artifacts report, and must not end up holding the last block's.
+                    block_targets_list = []
+                    for delta_a_block in delta_a_blocks_train.unbind(dim=1):
+                        block_logit_map = _stage1_projection(
+                            f_a=f_a,
+                            delta_a=delta_a_block,
+                            w_a=w_a,
+                            f_b=f_b,
+                            w_b=w_b,
+                            selected=selected,
+                            regularization=block_ridge_blockwise_stage1_lambda,
+                        )
+                        block_targets_list.append(delta_a_block[selected] @ block_logit_map.T @ p_b.T)
+                    block_targets = torch.stack(block_targets_list, dim=1)
+                elif block_ridge_target_strategy == "reuse_logitmap":
+                    # The full-delta Stage-1 map applied to each block's delta.
+                    block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T
+                else:  # last_only
+                    # Every block regresses the full Stage-1 train target.
+                    block_targets = train_target.unsqueeze(1).expand(-1, delta_a_blocks_train.shape[1], -1)
+
+                block_weight = 1.0 / num_blocks if block_residuals_weighting_strategy == "mean" else 1.0
+                weights = [block_weight] * num_blocks
+                # With centered features every block's support prediction has zero mean, so
+                # the smoothed-residual carry stays zero-mean too and each block's intercept
+                # is just the mean of its own target slice.
+                intercepts = block_targets.mean(dim=0) if fit_intercept else None  # [num_blocks, d]
+                raw = _fit_block_ridge(
+                    fit_blocks,
+                    block_targets - intercepts.unsqueeze(0) if fit_intercept else block_targets,
                     selected=local_selected,
                     regularization=ridge_lambda,
                     mode=block_ridge_mode,
                     rho=rho,
                     regularization_scaling=block_ridge_lambda_scaling,
                 )
-            ]
+                joint_scales = None
+            else:  # joint_ridge
+                # One ridge on all blocks against the *total* Stage-1 target. Each block is
+                # divided by the root of its mean squared row norm, tr(X_b X_b^T)/n on the
+                # support -- so ridge_lambda is a per-block trace-relative penalty, the same
+                # units as block_ridge_lambda_scaling="trace" -- then concatenated. It uses no
+                # per-block targets, so block_ridge_target_strategy, the weighting strategy,
+                # block_ridge_mode, rho and block_ridge_lambda_scaling do not apply.
+                weights = [1.0] * num_blocks
+                joint_scales = [float(fit_blocks[b].square().sum(dim=1).mean().sqrt()) for b in range(num_blocks)]
+                z = torch.cat([fit_blocks[b] / joint_scales[b] for b in range(num_blocks)], dim=1)
+                target_mean = train_target.mean(dim=0) if fit_intercept else None
+                joint = _ridge(z, train_target - target_mean if fit_intercept else train_target, ridge_lambda)
+                del z
+                sizes = [int(fit_blocks[b].shape[1]) for b in range(num_blocks)]
+                raw = [c / joint_scales[b] for b, c in enumerate(torch.split(joint, sizes, dim=0))]
+                intercepts = None
+
+            # Fold weights, standardization and intercepts into (coefficients, bias).
+            coefficients = []
+            bias: torch.Tensor | None = None
+            if fit_intercept:
+                bias = target_mean.clone() if stage_2_strategy == "joint_ridge" else torch.zeros_like(raw[0][0])
+            for b, (c, w) in enumerate(zip(raw, weights, strict=True)):
+                if block_stats is not None:
+                    mu, sd = block_stats[b]
+                    bias = bias - w * ((mu / sd) @ c)
+                    c = c / sd.unsqueeze(1)
+                    if intercepts is not None:
+                        bias = bias + w * intercepts[b]
+                coefficients.append((c * w).to(dev))
+            if bias is not None:
+                bias = bias.to(dev)
+
             stage2_state = {
-                "kind": "block_ridge",
+                "kind": stage_2_strategy,
                 "coefficients": coefficients,
+                "bias": bias,
                 "num_target_residual": int(num_target_residual),
                 "num_source_residual_blocks": int(num_source_residual_blocks),
                 "block_group_strategy": str(block_group_strategy),
-                "block_ridge_mode": str(block_ridge_mode),
-                "rho": float(rho),
-                "lambda_scaling": str(block_ridge_lambda_scaling),
+                "block_pooling": str(block_pooling),
+                "block_feature_preprocessing": str(block_feature_preprocessing),
+                "weights": weights,
             }
+            if stage_2_strategy == "block_ridge":
+                stage2_state.update(
+                    {
+                        "block_ridge_mode": str(block_ridge_mode),
+                        "rho": float(rho),
+                        "lambda_scaling": str(block_ridge_lambda_scaling),
+                        "target_strategy": str(block_ridge_target_strategy),
+                        "blockwise_stage1_lambda": float(block_ridge_blockwise_stage1_lambda),
+                        "weighting_strategy": str(block_residuals_weighting_strategy),
+                    }
+                )
+            else:
+                stage2_state["joint_block_scales"] = joint_scales
 
             def correction_fn(
                 activations: Mapping[str, Any],
                 *,
                 _coefficients=coefficients,
+                _bias=bias,
                 _num_target_residual=num_target_residual,
                 _num_source_residual_blocks=num_source_residual_blocks,
                 _strategy=block_group_strategy,
@@ -707,6 +984,8 @@ class SteerTextRebase:
                     activations["blocks"][_num_target_residual].double().to(coef_device)
                 )
                 out = _predict_block_ridge(_coefficients, blocks)
+                if _bias is not None:
+                    out = out + _bias
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
         # Stage 2 accuracy in cached-tensor space, the number directly comparable
@@ -735,6 +1014,7 @@ class SteerTextRebase:
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
+            "block_pooling": block_pooling,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             # The fitted transforms themselves, so a run can be inspected or
@@ -791,9 +1071,10 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     model = getattr(llm, "model", llm)
     _, head = head_linear(model)
     correction_fn = prepared["correction_fn"]
-    need_blocks = prepared.get("stage_2_strategy") == "block_ridge"
+    need_blocks = prepared.get("stage_2_strategy") in {"block_ridge", "joint_ridge"}
 
-    capture = _TextBlockCapture(model) if need_blocks else None
+    # Pool the live blocks exactly as the fit's features were pooled.
+    capture = _TextBlockCapture(model, pooling=prepared.get("block_pooling", "mean")) if need_blocks else None
     handles: list[Any] = []
 
     def _mask_hook(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:

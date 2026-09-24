@@ -21,6 +21,23 @@ module is needed: the raw-dot-product head_logits path already used by
 ``eval/text_rebase.py`` and ``eval/llm_merge.py`` gives exact nearest-mean
 predictions once the weight rows are unit-norm and the bias is zero.
 
+``--center`` builds the centroids from *centered* features instead. Pooled
+features share one dominant direction, so the plain centroids above are nearly
+parallel (cosine 0.94-0.996 on t5-large encoder features): every class gets
+almost the same logit, and decision margins are ~1% of the logits. Centering
+removes that shared direction first:
+
+    mean_f = mean_{x in support} pooled_feature(x)
+    c_c    = normalize( mean_{x in support(c)} pooled_feature(x) - mean_f )
+    bias_c = -c_c . mean_f
+
+so the head computes c_c . (x - mean_f), which is argmax-equivalent to cosine
+nearest-mean on the centered query (the query's norm is the same for every
+class) while still being a plain affine head on the raw feature. Features are
+not normalized per example here: a per-example norm before centering would put
+|x| in the bias, which no affine head can represent. The support is
+class-balanced, so mean_f is also the mean of the class means.
+
 The pooled feature -- whatever tensor the model's real head would consume
 (T5: post-dense-tanh; decoder-only: the last non-pad hidden state) -- is
 obtained the same way ``rebase/text/steer_text.py`` already does it: swap the
@@ -153,6 +170,7 @@ def build_head(
     use_fast_tokenizer: bool,
     batch_size: int = 16,
     model_kind: str = "sequence_classification",
+    center: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, object], TextLM]:
     torch.manual_seed(seed)
 
@@ -222,6 +240,8 @@ def build_head(
     # it never participates. Only a class the task actually uses may not be
     # missing.
     centroids = torch.zeros(num_labels, features.shape[-1], dtype=torch.float64)
+    biases = torch.zeros(num_labels, dtype=torch.float64)
+    mean_feature = features.mean(dim=0)
     for class_id in range(num_labels):
         rows = normed[labels == class_id]
         if rows.shape[0] == 0:
@@ -231,13 +251,21 @@ def build_head(
                     f"task '{task}' uses it (head_class_ids={head_class_ids})."
                 )
             continue
-        centroids[class_id] = torch.nn.functional.normalize(rows.mean(dim=0), dim=-1)
+        if center:
+            centroids[class_id] = torch.nn.functional.normalize(
+                features[labels == class_id].mean(dim=0) - mean_feature, dim=-1
+            )
+            biases[class_id] = -(centroids[class_id] @ mean_feature)
+        else:
+            centroids[class_id] = torch.nn.functional.normalize(rows.mean(dim=0), dim=-1)
 
     head_name, head_module = head_linear(llm.model)
+    if center and head_module.bias is None:
+        raise ValueError("--center needs a head with a bias to carry -c . mean_f; this head has none.")
     weight = centroids.to(dtype=head_module.weight.dtype, device="cpu")
     payload: dict[str, torch.Tensor] = {f"{head_name}.weight": weight}
     if head_module.bias is not None:
-        payload[f"{head_name}.bias"] = torch.zeros(num_labels, dtype=head_module.bias.dtype)
+        payload[f"{head_name}.bias"] = biases.to(dtype=head_module.bias.dtype)
     # Bake the same neutralization into the saved head: injecting it at eval
     # time (_inject_task_head) must reproduce the exact feature space the
     # centroids above were computed in, or the two disagree again.
@@ -257,7 +285,7 @@ def build_head(
         "head_class_ids": head_class_ids,
         "head_param_prefix": head_name,
         "neutralized_intermediate_layers": sorted({k.rsplit(".", 1)[0] for k in neutralized}),
-        "construction": "nearest_class_mean_cosine",
+        "construction": "nearest_class_mean_centered_cosine" if center else "nearest_class_mean_cosine",
         "note": (
             "weight rows are L2-normalized class centroids of the model's own pooled "
             "features over the support set, computed after neutralizing any untrained "
@@ -281,6 +309,14 @@ def build_head(
         head_key_pattern=head_name.rsplit(".", 1)[0] if "." in head_name else head_name,
         head_class_ids=head_class_ids,
     )
+    if center:
+        # The saved head must reproduce cosine nearest-mean on centered features exactly.
+        index = torch.tensor(sorted(head_class_ids))
+        centered = torch.nn.functional.normalize(features - mean_feature, dim=-1)
+        by_cosine = index[(centered @ centroids[index].T).argmax(dim=1)]
+        by_head = index[(features @ centroids[index].T + biases[index]).argmax(dim=1)]
+        if not torch.equal(by_cosine, by_head):
+            raise AssertionError("centered head disagrees with centered cosine nearest-mean on the support set")
     support_acc = llm.sequence_classification_accuracy(
         tokenized.loader, device=device, mask_class=tokenized.mask_class
     )
@@ -316,6 +352,12 @@ def main() -> None:
     p.add_argument("--dtype", type=str, default=None, choices=[None, "fp16", "bf16", "fp32"])
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--no-fast-tokenizer", action="store_true")
+    p.add_argument(
+        "--center",
+        action="store_true",
+        help="Build centroids from mean-centered features and fold the centering into the bias "
+        "(see the module docstring). Changes both the decisions and the logit scale of B's head.",
+    )
     p.add_argument("--output", type=str, required=True, help="Where to write the heads.pt (a {task: {param_name: tensor}} dict).")
     args = p.parse_args()
 
@@ -335,13 +377,14 @@ def main() -> None:
         use_fast_tokenizer=not args.no_fast_tokenizer,
         batch_size=args.batch_size,
         model_kind=str(args.model_kind).strip().lower(),
+        center=bool(args.center),
     )
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     heads = {str(args.task).strip().lower(): {**payload, "_meta": meta}}
     torch.save(heads, out_path)
-    print(f"Wrote nearest-mean-cosine head for task '{args.task}' -> {out_path}")
+    print(f"Wrote {meta['construction']} head for task '{args.task}' -> {out_path}")
     for name, tensor in payload.items():
         print(f"  {name}: {tuple(tensor.shape)}")
 
