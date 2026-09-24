@@ -12,6 +12,7 @@ vision tasks. Sweep: few_shot in {1, 2, 5, 10, 20} x seed in {33, 54, 89} -> 15 
 
 The feature cache is keyed by source/target/task/regime/split (not few_shot or seed), so one shared
 ``--feature-cache-dir`` means the features are computed once per task and every other run only refits.
+The default points at the cache the linear-regime steer runs already filled.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ def main() -> None:
     parser.add_argument("--prefix", default="vision8_steer_trace", help="Config file name prefix.")
     parser.add_argument("--pair", default="ViT-B/16 -> ViT-B/16", help="Label used in the config description.")
     parser.add_argument("--ckpt-root", default=BASE_CKPT_ROOT, help="Replaces the checkpoint root in tuned_ckpts.")
-    parser.add_argument("--feature-cache-dir", default="/work/intesasanpaolo_phd/merge-and-rebase/features/linear_feature_trace")
+    parser.add_argument("--feature-cache-dir", default="/work/intesasanpaolo_phd/merge-and-rebase/features/linear_feature")
     args = parser.parse_args()
 
     base = json.loads(args.base.read_text())

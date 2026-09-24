@@ -20,8 +20,10 @@
 # Tutti gli iperparametri stanno nei config configs/vision8_steer_trace_vitl/vision8_steer_trace_vitl_fs<K>_seed<S>.json
 # (generati da configs/vision8_steer_trace/make_configs.py).
 #
-# Da lanciare dalla root del repo, DOPO il warm-up della cache (vedi vitb_vitl_trace_warmup.sbatch):
-#   scripts/run_vision_steer_trace_vitl.sh     # sottomette warm-up + questo array con dipendenza afterok
+# Da lanciare dalla root del repo. Le feature sono gia' estratte in
+# /work/intesasanpaolo_phd/merge-and-rebase/features/linear_feature (feature_cache_dir dei config):
+# il warm-up (vitb_vitl_trace_warmup.sbatch) serve solo se manca la cache di un dataset.
+#   scripts/run_vision_steer_trace_vitl.sh     # controlla la cache e sottomette (warm-up +) questo array
 # Le cartelle .log/vitb_vitl_trace/slurm_backup devono esistere PRIMA di sbatch (SLURM non le crea).
 
 EXP="vitb_vitl_trace"
