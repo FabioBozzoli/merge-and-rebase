@@ -18,7 +18,7 @@
   "dtype": "fp32",
 
   "eval_mode": "head_logits",
-  "eval_source_finetuned": true,
+  "eval_source_finetuned": false,
   "linear_probe_head": true,
   "linear_probe_stage": "pre",
   "linear_probe_init": "nearest_mean",

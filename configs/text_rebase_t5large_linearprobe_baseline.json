@@ -38,12 +38,12 @@
 
   "method": "steer_text",
   "method_params": {
-    "feature_regime": "standard",
+    "feature_regime": "linear",
     "stage_2_strategy": "global_ridge",
     "few_shot": 300,
     "stage1_lambda": 1.0,
     "ridge_lambda": 1.0,
-    "feature_cache_dir": "src/.cache/steer_text_features",
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/.cache/steer_text_features",
     "force_recompute_features": false
   },
 
