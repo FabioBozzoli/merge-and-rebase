@@ -36,7 +36,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
@@ -919,7 +919,20 @@ def _iter_batches(loader: Any, *, device: torch.device) -> Iterable[tuple[torch.
         yield x.to(device), y.to(device)
 
 
-def _aligned_loader_pair(source_loader: Any, target_loader: Any) -> tuple[Any, Any]:
+# Train images kept per class when extracting features for these tasks. Their
+# full train splits (SVHN ~73k, MNIST 60k) make per-layer caches too large,
+# while the support set never exceeds ~20 shots per class. Test stays full.
+_TRAIN_FEATURES_PER_CLASS = {"SVHN": 50, "MNIST": 50}
+
+
+def _dataset_labels(dataset: Any) -> torch.Tensor:
+    """Labels of an HFVisionDataset read from its label column, without decoding images."""
+    return torch.tensor([dataset._map_label(y) for y in dataset.split[dataset.label_key]])
+
+
+def _aligned_loader_pair(
+    source_loader: Any, target_loader: Any, *, per_class: int | None = None
+) -> tuple[Any, Any]:
     """
     Rebuild A's and B's split loaders with ``shuffle=False`` over their
     underlying ``.dataset``, so batch ``i`` of A and batch ``i`` of B are
@@ -943,6 +956,10 @@ def _aligned_loader_pair(source_loader: Any, target_loader: Any) -> tuple[Any, A
             f"steer requires source and target datasets to have the same length for pairing, "
             f"got {len(source_ds)} vs {len(target_ds)}."
         )
+    if per_class is not None:
+        # Fixed seed, independent of the run seed, so every run shares one cache.
+        indices = _few_shot(_dataset_labels(source_ds), per_class, seed=0).tolist()
+        source_ds, target_ds = Subset(source_ds, indices), Subset(target_ds, indices)
     batch_size = source_loader.batch_size
     aligned_source = DataLoader(source_ds, batch_size=batch_size, shuffle=False)
     aligned_target = DataLoader(target_ds, batch_size=batch_size, shuffle=False)
@@ -1337,7 +1354,11 @@ class SteerRebase:
         need_blocks = stage_2_strategy == "block_ridge"
 
         def _compute(split: str) -> dict[str, Any]:
-            source_loader, target_loader = _aligned_loader_pair(getattr(source_loaders, split), getattr(target_loaders, split))
+            source_loader, target_loader = _aligned_loader_pair(
+                getattr(source_loaders, split),
+                getattr(target_loaders, split),
+                per_class=train_per_class if split == "train" else None,
+            )
             if feature_regime == "standard":
                 return _collect_standard_split(
                     clf_source_finetuned_visual=source_finetuned_visual,
@@ -1358,13 +1379,15 @@ class SteerRebase:
                 block_granularity=block_granularity,
             )
 
+        train_per_class = _TRAIN_FEATURES_PER_CLASS.get(task)
         train_data = _load_or_compute_split(
             feature_cache_dir=feature_cache_dir,
             source_tag=source_tag,
             target_tag=target_tag,
             task=task,
             feature_regime=feature_regime,
-            split="train",
+            # Separate cache dir so a subsampled cache never masquerades as a full one.
+            split="train" if train_per_class is None else f"train_{train_per_class}perclass",
             force_recompute_features=force_recompute_features,
             need_blocks=need_blocks,
             compute_fn=lambda: _compute("train"),
