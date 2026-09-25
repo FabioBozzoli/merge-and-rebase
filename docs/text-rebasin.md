@@ -250,6 +250,32 @@ its Stage 2 correction as a function of B's pooled feature, so if that feature
 carries no class signal the correction cannot be class-dependent either, and no
 Stage 1 quality can recover it.
 
+## RoBERTa as the target (`FacebookAI/roberta-base`)
+
+`steer_text` can transport a T5 source onto a RoBERTa target. Set `target_model_name_or_path: "FacebookAI/roberta-base"`,
+`target_model_arch: "auto"` and `model_kind: "encoder_classification"`; `configs/block_ridge_ntk_roberta/make_configs.py`
+generates the runs.
+
+- **Model**: `RobertaEncoderForSequenceClassification` — RoBERTa's encoder, the masked mean of the last layer's
+  output and one linear head named `classification_head.out_proj` (the same surface as the T5 encoder wrapper, so
+  head files, `_head_as_identity` and block discovery work unchanged). The mean, not `<s>`, is the feature: it is
+  the same kind of feature as the source's and RoBERTa's pretrained `<s>` is not trained to summarise a sentence.
+  `TextLM.build` picks the wrapper from `config.model_type` (`t5`-family or `roberta`).
+- **Two Stage-2 families**: `global_ridge` / `global_mlp` regress on the last layer's pooled output;
+  `block_ridge` regresses on every block, taken at the end of the block (`block_source="residual"`) or at the
+  input of the attention output projection `attention.output.dense` (`block_source="attention"`). With NTK source
+  checkpoints all of them need `feature_regime="linear"`: a plain forward of an NTK checkpoint is not the function
+  that was trained, so its delta must be linearized.
+- **Segments**: RoBERTa pair-encodes as `<s> premise </s></s> hypothesis </s>` (two separator EOS, T5 has one), so
+  `target_block_pooling="segments"` uses a per-family layout (`_SEGMENT_LAYOUT_BY_MODEL_TYPE`) and refuses model
+  types it does not know instead of guessing the boundary.
+- **Depth**: RoBERTa-base and T5-base both have 12 blocks, so no block grouping happens.
+- **Reusing the source side**: the A half of a cached split (`features_A`, `delta_A`, `delta_A_blocks`, `y_A`, one jvp
+  per source block per batch) does not depend on the target. `method_params.reuse_source_features_from: "<target tag>"`
+  copies it from an existing cache pair with the same source (e.g. `google-t5__t5-large__encoder_classification`) and
+  computes only the target's half. The labels of the two runs must line up row by row (checked, it raises
+  otherwise); afterwards the new pair is self-sufficient.
+
 ## Limits
 
 - `steer_text` requires `eval_mode="head_logits"`.

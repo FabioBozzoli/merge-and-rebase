@@ -12,10 +12,15 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 
-# Architectures whose encoder stack model_kind="encoder_classification" can build.
+# Architectures whose encoder stack model_kind="encoder_classification" can build, as
+# config.model_type -> wrapper class name in rebase/text/encoder_classifier.py.
 # Checked against config.model_type so that an already-converted encoder-only
 # directory (which reports is_encoder_decoder=False) is still recognised.
 _T5_FAMILY_MODEL_TYPES = frozenset({"t5", "mt5", "umt5", "longt5"})
+_ENCODER_CLASSIFIER_BY_MODEL_TYPE: dict[str, str] = {
+    **{model_type: "T5EncoderForSequenceClassification" for model_type in _T5_FAMILY_MODEL_TYPES},
+    "roberta": "RobertaEncoderForSequenceClassification",
+}
 
 
 @dataclass(frozen=True)
@@ -119,7 +124,7 @@ class TextLM(nn.Module):
             # out so only eval/text_rebase.py triggers it. A module-level import
             # here would make every `models.text_lm` import register rebase
             # methods -- including on the vision paths, which never want them.
-            from ..rebase.text.encoder_classifier import T5EncoderForSequenceClassification
+            from ..rebase.text import encoder_classifier
 
             # Gate on the model family, not on config.is_encoder_decoder: a
             # checkpoint already converted by scripts/convert_t5_encoder_ckpt.py
@@ -127,17 +132,19 @@ class TextLM(nn.Module):
             # False and would fail that test despite being exactly what this
             # kind is for.
             model_type = str(getattr(hf_cfg, "model_type", "")).lower()
-            if model_type not in _T5_FAMILY_MODEL_TYPES:
+            wrapper_name = _ENCODER_CLASSIFIER_BY_MODEL_TYPE.get(model_type)
+            if wrapper_name is None:
                 raise ValueError(
-                    f"model_kind='encoder_classification' builds a T5 encoder stack, but "
+                    f"model_kind='encoder_classification' builds an encoder stack with a linear head, but "
                     f"'{cfg.model_name_or_path}' has model_type='{model_type}'. Supported: "
-                    f"{sorted(_T5_FAMILY_MODEL_TYPES)}. Use model_kind='sequence_classification' "
+                    f"{sorted(_ENCODER_CLASSIFIER_BY_MODEL_TYPE)}. Use model_kind='sequence_classification' "
                     "for other architectures."
                 )
+            wrapper_cls = getattr(encoder_classifier, wrapper_name)
             # A Hub id and a local converted directory are the same call here:
             # from_pretrained accepts either, so converted checkpoints need no
             # separate code path.
-            model = T5EncoderForSequenceClassification.from_pretrained(
+            model = wrapper_cls.from_pretrained(
                 **common,
                 num_labels=int(cfg.num_labels),
             )

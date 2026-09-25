@@ -5,10 +5,11 @@ import os
 import pytest
 import torch
 import torch.nn as nn
-from transformers import T5Config, T5ForConditionalGeneration
+from transformers import RobertaConfig, RobertaForMaskedLM, T5Config, T5ForConditionalGeneration
 
 from merge_and_rebase.rebase.text.adapters import head_intermediate_linears, head_linear, text_param_filter
 from merge_and_rebase.rebase.text.encoder_classifier import (
+    RobertaEncoderForSequenceClassification,
     T5EncoderForSequenceClassification,
     masked_mean,
     segment_masks_from_eos,
@@ -364,3 +365,131 @@ def test_block_map_sees_no_decoder_on_a_real_checkpoint() -> None:
     counts = count_transformer_blocks(llm.model)
     assert "decoder" not in counts, f"decoder blocks leaked into the block map: {counts}"
     assert counts.get("encoder", 0) > 0
+
+
+# ---------------------------------------------------------------------------
+# RoBERTa: pair-encoding layout for the segments, and the encoder-only wrapper
+# ---------------------------------------------------------------------------
+
+_RB_BOS, _RB_PAD, _RB_EOS = 0, 1, 2
+
+
+def _roberta_config(num_labels: int = 3, num_layers: int = _LAYERS) -> RobertaConfig:
+    return RobertaConfig(
+        vocab_size=_VOCAB,
+        hidden_size=_D_MODEL,
+        num_hidden_layers=num_layers,
+        num_attention_heads=2,
+        intermediate_size=32,
+        max_position_embeddings=40,
+        pad_token_id=_RB_PAD,
+        bos_token_id=_RB_BOS,
+        eos_token_id=_RB_EOS,
+        num_labels=num_labels,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+
+
+def _roberta(num_labels: int = 3, seed: int = 0) -> RobertaEncoderForSequenceClassification:
+    torch.manual_seed(seed)
+    model = RobertaEncoderForSequenceClassification(_roberta_config(num_labels)).eval()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0.0, 0.02)
+    return model
+
+
+def test_roberta_segment_masks_use_two_separator_eos_and_drop_the_bos() -> None:
+    """``<s> p p </s></s> h </s> pad``: with the T5 rule the hypothesis would be lost."""
+    ids = torch.tensor(
+        [
+            [_RB_BOS, 5, 6, _RB_EOS, _RB_EOS, 7, _RB_EOS, _RB_PAD],
+            [_RB_BOS, 5, _RB_EOS, _RB_EOS, 6, 7, _RB_EOS, _RB_PAD],
+        ]
+    )
+    mask = (ids != _RB_PAD).long()
+    seg1, seg2 = segment_masks_from_eos(ids, mask, _RB_EOS, separator_eos=2, bos_token_id=_RB_BOS)
+    assert seg1.tolist() == [
+        [False, True, True, False, False, False, False, False],
+        [False, True, False, False, False, False, False, False],
+    ]
+    assert seg2.tolist() == [
+        [False, False, False, False, False, True, False, False],
+        [False, False, False, False, True, True, False, False],
+    ]
+    # The T5 rule (one separator EOS) would leave the RoBERTa hypothesis out of both segments.
+    t5_seg1, t5_seg2 = segment_masks_from_eos(ids, mask, _RB_EOS)
+    assert not t5_seg2.any()
+
+    hidden = torch.randn(2, 8, 4)
+    pooled = segment_pooled(hidden, mask, ids, _RB_EOS, separator_eos=2, bos_token_id=_RB_BOS)
+    expected = torch.cat([masked_mean(hidden, seg1), masked_mean(hidden, seg2), masked_mean(hidden, mask)], dim=-1)
+    assert pooled.shape == (2, 12) and torch.allclose(pooled, expected)
+
+
+def test_roberta_segment_masks_need_three_eos() -> None:
+    ids = torch.tensor([[_RB_BOS, 5, _RB_EOS, 6, _RB_EOS]])  # T5-style layout: only two EOS
+    with pytest.raises(ValueError, match="fewer than 3 EOS"):
+        segment_masks_from_eos(ids, torch.ones_like(ids), _RB_EOS, separator_eos=2, bos_token_id=_RB_BOS)
+
+
+def test_roberta_wrapper_has_no_mlm_or_pooler_head_and_a_single_linear_head() -> None:
+    model = _roberta()
+    names = [n for n, _ in model.named_parameters()]
+    assert not [n for n in names if "lm_head" in n or "pooler" in n]
+    name, module = head_linear(model)
+    assert name == "classification_head.out_proj" and isinstance(module, nn.Linear)
+    assert head_intermediate_linears(model) == []
+    # Blocks are the encoder layers, matched by steer_text's existing BERT/RoBERTa pattern.
+    assert num_residual_blocks(model) == _LAYERS
+    assert len(block_modules(model)) == _LAYERS
+    _, num_blocks = text_parameter_blocks(model)
+    assert num_blocks == _LAYERS + 1
+
+
+def test_roberta_head_as_identity_exposes_the_masked_mean_feature() -> None:
+    model = _roberta()
+    ids = torch.tensor([[_RB_BOS, 5, 6, _RB_EOS, _RB_EOS, 7, _RB_EOS, _RB_PAD]] * 2)
+    mask = (ids != _RB_PAD).long()
+    logits = model(input_ids=ids, attention_mask=mask).logits
+    _, head = head_linear(model)
+    with _head_as_identity(model):
+        pooled = model(input_ids=ids, attention_mask=mask).logits
+        hidden = model.roberta(input_ids=ids, attention_mask=mask).last_hidden_state
+    assert torch.allclose(pooled, masked_mean(hidden, mask), atol=1e-6)
+    assert torch.allclose(head(pooled), logits, atol=1e-6)
+    assert not torch.allclose(pooled, hidden.mean(dim=1), atol=1e-6)  # padding is masked out
+
+
+def test_roberta_wrapper_loads_a_base_checkpoint_without_reinitializing(tmp_path) -> None:
+    """A base RoBERTa checkpoint is a masked-LM one (``roberta.*`` + ``lm_head.*``)."""
+    torch.manual_seed(0)
+    base = RobertaForMaskedLM(_roberta_config()).eval()
+    with torch.no_grad():
+        for p in base.parameters():
+            p.normal_(0.0, 0.02)
+    base.save_pretrained(tmp_path / "base")
+    loaded = RobertaEncoderForSequenceClassification.from_pretrained(tmp_path / "base", num_labels=3).eval()
+
+    got = loaded.state_dict()
+    checked = 0
+    for key, value in base.state_dict().items():
+        if key.startswith("lm_head") or "position_ids" in key:
+            continue
+        assert key in got, f"encoder tensor not loaded: {key}"
+        assert torch.equal(got[key], value), f"encoder tensor differs after load: {key}"
+        checked += 1
+    assert checked > 0
+    assert not [k for k in got if "lm_head" in k or "pooler" in k]
+
+
+def test_encoder_classification_registry_maps_model_types_to_wrappers() -> None:
+    from merge_and_rebase.models import text_lm
+    from merge_and_rebase.rebase.text import encoder_classifier
+
+    registry = text_lm._ENCODER_CLASSIFIER_BY_MODEL_TYPE
+    assert set(registry) == {"t5", "mt5", "umt5", "longt5", "roberta"}
+    assert {registry[t] for t in ("t5", "mt5", "umt5", "longt5")} == {"T5EncoderForSequenceClassification"}
+    assert registry["roberta"] == "RobertaEncoderForSequenceClassification"
+    assert all(hasattr(encoder_classifier, name) for name in registry.values())

@@ -336,7 +336,7 @@ def main() -> None:
         default="sequence_classification",
         choices=["sequence_classification", "encoder_classification"],
         help="Which wrapper defines the pooled feature the centroids are built from. "
-        "'encoder_classification' pools the T5 encoder's token features; "
+        "'encoder_classification' pools the encoder's token features (T5 family or RoBERTa); "
         "'sequence_classification' uses the architecture's own rule (T5: the decoder's eos "
         "position). The two produce different features, so a head built under one kind is not "
         "valid under the other -- it must match the model_kind of the run that will inject it.",

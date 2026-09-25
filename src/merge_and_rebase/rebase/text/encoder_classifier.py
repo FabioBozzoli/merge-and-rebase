@@ -54,8 +54,9 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import T5Config, T5EncoderModel
+from transformers import RobertaConfig, RobertaModel, T5Config, T5EncoderModel
 from transformers.modeling_outputs import SequenceClassifierOutput
+from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel
 from transformers.models.t5.modeling_t5 import T5PreTrainedModel
 
 
@@ -85,40 +86,53 @@ def masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor | None) -> to
 
 
 def segment_masks_from_eos(
-    input_ids: torch.Tensor, attention_mask: torch.Tensor, eos_token_id: int
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eos_token_id: int,
+    *,
+    separator_eos: int = 1,
+    bos_token_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Two ``[B, T]`` boolean masks splitting a pair-encoded row at its EOS tokens.
 
-    T5's pair encoding (``build_nli_tokenized_loader``) lays out
-    ``premise <eos> hypothesis <eos>`` with no other separator. Segment 1 is
-    every token strictly before the first EOS, segment 2 every token strictly
-    between the first and second EOS; both exclude the EOS tokens themselves.
+    Segment 1 is every token strictly before the first EOS, segment 2 every token
+    after the ``separator_eos``-th EOS and before the next one; EOS tokens are in
+    neither. ``separator_eos`` is how many consecutive EOS tokens separate the two
+    sentences in the model's pair encoding:
 
-    Padding sits after the second EOS under right-padding and is excluded by
-    construction (its cumulative EOS count is 2), but every row is also
-    intersected with ``attention_mask`` as a defensive measure against any
-    other padding convention.
+    - T5 (``build_nli_tokenized_loader``): ``premise <eos> hypothesis <eos>`` -> 1;
+    - RoBERTa: ``<s> premise </s></s> hypothesis </s>`` -> 2. With the T5 rule the
+      RoBERTa "segment 2" would be the empty gap between the two ``</s>`` and the
+      hypothesis would be dropped, hence the parameter. ``bos_token_id`` (``<s>``)
+      is excluded from segment 1 so that both segments hold sentence tokens only.
 
-    Raises ``ValueError`` if any row has fewer than two EOS tokens, rather
-    than degrading to a whole-row mask: on this repo's NLI tasks that means
-    truncation or an upstream tokenization change removed the
+    Padding sits after the last EOS under right-padding and is excluded by
+    construction (its cumulative EOS count exceeds ``separator_eos``), but every
+    row is also intersected with ``attention_mask`` as a defensive measure.
+
+    Raises ``ValueError`` if any row has fewer than ``separator_eos + 1`` EOS
+    tokens, rather than degrading to a whole-row mask: on this repo's NLI tasks
+    that means truncation or an upstream tokenization change removed the
     premise/hypothesis boundary, and a silent fallback would produce
     plausible-looking but wrong numbers.
     """
+    need = int(separator_eos) + 1
     is_eos = input_ids == int(eos_token_id)
     counts = is_eos.sum(dim=1)
-    if bool((counts < 2).any()):
-        bad = int((counts < 2).sum())
+    if bool((counts < need).any()):
+        bad = int((counts < need).sum())
         raise ValueError(
-            f"segment_masks_from_eos: {bad} row(s) have fewer than 2 EOS tokens "
+            f"segment_masks_from_eos: {bad} row(s) have fewer than {need} EOS tokens "
             f"(eos_token_id={eos_token_id}); cannot locate the premise/hypothesis boundary. "
             "This happens with a single-string premise_hypothesis_template (one EOS per row) "
             "or if truncation removed the second segment entirely."
         )
     cumcount = is_eos.cumsum(dim=1)
     real = attention_mask.bool()
+    if bos_token_id is not None:
+        real = real & (input_ids != int(bos_token_id))
     segment1 = (cumcount == 0) & real
-    segment2 = (cumcount == 1) & ~is_eos & real
+    segment2 = (cumcount == int(separator_eos)) & ~is_eos & real
     return segment1, segment2
 
 
@@ -127,6 +141,9 @@ def segment_pooled(
     attention_mask: torch.Tensor,
     input_ids: torch.Tensor,
     eos_token_id: int,
+    *,
+    separator_eos: int = 1,
+    bos_token_id: int | None = None,
 ) -> torch.Tensor:
     """``[premise_mean ; hypothesis_mean ; global_mean]``, each via :func:`masked_mean`.
 
@@ -136,7 +153,9 @@ def segment_pooled(
     on this vector can always zero the first two blocks' coefficients and
     recover today's global-only behaviour.
     """
-    segment1, segment2 = segment_masks_from_eos(input_ids, attention_mask, eos_token_id)
+    segment1, segment2 = segment_masks_from_eos(
+        input_ids, attention_mask, eos_token_id, separator_eos=separator_eos, bos_token_id=bos_token_id
+    )
     return torch.cat(
         [masked_mean(hidden, segment1), masked_mean(hidden, segment2), masked_mean(hidden, attention_mask)],
         dim=-1,
@@ -239,4 +258,66 @@ class T5EncoderForSequenceClassification(T5PreTrainedModel):
             logits=logits,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+        )
+
+
+class RobertaEncoderForSequenceClassification(RobertaPreTrainedModel):
+    """RoBERTa's encoder plus a linear head on the masked-mean token feature.
+
+    The RoBERTa twin of :class:`T5EncoderForSequenceClassification`, with the same
+    surface for every text consumer: ``model(input_ids=..., attention_mask=...).logits``,
+    one final ``nn.Linear`` named ``classification_head.out_proj`` and
+    ``roberta.encoder.layer.N`` parameter names (already matched by
+    ``steer_text._BLOCK_PATTERNS``).
+
+    The feature is the masked mean of the last layer's output rather than the ``<s>``
+    state: it is the same kind of feature as the source's, it is what the global
+    Stage-2 modes see as ``activations["global"]``, and RoBERTa has no NSP objective,
+    so its pretrained ``<s>`` is not trained to summarise the sentence. No
+    ``RobertaClassificationHead.dense`` layer exists either, hence no random layer
+    between the representation and the readout.
+
+    ``base_model_prefix = "roberta"`` is what lets ``from_pretrained`` load a base
+    RoBERTa checkpoint (``roberta.*`` plus ``lm_head.*``) into this wrapper.
+    """
+
+    config_class = RobertaConfig
+    base_model_prefix = "roberta"
+    _keys_to_ignore_on_load_unexpected = [r"lm_head", r"pooler"]
+
+    def __init__(self, config: RobertaConfig) -> None:
+        super().__init__(config)
+        self.roberta = RobertaModel(config, add_pooling_layer=False)
+        self.classification_head = T5EncoderClassificationHead(config.hidden_size, config.num_labels)
+        self.post_init()
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.roberta.get_input_embeddings()
+
+    def set_input_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.roberta.set_input_embeddings(new_embeddings)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        return_dict: bool | None = None,
+        **kwargs: Any,
+    ) -> SequenceClassifierOutput:
+        del return_dict, kwargs  # accepted for call-site compatibility, unused
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds)
+        pooled = masked_mean(outputs.last_hidden_state, attention_mask)
+        logits = self.classification_head(pooled)
+
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits, labels.view(-1).long())
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
         )

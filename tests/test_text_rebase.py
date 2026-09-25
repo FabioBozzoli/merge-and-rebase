@@ -1525,3 +1525,217 @@ def test_train_linear_probe_head_feature_cache_matches_recomputing() -> None:
     assert set(cached) == set(recomputed)
     for name, tensor in cached.items():
         torch.testing.assert_close(tensor, recomputed[name], rtol=1e-5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# RoBERTa as the *target* (T5 source): model kind, attention path, segments, cache reuse
+# ---------------------------------------------------------------------------
+
+RB_BOS, RB_PAD, RB_EOS = 0, 1, 2
+
+
+def _tiny_roberta_encoder(hidden: int = 48, num_layers: int = 2, seed: int = 0):
+    from transformers import RobertaConfig
+
+    from merge_and_rebase.rebase.text.encoder_classifier import RobertaEncoderForSequenceClassification
+
+    torch.manual_seed(seed)
+    config = RobertaConfig(
+        vocab_size=VOCAB, hidden_size=hidden, num_hidden_layers=num_layers, num_attention_heads=2,
+        intermediate_size=2 * hidden, max_position_embeddings=40, pad_token_id=RB_PAD, bos_token_id=RB_BOS,
+        eos_token_id=RB_EOS, num_labels=NUM_LABELS, hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0,
+    )
+    return RobertaEncoderForSequenceClassification(config).eval()
+
+
+class _RobertaPairDataset(Dataset):
+    """``<s> premise </s></s> hypothesis </s>`` rows, the same examples/labels as ``_PairDictDataset``."""
+
+    def __init__(self, n: int, premise_len: int = 3, hyp_len: int = 2, seed: int = 0, classes: int = 2,
+                 label_shift: int = 0) -> None:
+        g = torch.Generator().manual_seed(seed + 100)
+        col = lambda v: torch.full((n, 1), v, dtype=torch.long)  # noqa: E731
+        premise = torch.randint(3, VOCAB, (n, premise_len), generator=g)
+        hypothesis = torch.randint(3, VOCAB, (n, hyp_len), generator=g)
+        self.input_ids = torch.cat([col(RB_BOS), premise, col(RB_EOS), col(RB_EOS), hypothesis, col(RB_EOS)], dim=1)
+        self.attention_mask = torch.ones_like(self.input_ids)
+        self.local = (torch.arange(n) + label_shift) % classes
+        self.head_class_ids = [0, 2] if classes == 2 else list(range(classes))
+        self.labels = torch.tensor([self.head_class_ids[int(y)] for y in self.local])
+
+    def __len__(self) -> int:
+        return self.input_ids.shape[0]
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {"input_ids": self.input_ids[idx], "attention_mask": self.attention_mask[idx], "labels": self.labels[idx]}
+
+
+def _roberta_pair_loaders(n: int = 16, seed: int = 0, label_shift: int = 0) -> SimpleNamespace:
+    train, test = _RobertaPairDataset(n, seed=seed, label_shift=label_shift), _RobertaPairDataset(n, seed=seed + 1, label_shift=label_shift)
+    return SimpleNamespace(
+        train=_loader(train), test=_loader(test),
+        local_labels={"train": train.local.tolist(), "test": test.local.tolist()},
+        mask_class=sorted(set(train.head_class_ids)),
+    )
+
+
+def _steer_prepare_roberta(tmp_path, *, target_loaders=None, target_tag="tgt_rob", **overrides):
+    """T5-encoder source (own tokenization) -> tiny RoBERTa target (its own tokenization)."""
+    source_pre = _tiny_t5_encoder(d_model=32, seed=0)
+    source_ft = _tiny_t5_encoder(d_model=32, seed=1)
+    target = _tiny_roberta_encoder(hidden=48, seed=2)
+    params = {
+        "feature_regime": "linear", "stage_2_strategy": "block_ridge", "few_shot": 4,
+        "feature_cache_dir": str(tmp_path / "cache"), "seed": 0, "verbose": False,
+    }
+    params.update(overrides)
+    prepared = get_method("steer_text").prepare(
+        llm_source=SimpleNamespace(model=source_ft),
+        llm_source_pretrained=SimpleNamespace(model=source_pre),
+        llm_target=SimpleNamespace(model=target),
+        source_loaders=_pair_text_loaders(),
+        target_loaders=target_loaders if target_loaders is not None else _roberta_pair_loaders(),
+        task="rte", mask_class=[0, 2], device="cpu", source_tag="src_enc", target_tag=target_tag, **params,
+    )
+    return prepared, target
+
+
+def test_roberta_attention_source_reads_the_input_of_attention_output_dense() -> None:
+    from merge_and_rebase.rebase.text.encoder_classifier import masked_mean
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture, block_modules
+
+    model = _tiny_roberta_encoder(seed=0)
+    batch = _collate([_RobertaPairDataset(4)[i] for i in range(4)])
+    raw: dict[int, torch.Tensor] = {}
+    projections = [b.get_submodule("attention.output.dense") for b in block_modules(model)]
+    hooks = [o.register_forward_pre_hook(lambda _m, inp, b=b: raw.__setitem__(b, inp[0])) for b, o in enumerate(projections)]
+    with torch.no_grad(), _TextBlockCapture(model, source="attention") as capture:
+        capture.attention_mask = batch["attention_mask"]
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    for h in hooks:
+        h.remove()
+    assert set(capture.activations) == set(raw) == set(range(len(projections)))
+    for b, h in raw.items():
+        assert torch.allclose(capture.activations[b], masked_mean(h, batch["attention_mask"]), atol=1e-6)
+
+
+def test_roberta_segment_pooling_uses_the_roberta_layout() -> None:
+    from merge_and_rebase.rebase.text.encoder_classifier import segment_pooled
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture, block_modules
+
+    model = _tiny_roberta_encoder(seed=0)
+    batch = _collate([_RobertaPairDataset(4)[i] for i in range(4)])
+    raw: dict[int, torch.Tensor] = {}
+    hooks = [
+        m.register_forward_hook(lambda _m, _i, out, b=b: raw.__setitem__(b, out[0] if isinstance(out, tuple) else out))
+        for b, m in enumerate(block_modules(model))
+    ]
+    with torch.no_grad(), _TextBlockCapture(model, segment_pooling=True) as capture:
+        capture.attention_mask, capture.input_ids = batch["attention_mask"], batch["input_ids"]
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    for h in hooks:
+        h.remove()
+    assert (capture.separator_eos, capture.bos_token_id, capture.eos_token_id) == (2, RB_BOS, RB_EOS)
+    for b, h in raw.items():
+        expected = segment_pooled(h, batch["attention_mask"], batch["input_ids"], RB_EOS, separator_eos=2, bos_token_id=RB_BOS)
+        assert torch.allclose(capture.activations[b], expected, atol=1e-6)
+        assert capture.activations[b].shape[-1] == 3 * h.shape[-1]
+
+
+def test_segment_pooling_refuses_an_unknown_pair_layout() -> None:
+    from transformers import BertConfig, BertModel
+
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    bert = BertModel(BertConfig(vocab_size=VOCAB, hidden_size=16, num_hidden_layers=1, num_attention_heads=2,
+                                intermediate_size=32, eos_token_id=2))
+    with pytest.raises(ValueError, match="pair-encoding layout"):
+        _TextBlockCapture(bert, segment_pooling=True)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"block_source": "attention", "target_block_pooling": "segments"},
+        {"block_source": "attention"},
+        {"block_source": "residual"},
+        {"block_source": "residual", "target_block_pooling": "segments"},
+        {"stage_2_strategy": "global_ridge"},
+        {"stage_2_strategy": "global_mlp", "mlp_epochs": 3},
+    ],
+    ids=["attn+segments", "attn+global", "residual+global", "residual+segments", "global_ridge", "global_mlp"],
+)
+def test_steer_text_runs_on_a_roberta_target(tmp_path, overrides) -> None:
+    prepared, target = _steer_prepare_roberta(tmp_path, block_ridge_lambda_scaling="trace" if overrides.get("stage_2_strategy", "block_ridge") == "block_ridge" else "none", ridge_lambda=0.1, **overrides)
+    assert all(v == v for v in prepared["diagnostics"].values())
+    batch = _collate([_RobertaPairDataset(4)[i] for i in range(4)])
+    kw = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        baseline = target(**kw).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kw).logits
+    assert torch.isfinite(corrected).all() and not torch.allclose(corrected, baseline)
+
+
+def test_roberta_attention_segments_live_matches_the_fit(tmp_path) -> None:
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    prepared, target = _steer_prepare_roberta(
+        tmp_path, block_source="attention", target_block_pooling="segments", block_ridge_lambda_scaling="trace",
+        ridge_lambda=0.1, block_ridge_mode="smoothed_residual", rho=0.9,
+    )
+    _, head = text_rebase_head(target)
+    batch = _collate([_RobertaPairDataset(4)[i] for i in range(4)])
+    kw = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, source="attention", segment_pooling=True) as capture:
+            capture.attention_mask, capture.input_ids = batch["attention_mask"], batch["input_ids"]
+            pooled = target(**kw).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kw).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kw).logits
+    expected = baseline + prepared["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
+
+
+def test_reuse_source_features_takes_the_source_side_from_another_targets_cache(tmp_path, monkeypatch) -> None:
+    """The A side (jvp per block) is target-independent: a RoBERTa run reuses a T5 target's copy of it
+    and computes only B's side."""
+    from merge_and_rebase.rebase.text import steer_text as st
+
+    _steer_prepare_encoder(tmp_path)  # fills src_enc_to_tgt_enc/rte/linear with the full split (T5 target)
+    old = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / "linear"
+    new = tmp_path / "cache" / "src_enc_to_tgt_rob" / "rte" / "linear"
+
+    def _boom(**_kwargs):
+        raise AssertionError("the source-side jvp pass must not run when the source side is reused")
+
+    monkeypatch.setattr(st, "_collect_linear_split", _boom)
+    prepared, _ = _steer_prepare_roberta(tmp_path, reuse_source_features_from="tgt_enc")
+
+    for split in ("train", "test"):
+        for name in ("features_A", "delta_A", "delta_A_blocks", "y_A"):
+            assert torch.equal(torch.load(old / split / f"{name}.pt"), torch.load(new / split / f"{name}.pt")), name
+        blocks = torch.load(new / split / "features_B_blocks.pt")
+        assert len(blocks) == 3 and all(v.shape[-1] == 48 for v in blocks.values())  # 2 layers + output, RoBERTa width
+    assert 0.0 <= prepared["diagnostics"]["stage2_test_acc"] <= 1.0
+
+    # The new pair is self-sufficient afterwards: a second run needs neither the old cache nor the option.
+    again, _ = _steer_prepare_roberta(tmp_path)
+    assert again["diagnostics"] == prepared["diagnostics"]
+
+
+def test_reuse_source_features_guards(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="not found"):
+        _steer_prepare_roberta(tmp_path, reuse_source_features_from="no_such_target")
+    with pytest.raises(ValueError, match="own target tag"):
+        _steer_prepare_roberta(tmp_path, reuse_source_features_from="tgt_rob")
+
+    _steer_prepare_encoder(tmp_path)
+    with pytest.raises(ValueError, match="do not line up"):
+        _steer_prepare_roberta(
+            tmp_path, reuse_source_features_from="tgt_enc", target_tag="tgt_rob_shifted",
+            target_loaders=_roberta_pair_loaders(label_shift=1),
+        )

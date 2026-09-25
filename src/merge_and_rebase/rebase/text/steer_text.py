@@ -278,8 +278,8 @@ BLOCK_POOLINGS: tuple[str, ...] = ("mean", "unitnorm", "rmsnorm")
 BLOCK_SOURCES: tuple[str, ...] = ("residual", "attention")
 
 # Path, inside one block, of the self-attention output projection whose *input* is the
-# attention output: T5Block, then Llama/Qwen decoder layers.
-_ATTENTION_OUT_PATHS: tuple[str, ...] = ("layer.0.SelfAttention.o", "self_attn.o_proj")
+# attention output: T5Block, then Llama/Qwen decoder layers, then BERT/RoBERTa's RobertaSelfOutput.dense.
+_ATTENTION_OUT_PATHS: tuple[str, ...] = ("layer.0.SelfAttention.o", "self_attn.o_proj", "attention.output.dense")
 
 
 def block_attention_out_projections(model: nn.Module) -> list[nn.Module]:
@@ -298,6 +298,17 @@ def block_attention_out_projections(model: nn.Module) -> list[nn.Module]:
                 f"{type(block).__name__}; block_source='attention' does not support this architecture yet."
             )
     return found
+
+
+# Pair-encoding layout per model family: (EOS tokens between the two sentences, whether a leading
+# <s> is excluded from the premise segment). T5: `p </s> h </s>`; RoBERTa: `<s> p </s></s> h </s>`.
+_SEGMENT_LAYOUT_BY_MODEL_TYPE: dict[str, tuple[int, bool]] = {
+    "t5": (1, False),
+    "mt5": (1, False),
+    "umt5": (1, False),
+    "longt5": (1, False),
+    "roberta": (2, True),
+}
 
 
 class _TextBlockCapture:
@@ -349,11 +360,24 @@ class _TextBlockCapture:
         self.norms = block_final_norms(model) if pooling == "rmsnorm" else None
         self.segment_pooling = segment_pooling
         self.eos_token_id: int | None = None
+        self.separator_eos = 1
+        self.bos_token_id: int | None = None
         if segment_pooling:
             eos_token_id = getattr(model.config, "eos_token_id", None)
             if eos_token_id is None:
                 raise ValueError("segment_pooling requires model.config.eos_token_id to be set.")
             self.eos_token_id = int(eos_token_id)
+            model_type = str(getattr(model.config, "model_type", "")).lower()
+            if model_type not in _SEGMENT_LAYOUT_BY_MODEL_TYPE:
+                raise ValueError(
+                    f"segment_pooling does not know the pair-encoding layout of model_type='{model_type}' "
+                    f"(known: {sorted(_SEGMENT_LAYOUT_BY_MODEL_TYPE)}); refusing to guess where the "
+                    "premise/hypothesis boundary is."
+                )
+            self.separator_eos, uses_bos = _SEGMENT_LAYOUT_BY_MODEL_TYPE[model_type]
+            if uses_bos:
+                bos_token_id = getattr(model.config, "bos_token_id", None)
+                self.bos_token_id = None if bos_token_id is None else int(bos_token_id)
         self.activations: dict[int, torch.Tensor] = {}
         self.attention_mask: torch.Tensor | None = None
         self.input_ids: torch.Tensor | None = None
@@ -361,7 +385,10 @@ class _TextBlockCapture:
 
     def _pool(self, block_id: int, out: torch.Tensor) -> torch.Tensor:
         if out.ndim == 3 and self.segment_pooling:
-            return segment_pooled(out, self.attention_mask, self.input_ids, self.eos_token_id)
+            return segment_pooled(
+                out, self.attention_mask, self.input_ids, self.eos_token_id,
+                separator_eos=self.separator_eos, bos_token_id=self.bos_token_id,
+            )
         if out.ndim == 3 and self.pooling == "unitnorm":
             out = out / out.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         elif out.ndim == 3 and self.pooling == "rmsnorm":
@@ -444,6 +471,69 @@ def _collect_standard_split(
         "features_B": torch.cat(features_b, dim=0),
         "y_A": torch.cat(labels, dim=0),
     }
+
+
+def _target_batch_features(
+    target: nn.Module, batch_b: Mapping[str, torch.Tensor], device: torch.device, target_block_pooling: str,
+    num_target_residual: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """B's pooled output feature and per-residual-block features for one batch (on the CPU).
+
+    Assumes the target's head is already ``nn.Identity`` (see :func:`_head_as_identity`). The blocks are
+    segment-pooled iff ``target_block_pooling == "segments"``; the output feature never is.
+    """
+    segments = target_block_pooling == "segments"
+    with _TextBlockCapture(target, segment_pooling=segments) as capture:
+        capture.attention_mask = batch_b.get("attention_mask")
+        if segments:
+            capture.input_ids = batch_b["input_ids"]
+        with torch.no_grad():
+            out_b = _pooled_features(target, batch_b, device)
+    return out_b.detach().cpu(), [capture.activations[b].cpu() for b in range(num_target_residual)]
+
+
+@torch.no_grad()
+def _collect_target_side(
+    *, target: nn.Module, target_loader: Any, device: torch.device, target_block_pooling: str = "global",
+    need_blocks: bool = True,
+) -> dict[str, Any]:
+    """Only B's half of a split (``features_B``, ``features_B_blocks``) plus its labels ``y_B``.
+
+    Same per-batch code as ``_collect_linear_split``'s B side, so the tensors are identical to the ones
+    that function would have cached; it exists so a new target can reuse the (target-independent, and
+    expensive: one jvp per source block per batch) A side of an existing cache.
+    """
+    num_target_residual = num_residual_blocks(target)
+    features_b: list[torch.Tensor] = []
+    labels: list[torch.Tensor] = []
+    blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_residual + 1)}
+    with _head_as_identity(target):
+        for batch_b in target_loader:
+            if need_blocks:
+                out_b, block_feats = _target_batch_features(target, batch_b, device, target_block_pooling, num_target_residual)
+                for b in range(num_target_residual):
+                    blocks[b].append(block_feats[b])
+                blocks[num_target_residual].append(out_b)
+            else:
+                out_b = _pooled_features(target, batch_b, device).detach().cpu()
+            features_b.append(out_b)
+            labels.append(batch_b["labels"].cpu())
+    out: dict[str, Any] = {"features_B": torch.cat(features_b, dim=0), "y_B": torch.cat(labels, dim=0)}
+    if need_blocks:
+        out["features_B_blocks"] = {b: torch.cat(chunks, dim=0) for b, chunks in blocks.items()}
+    return out
+
+
+def _load_source_side(cache_dir: Path, *, need_blocks: bool) -> dict[str, torch.Tensor]:
+    """A's half of a cached split (``features_A``, ``delta_A``, ``y_A``, and ``delta_A_blocks`` if needed)."""
+    names = ["features_A", "delta_A", "y_A"] + (["delta_A_blocks"] if need_blocks else [])
+    missing = [n for n in names if not (cache_dir / f"{n}.pt").exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"steer_text reuse_source_features_from: {missing} not found in {cache_dir}. The source-side "
+            "features must already be cached for that target (same source, task, regime, split)."
+        )
+    return {n: torch.load(cache_dir / f"{n}.pt", map_location="cpu", weights_only=True) for n in names}
 
 
 def _collect_linear_split(
@@ -530,16 +620,11 @@ def _collect_linear_split(
             delta_a_blocks.append(block_residuals)
             labels.append(batch_a["labels"].cpu())
 
-            with _TextBlockCapture(target, segment_pooling=(target_block_pooling == "segments")) as capture:
-                capture.attention_mask = batch_b.get("attention_mask")
-                if target_block_pooling == "segments":
-                    capture.input_ids = batch_b["input_ids"]
-                with torch.no_grad():
-                    out_b = _pooled_features(target, batch_b, device)
+            out_b, block_feats = _target_batch_features(target, batch_b, device, target_block_pooling, num_target_residual)
             for b in range(num_target_residual):
-                features_b_blocks[b].append(capture.activations[b].cpu())
-            features_b_blocks[num_target_residual].append(out_b.detach().cpu())
-            features_b.append(out_b.detach().cpu())
+                features_b_blocks[b].append(block_feats[b])
+            features_b_blocks[num_target_residual].append(out_b)
+            features_b.append(out_b)
 
     return {
         "features_A": torch.cat(features_a, dim=0),
@@ -717,6 +802,7 @@ class SteerTextRebase:
         block_source: str = "residual",
         block_feature_preprocessing: str = "none",
         target_block_pooling: str = "global",
+        reuse_source_features_from: str | None = None,
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -778,6 +864,14 @@ class SteerTextRebase:
                 )
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
+        if reuse_source_features_from is not None:
+            if not str(reuse_source_features_from).strip():
+                raise ValueError("steer_text reuse_source_features_from must be a non-empty target tag")
+            if str(reuse_source_features_from) == str(target_tag):
+                raise ValueError(
+                    "steer_text reuse_source_features_from names this run's own target tag; it must point at "
+                    "a different, already-cached target with the same source."
+                )
 
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         log_prefix = "[steer_text]"
@@ -831,6 +925,31 @@ class SteerTextRebase:
         def _compute(split: str) -> dict[str, Any]:
             source_loader = getattr(source_loaders, split)
             target_loader = getattr(target_loaders, split)
+            if reuse_source_features_from is not None:
+                # A's half (features_A, delta_A[_blocks], y_A) does not depend on the target, and is the
+                # expensive part; take it from an existing cache and compute only B's half.
+                reuse_dir = _cache_split_dir(
+                    feature_cache_dir, source_tag, str(reuse_source_features_from), task, feature_regime, split
+                )
+                source_side = _load_source_side(reuse_dir, need_blocks=need_blocks and feature_regime == "linear")
+                target_side = _collect_target_side(
+                    target=target_model, target_loader=target_loader, device=dev,
+                    target_block_pooling=(target_block_pooling if block_source == "residual" else "global"),
+                    need_blocks=need_blocks and feature_regime == "linear",
+                )
+                if source_side["y_A"].shape != target_side["y_B"].shape or not torch.equal(
+                    source_side["y_A"].long(), target_side["y_B"].long()
+                ):
+                    raise ValueError(
+                        f"steer_text reuse_source_features_from: the labels of the cached source side in {reuse_dir} "
+                        f"do not line up with this run's '{split}' loader ({tuple(source_side['y_A'].shape)} vs "
+                        f"{tuple(target_side['y_B'].shape)} rows, or different labels). The two runs must use the same "
+                        "examples, order, max_train_samples/max_samples_per_task and head_class_ids."
+                    )
+                target_side.pop("y_B")
+                if verbose:
+                    print(f"{log_prefix} reusing source-side features of '{split}' from {reuse_dir}")
+                return {**source_side, **target_side}
             if feature_regime == "standard":
                 return _collect_standard_split(
                     source_finetuned=source_model,
