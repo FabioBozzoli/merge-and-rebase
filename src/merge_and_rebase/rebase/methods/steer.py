@@ -130,6 +130,29 @@ def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------------
 
 
+def _energy_truncated_pinv(matrix: torch.Tensor, energy_threshold: float) -> tuple[torch.Tensor, int, int]:
+    """
+    Pseudo-inverse keeping only the leading singular values that carry ``energy_threshold`` of their sum.
+
+    With singular values s_1 >= ... >= s_r (numerically zero ones dropped with ``torch.linalg.pinv``'s
+    default tolerance), keeps the smallest k with sum_{i<=k} s_i / sum_i s_i >= energy_threshold, so the
+    retained rank adapts to the spectrum: all of it when every direction matters, fewer when the tail is
+    negligible. ``energy_threshold=1.0`` reproduces ``torch.linalg.pinv``. Returns (pinv, k, r).
+    """
+    if not 0.0 < energy_threshold <= 1.0:
+        raise ValueError(f"steer stage1 energy threshold must be in (0, 1], got {energy_threshold}")
+    u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+    tolerance = max(matrix.shape) * torch.finfo(s.dtype).eps * (float(s[0]) if s.numel() else 0.0)
+    rank = int((s > tolerance).sum())
+    if rank == 0:
+        raise ValueError("steer stage1: the support-set delta matrix has no non-zero singular value.")
+    kept = s[:rank]
+    cumulative = torch.cumsum(kept, dim=0) / kept.sum()
+    k = min(int((cumulative < energy_threshold).sum()) + 1, rank)
+    pinv = vh[:k].T @ torch.diag(1.0 / s[:k]) @ u[:, :k].T
+    return pinv, k, rank
+
+
 def _stage1_projection(
     *,
     f_a: torch.Tensor,
@@ -139,13 +162,20 @@ def _stage1_projection(
     w_b: torch.Tensor,
     selected: torch.Tensor,
     regularization: float,
-) -> torch.Tensor:
-    """Fit the logit correction map with a penalty on the transported residual."""
+    energy_threshold: float = 0.99,
+) -> tuple[torch.Tensor, int, int]:
+    """
+    Fit the logit correction map with a penalty on the transported residual.
+
+    The support-set delta is inverted with ``_energy_truncated_pinv``; returns the map plus the kept and
+    full rank of that inverse.
+    """
     if regularization <= 0:
         raise ValueError("steer stage1 regularization must be positive")
     residual = (f_a[selected] + delta_a[selected]) @ w_a.T - f_b[selected] @ w_b.T
-    logit_map = torch.linalg.pinv(delta_a[selected]) @ residual
-    return (logit_map / (1.0 + regularization)).T
+    pinv, kept_rank, rank = _energy_truncated_pinv(delta_a[selected], energy_threshold)
+    logit_map = pinv @ residual
+    return (logit_map / (1.0 + regularization)).T, kept_rank, rank
 
 
 def _stage1_target_corrections(
@@ -158,10 +188,18 @@ def _stage1_target_corrections(
     delta_a_test: torch.Tensor,
     selected: torch.Tensor,
     regularization: float,
+    energy_threshold: float = 0.99,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return train and test target corrections in B's feature space."""
-    logit_map = _stage1_projection(
-        f_a=f_a, delta_a=delta_a, w_a=w_a, f_b=f_b, w_b=w_b, selected=selected, regularization=regularization
+    logit_map, _, _ = _stage1_projection(
+        f_a=f_a,
+        delta_a=delta_a,
+        w_a=w_a,
+        f_b=f_b,
+        w_b=w_b,
+        selected=selected,
+        regularization=regularization,
+        energy_threshold=energy_threshold,
     )
     p_b = torch.linalg.pinv(w_b)
     train_target = delta_a[selected] @ logit_map.T @ p_b.T
@@ -1221,6 +1259,7 @@ class SteerRebase:
         few_shot: int | None = None,
         total_support_examples: int | None = None,
         stage1_lambda: float = 1.0,
+        stage1_energy_threshold: float = 0.99,
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
@@ -1421,12 +1460,25 @@ class SteerRebase:
         else:
             selected = _random_sample(train_labels, int(total_support_examples), seed)
 
-        logit_map = _stage1_projection(f_a=f_a, delta_a=delta_a, w_a=w_a, f_b=f_b, w_b=w_b, selected=selected, regularization=stage1_lambda)
+        logit_map, stage1_kept_rank, stage1_rank = _stage1_projection(
+            f_a=f_a,
+            delta_a=delta_a,
+            w_a=w_a,
+            f_b=f_b,
+            w_b=w_b,
+            selected=selected,
+            regularization=stage1_lambda,
+            energy_threshold=stage1_energy_threshold,
+        )
         p_b = torch.linalg.pinv(w_b)
         train_target = delta_a[selected] @ logit_map.T @ p_b.T
         test_target = delta_a_test @ logit_map.T @ p_b.T
         stage1_test_acc = _accuracy(f_b_test + test_target, w_b, test_labels)
         if verbose:
+            print(
+                f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
+                f"(energy threshold {stage1_energy_threshold})"
+            )
             print(f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} (uses A's delta at test time; diagnostic only)")
 
         num_source_blocks = None
@@ -1603,6 +1655,9 @@ class SteerRebase:
                 "stage0_test_acc": stage0_test_acc,
                 "stage1_test_acc": stage1_test_acc,
                 "stage2_test_acc": stage2_test_acc,
+                "stage1_kept_rank": stage1_kept_rank,
+                "stage1_rank": stage1_rank,
+                "stage1_energy_threshold": stage1_energy_threshold,
             },
         }
 
