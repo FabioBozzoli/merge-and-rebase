@@ -468,6 +468,7 @@ class SteerTextRebase:
         few_shot: int | None = None,
         total_support_examples: int | None = None,
         stage1_lambda: float = 1.0,
+        stage1_energy_threshold: float = 0.99,
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
@@ -581,14 +582,25 @@ class SteerTextRebase:
         else:
             selected = _random_sample(local_labels, int(total_support_examples), int(seed))
 
-        logit_map = _stage1_projection(
-            f_a=f_a, delta_a=delta_a, w_a=w_a, f_b=f_b, w_b=w_b, selected=selected, regularization=stage1_lambda
+        logit_map, stage1_kept_rank, stage1_rank = _stage1_projection(
+            f_a=f_a,
+            delta_a=delta_a,
+            w_a=w_a,
+            f_b=f_b,
+            w_b=w_b,
+            selected=selected,
+            regularization=stage1_lambda,
+            energy_threshold=stage1_energy_threshold,
         )
         p_b = torch.linalg.pinv(w_b)
         train_target = delta_a[selected] @ logit_map.T @ p_b.T
         test_target = delta_a_test @ logit_map.T @ p_b.T
         stage1_test_acc = _accuracy(f_b_test + test_target, w_b, b_b, test_labels, mask_class=mask_class)
         if verbose:
+            print(
+                f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
+                f"(energy threshold {stage1_energy_threshold})"
+            )
             print(
                 f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} "
                 "(uses A's delta at test time; diagnostic only)"
@@ -720,6 +732,9 @@ class SteerTextRebase:
                 "stage0_test_acc": stage0_test_acc,
                 "stage1_test_acc": stage1_test_acc,
                 "stage2_test_acc": stage2_test_acc,
+                "stage1_kept_rank": stage1_kept_rank,
+                "stage1_rank": stage1_rank,
+                "stage1_energy_threshold": stage1_energy_threshold,
             },
         }
 
