@@ -723,10 +723,18 @@ def _get_block_module(visual: nn.Module, block_id: int) -> nn.Module:
     return visual.transformer.resblocks[block_id]
 
 
-def _pool_block_output(output: Any) -> torch.Tensor:
+# How 3D ViT token activations [B, L, D] are reduced to one vector per example:
+# "mean" averages all tokens (LinearizedModelV2's rule), "cls" keeps the class
+# token. OpenCLIP ViTs are batch-first with the class token prepended at index 0.
+# 4D conv maps are always GAP-pooled: in a ViT the only one is the patch
+# embedding (conv1), which runs before the class token is concatenated.
+_TOKEN_POOLINGS = frozenset({"mean", "cls"})
+
+
+def _pool_block_output(output: Any, token_pooling: str = "mean") -> torch.Tensor:
     out = output[0] if isinstance(output, (tuple, list)) else output
     if out.ndim == 3:
-        return out.mean(dim=1)
+        return out[:, 0] if token_pooling == "cls" else out.mean(dim=1)
     if out.ndim == 4:
         return out.mean(dim=(2, 3))
     return out
@@ -741,15 +749,16 @@ class _BlockActivationCapture:
     return value of ``encode_image``.
     """
 
-    def __init__(self, visual: nn.Module, block_ids: Sequence[int]) -> None:
+    def __init__(self, visual: nn.Module, block_ids: Sequence[int], token_pooling: str = "mean") -> None:
         self.visual = visual
         self.block_ids = list(block_ids)
+        self.token_pooling = token_pooling
         self.activations: dict[int, torch.Tensor] = {}
         self._handles: list[Any] = []
 
     def _make_hook(self, block_id: int) -> Callable[..., None]:
         def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
-            self.activations[block_id] = _pool_block_output(output).detach()
+            self.activations[block_id] = _pool_block_output(output, self.token_pooling).detach()
 
         return hook
 
@@ -777,11 +786,12 @@ class _AttentionActivationCapture:
     The surrounding transformer therefore receives the unchanged value.
     """
 
-    def __init__(self, visual: nn.Module, block_ids: Sequence[int]) -> None:
+    def __init__(self, visual: nn.Module, block_ids: Sequence[int], token_pooling: str = "mean") -> None:
         if _is_resnet_visual(visual):
             raise ValueError("steer attention granularity supports CLIP ViT visual encoders only.")
         self.visual = visual
         self.block_ids = list(block_ids)
+        self.token_pooling = token_pooling
         self.activations: dict[int, torch.Tensor] = {}
         self._handles: list[Any] = []
         self._patched_forwards: list[tuple[nn.MultiheadAttention, Callable[..., Any]]] = []
@@ -789,7 +799,7 @@ class _AttentionActivationCapture:
     def _make_pre_hook(self, block_id: int) -> Callable[..., None]:
         def hook(_module: nn.Module, inputs: Any) -> None:
             if inputs and torch.is_tensor(inputs[0]):
-                self.activations[block_id] = _pool_block_output(inputs[0]).detach()
+                self.activations[block_id] = _pool_block_output(inputs[0], self.token_pooling).detach()
 
         return hook
 
@@ -823,7 +833,7 @@ class _AttentionActivationCapture:
                 module.out_proj = original_out_proj
 
             raw = output[0] if isinstance(output, tuple) else output
-            self.activations[block_id] = _pool_block_output(raw).detach()
+            self.activations[block_id] = _pool_block_output(raw, self.token_pooling).detach()
             projected = F.linear(raw, original_out_proj.weight, original_out_proj.bias)
             if isinstance(output, tuple):
                 return (projected,) + output[1:]
@@ -860,21 +870,22 @@ class _AttentionActivationCapture:
 class _LinearActivationCapture:
     """Capture inputs/outputs at the sites returned by `_linear_activation_sites`."""
 
-    def __init__(self, visual: nn.Module, sites: Sequence[_LinearActivationSite]) -> None:
+    def __init__(self, visual: nn.Module, sites: Sequence[_LinearActivationSite], token_pooling: str = "mean") -> None:
         self.visual = visual
         self.sites = list(sites)
+        self.token_pooling = token_pooling
         self.activations: dict[int, torch.Tensor] = {}
         self._handles: list[Any] = []
 
     def _make_pre_hook(self, block_id: int) -> Callable[..., None]:
         def hook(_module: nn.Module, inputs: Any) -> None:
-            self.activations[block_id] = _pool_block_output(inputs).detach()
+            self.activations[block_id] = _pool_block_output(inputs, self.token_pooling).detach()
 
         return hook
 
     def _make_post_hook(self, block_id: int) -> Callable[..., None]:
         def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
-            self.activations[block_id] = _pool_block_output(output).detach()
+            self.activations[block_id] = _pool_block_output(output, self.token_pooling).detach()
 
         return hook
 
@@ -910,7 +921,7 @@ class _NoopActivationCapture:
 
 
 def _activation_capture_for_visual(
-    visual: nn.Module, block_granularity: str
+    visual: nn.Module, block_granularity: str, token_pooling: str = "mean"
 ) -> tuple[Any, tuple[int, ...], int]:
     """Build a target-side capture and identify sites filled by final output."""
     if block_granularity == "model":
@@ -918,13 +929,13 @@ def _activation_capture_for_visual(
     if block_granularity == "linear":
         sites = _linear_activation_sites(visual)
         final_ids = tuple(i for i, site in enumerate(sites) if site.hook == "final")
-        return _LinearActivationCapture(visual, sites), final_ids, len(sites)
+        return _LinearActivationCapture(visual, sites, token_pooling), final_ids, len(sites)
     if block_granularity in {"residual", "attention"}:
         num_residual = _num_residual_blocks(visual)
         capture = (
-            _BlockActivationCapture(visual, list(range(num_residual)))
+            _BlockActivationCapture(visual, list(range(num_residual)), token_pooling)
             if block_granularity == "residual"
-            else _AttentionActivationCapture(visual, list(range(num_residual)))
+            else _AttentionActivationCapture(visual, list(range(num_residual)), token_pooling)
         )
         return capture, (num_residual,), num_residual + 1
     raise ValueError(f"Unknown steer block granularity: {block_granularity}")
@@ -1034,6 +1045,95 @@ def _collect_standard_split(
     }
 
 
+@torch.no_grad()
+def _target_batch_activations(
+    target_visual: nn.Module,
+    x_b: torch.Tensor,
+    target_capture: Any,
+    final_ids: Sequence[int],
+    num_target_blocks: int,
+) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+    """B's normalized final feature and per-site activations for one batch."""
+    # Capture object instances can be reused across batches: their hook
+    # handles are removed on exit and each fired site overwrites its last
+    # activation.
+    with target_capture as capture:
+        out_b = _l2_normalize(target_visual(x_b)).detach()
+    blocks = _complete_captured_activations(
+        capture,
+        final_output=out_b,
+        final_ids=final_ids,
+        expected_blocks=num_target_blocks,
+    )
+    return out_b, blocks
+
+
+def _collect_target_blocks_split(
+    *,
+    target_visual: nn.Module,
+    target_loader: Any,
+    device: torch.device,
+    block_granularity: str,
+    token_pooling: str,
+) -> dict[str, torch.Tensor]:
+    """Target-side half of ``_collect_linear_split``: B's final feature and per-site activations.
+
+    Everything on A's side (features_A, delta_A, delta_A_blocks) and B's final
+    feature are independent of ``token_pooling``, so a non-default pooling can
+    reuse them from the mean-pooled cache and only recompute this part.
+    """
+    target_capture, final_ids, num_target_blocks = _activation_capture_for_visual(
+        target_visual, block_granularity, token_pooling
+    )
+    features_b: list[torch.Tensor] = []
+    features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_blocks)}
+    labels: list[torch.Tensor] = []
+    for x_b, y_b in _iter_batches(target_loader, device=device):
+        out_b, blocks = _target_batch_activations(target_visual, x_b, target_capture, final_ids, num_target_blocks)
+        for block_id in range(num_target_blocks):
+            features_b_blocks[block_id].append(blocks[block_id].cpu())
+        features_b.append(out_b.cpu())
+        labels.append(y_b.cpu())
+    return {
+        "features_B": torch.cat(features_b, dim=0),
+        "features_B_blocks": {b: torch.cat(chunks, dim=0) for b, chunks in features_b_blocks.items()},
+        "y": torch.cat(labels, dim=0),
+    }
+
+
+def _reuse_mean_pooled_split(
+    mean_cache_dir: Path,
+    target_part: Callable[[], dict[str, torch.Tensor]],
+    *,
+    verbose: bool,
+) -> dict[str, Any] | None:
+    """Combine pooling-invariant tensors from ``mean_cache_dir`` with freshly pooled B blocks.
+
+    Returns None (caller falls back to a full extraction) when the mean cache
+    is missing or does not describe the same examples/model: labels must match
+    exactly and B's recomputed final feature must match the cached one.
+    """
+    cached = _load_cached_split(mean_cache_dir, need_blocks=True)
+    if cached is None:
+        return None
+    fresh = target_part()
+    same_labels = torch.equal(fresh["y"].long(), cached["y_A"].long())
+    same_features = fresh["features_B"].shape == cached["features_B"].shape and torch.allclose(
+        fresh["features_B"].double(), cached["features_B"].double(), rtol=1e-3, atol=1e-4
+    )
+    if not (same_labels and same_features):
+        print(
+            f"[steer] WARNING: mean-pooled cache at {mean_cache_dir} does not match the current target "
+            f"(labels match={same_labels}, final features match={same_features}); extracting all features."
+        )
+        return None
+    if verbose:
+        print(f"[steer] reusing pooling-invariant features from {mean_cache_dir}; recomputed target blocks only")
+    reused = dict(cached)
+    reused["features_B_blocks"] = fresh["features_B_blocks"]
+    return reused
+
+
 def _collect_linear_split(
     *,
     source_pretrained_visual: nn.Module,
@@ -1043,6 +1143,7 @@ def _collect_linear_split(
     target_loader: Any,
     device: torch.device,
     block_granularity: str = "residual",
+    token_pooling: str = "mean",
 ) -> dict[str, torch.Tensor]:
     """
     Linear regime: Taylor-linearized delta_A via LinearizedModule (torch.func.jvp),
@@ -1056,7 +1157,7 @@ def _collect_linear_split(
     theta0 = dict(zip(linmod.param_names, linmod.theta0, strict=True))
 
     target_capture, target_final_ids, num_target_blocks = _activation_capture_for_visual(
-        target_visual, block_granularity
+        target_visual, block_granularity, token_pooling
     )
 
     features_a: list[torch.Tensor] = []
@@ -1101,17 +1202,8 @@ def _collect_linear_split(
         delta_a_blocks.append(block_residuals)
         labels.append(y_a.cpu())
 
-        # Capture object instances can be reused across batches: their hook
-        # handles are removed on exit and each fired site overwrites its last
-        # activation.
-        with target_capture as capture:
-            with torch.no_grad():
-                out_b = _l2_normalize(target_visual(x_b))
-        captured_blocks = _complete_captured_activations(
-            capture,
-            final_output=out_b.detach(),
-            final_ids=target_final_ids,
-            expected_blocks=num_target_blocks,
+        out_b, captured_blocks = _target_batch_activations(
+            target_visual, x_b, target_capture, target_final_ids, num_target_blocks
         )
         for block_id in range(num_target_blocks):
             features_b_blocks[block_id].append(captured_blocks[block_id].cpu())
@@ -1135,8 +1227,12 @@ def _cache_split_dir(
     regime: str,
     split: str,
     block_granularity: str = "residual",
+    token_pooling: str = "mean",
 ) -> Path:
     cache_regime = regime if block_granularity == "residual" else f"{regime}_{block_granularity}granularity"
+    # Mean pooling keeps the historical layout so existing caches stay valid.
+    if token_pooling != "mean":
+        cache_regime = f"{cache_regime}_{token_pooling}pool"
     return Path(feature_cache_dir) / f"{source_tag}_to_{target_tag}" / task / cache_regime / split
 
 
@@ -1190,6 +1286,7 @@ def _load_or_compute_split(
     compute_fn: Callable[[], dict[str, Any]],
     verbose: bool,
     block_granularity: str = "residual",
+    token_pooling: str = "mean",
 ) -> dict[str, Any]:
     cache_dir = _cache_split_dir(
         feature_cache_dir,
@@ -1199,6 +1296,7 @@ def _load_or_compute_split(
         feature_regime,
         split,
         block_granularity,
+        token_pooling,
     )
     if not force_recompute_features:
         cached = _load_cached_split(cache_dir, need_blocks=need_blocks)
@@ -1252,6 +1350,7 @@ class SteerRebase:
         stage_2_strategy: str = "global_ridge",
         block_granularity: str = "residual",
         block_group_strategy: str = "concat",
+        token_pooling: str = "mean",
         feature_cache_dir: str = "src/.cache/steer_features",
         force_recompute_features: bool = False,
         source_tag: str = "source",
@@ -1281,6 +1380,8 @@ class SteerRebase:
             raise ValueError(f"steer block_granularity must be one of: {sorted(_BLOCK_GRANULARITIES)}")
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
+        if token_pooling not in _TOKEN_POOLINGS:
+            raise ValueError(f"steer token_pooling must be one of: {sorted(_TOKEN_POOLINGS)}")
         if block_ridge_lambda_scaling not in {"none", "trace"}:
             raise ValueError("steer block_ridge_lambda_scaling must be 'none' or 'trace'")
         if (few_shot is None) == (total_support_examples is None):
@@ -1288,6 +1389,10 @@ class SteerRebase:
 
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         log_prefix = "[steer]"
+        need_blocks = stage_2_strategy == "block_ridge"
+        # Only block_ridge reads token-pooled activations; every other strategy
+        # shares the mean-pooled cache, whose tensors are identical for it.
+        cache_pooling = token_pooling if need_blocks else "mean"
 
         # steer4rebase's data.py loads head_A.pt/head_B.pt from the train split
         # directory (a dict with a "weight" key, or a raw tensor) rather than
@@ -1304,9 +1409,22 @@ class SteerRebase:
             feature_regime,
             "train",
             block_granularity,
+            cache_pooling,
         )
         cached_w_a = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_A.pt")
         cached_w_b = None if force_recompute_features else _load_cached_head(head_cache_dir / "head_B.pt")
+        if cache_pooling != "mean" and (cached_w_a is None or cached_w_b is None) and not force_recompute_features:
+            # Heads do not depend on pooling: keep fitting in the same basis as
+            # the mean-pooled run instead of silently switching to live heads.
+            mean_head_dir = _cache_split_dir(
+                feature_cache_dir, source_tag, target_tag, task, feature_regime, "train", block_granularity
+            )
+            cached_w_a = _load_cached_head(mean_head_dir / "head_A.pt")
+            cached_w_b = _load_cached_head(mean_head_dir / "head_B.pt")
+            if cached_w_a is not None and cached_w_b is not None:
+                head_cache_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(cached_w_a, head_cache_dir / "head_A.pt")
+                torch.save(cached_w_b, head_cache_dir / "head_B.pt")
 
         clf_source.build_zeroshot_text_features(classnames, source_build_cfg_task, cache_dir="src/.cache/zs_cache")
         clf_target.build_zeroshot_text_features(classnames, build_cfg_task, cache_dir="src/.cache/zs_cache")
@@ -1372,6 +1490,13 @@ class SteerRebase:
         source_finetuned_visual = clf_source.model.visual.to(dev).eval()
         source_pretrained_visual = clf_source_pretrained.model.visual.to(dev).eval()
         target_visual = clf_target.model.visual.to(dev).eval()
+        if token_pooling == "cls":
+            if _is_resnet_visual(target_visual):
+                raise ValueError("steer token_pooling='cls' requires a CLIP ViT target; ResNets have no class token.")
+            if stage_2_strategy != "block_ridge" and verbose:
+                # The final encode_image feature is already the projected class
+                # token, so only block_ridge's intermediate activations change.
+                print(f"{log_prefix} token_pooling='cls' has no effect with stage_2_strategy='{stage_2_strategy}'.")
 
         # The whole method transports A's fine-tuning delta, so an A whose visual
         # weights equal the pretrained ones yields delta_A == 0 and silently
@@ -1390,9 +1515,7 @@ class SteerRebase:
                 "delta_A would be zero. The tuned checkpoint most likely failed to load into the source "
                 "model (mismatched keyspace)."
             )
-        need_blocks = stage_2_strategy == "block_ridge"
-
-        def _compute(split: str) -> dict[str, Any]:
+        def _compute(split: str, cache_split: str) -> dict[str, Any]:
             source_loader, target_loader = _aligned_loader_pair(
                 getattr(source_loaders, split),
                 getattr(target_loaders, split),
@@ -1407,6 +1530,22 @@ class SteerRebase:
                     target_loader=target_loader,
                     device=dev,
                 )
+            if cache_pooling != "mean" and not force_recompute_features:
+                reused = _reuse_mean_pooled_split(
+                    _cache_split_dir(
+                        feature_cache_dir, source_tag, target_tag, task, feature_regime, cache_split, block_granularity
+                    ),
+                    lambda: _collect_target_blocks_split(
+                        target_visual=target_visual,
+                        target_loader=target_loader,
+                        device=dev,
+                        block_granularity=block_granularity,
+                        token_pooling=token_pooling,
+                    ),
+                    verbose=verbose,
+                )
+                if reused is not None:
+                    return reused
             source_finetuned_params = {name: p.detach().to(dev) for name, p in source_finetuned_visual.named_parameters()}
             return _collect_linear_split(
                 source_pretrained_visual=source_pretrained_visual,
@@ -1416,22 +1555,25 @@ class SteerRebase:
                 target_loader=target_loader,
                 device=dev,
                 block_granularity=block_granularity,
+                token_pooling=token_pooling,
             )
 
         train_per_class = _TRAIN_FEATURES_PER_CLASS.get(task)
+        # Separate cache dir so a subsampled cache never masquerades as a full one.
+        train_split = "train" if train_per_class is None else f"train_{train_per_class}perclass"
         train_data = _load_or_compute_split(
             feature_cache_dir=feature_cache_dir,
             source_tag=source_tag,
             target_tag=target_tag,
             task=task,
             feature_regime=feature_regime,
-            # Separate cache dir so a subsampled cache never masquerades as a full one.
-            split="train" if train_per_class is None else f"train_{train_per_class}perclass",
+            split=train_split,
             force_recompute_features=force_recompute_features,
             need_blocks=need_blocks,
-            compute_fn=lambda: _compute("train"),
+            compute_fn=lambda: _compute("train", train_split),
             verbose=verbose,
             block_granularity=block_granularity,
+            token_pooling=cache_pooling,
         )
         test_data = _load_or_compute_split(
             feature_cache_dir=feature_cache_dir,
@@ -1442,9 +1584,10 @@ class SteerRebase:
             split="test",
             force_recompute_features=force_recompute_features,
             need_blocks=need_blocks,
-            compute_fn=lambda: _compute("test"),
+            compute_fn=lambda: _compute("test", "test"),
             verbose=verbose,
             block_granularity=block_granularity,
+            token_pooling=cache_pooling,
         )
 
         f_a = train_data["features_A"].double()
@@ -1647,6 +1790,7 @@ class SteerRebase:
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
             "block_granularity": block_granularity,
+            "token_pooling": token_pooling,
             "block_ridge_lambda_scaling": block_ridge_lambda_scaling,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
@@ -1700,11 +1844,12 @@ def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, al
     original_encode_image = clf_target.model.encode_image
     needs_blocks = prepared["stage_2_strategy"] == "block_ridge"
     block_granularity = str(prepared.get("block_granularity", "residual"))
+    token_pooling = str(prepared.get("token_pooling", "mean"))
 
     def patched_encode_image(images: torch.Tensor) -> torch.Tensor:
         if needs_blocks:
             capture_context, final_ids, expected_blocks = _activation_capture_for_visual(
-                visual, block_granularity
+                visual, block_granularity, token_pooling
             )
             with capture_context as capture:
                 out = original_encode_image(images)
