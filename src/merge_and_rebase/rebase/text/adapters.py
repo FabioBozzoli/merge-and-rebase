@@ -29,8 +29,9 @@ activation hooks assume every parameterized submodule captures a
 from __future__ import annotations
 
 import random
+import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -43,6 +44,68 @@ _HEAD_ROOTS: tuple[str, ...] = ("score", "classifier", "classification_head")
 
 # Parameter-name fragments that never belong in a transported task vector.
 _NEVER_TRANSPORT: tuple[str, ...] = ("position_ids", "num_batches_tracked", "rotary_emb.inv_freq")
+
+
+class _RenamedModulesView(nn.Module):
+    """A model whose ``named_modules`` reports the names ``rename`` gives them.
+
+    ``theseus`` keys its activation registry by module name and pairs A's and B's entries by that name.
+    Across two families (T5 -> RoBERTa) no name is shared, so nothing would be paired and every layer
+    would be transported with a zero delta. Viewing A through this class renames the modules that have a
+    counterpart in B and hides the others (``rename`` returning ``None``); the forward is A's, unchanged.
+    """
+
+    def __init__(self, model: nn.Module, rename: Callable[[str], str | None]) -> None:
+        super().__init__()
+        self.inner = model
+        self._rename = rename
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.inner(*args, **kwargs)
+
+    def named_modules(self, memo: Any = None, prefix: str = "", remove_duplicate: bool = True) -> Iterator[tuple[str, nn.Module]]:  # noqa: ARG002
+        yield "", self
+        for name, module in self.inner.named_modules():
+            renamed = self._rename(name) if name else None
+            if renamed is not None:
+                yield renamed, module
+
+
+# T5 encoder block -> RoBERTa encoder layer, matrix by matrix. Both base models have d_model 768, d_ff 3072,
+# 12 heads of 64, so the shapes agree exactly. T5's norms, relative-position bias and embeddings have no
+# counterpart with the same role (RMS norm vs LayerNorm, relative vs absolute positions) and are left out.
+_T5_TO_ROBERTA_MODULES: dict[str, str] = {
+    "layer.0.SelfAttention.q": "attention.self.query",
+    "layer.0.SelfAttention.k": "attention.self.key",
+    "layer.0.SelfAttention.v": "attention.self.value",
+    "layer.0.SelfAttention.o": "attention.output.dense",
+    "layer.1.DenseReluDense.wi": "intermediate.dense",
+    "layer.1.DenseReluDense.wo": "output.dense",
+}
+_T5_BLOCK_MODULE = re.compile(r"^(?:transformer\.)?encoder\.block\.(\d+)\.(.+)$")
+
+
+def t5_to_roberta_module_name(name: str) -> str | None:
+    """RoBERTa name (``roberta.encoder.layer.i.<...>``) of the T5 encoder module ``name``, or ``None``."""
+    match = _T5_BLOCK_MODULE.match(name)
+    if match is None or match.group(2) not in _T5_TO_ROBERTA_MODULES:
+        return None
+    return f"roberta.encoder.layer.{match.group(1)}.{_T5_TO_ROBERTA_MODULES[match.group(2)]}"
+
+
+def remap_t5_delta_to_roberta(delta: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """A T5 encoder task vector under RoBERTa parameter names; keys without a counterpart are dropped.
+
+    Only the six weight matrices of :data:`_T5_TO_ROBERTA_MODULES` survive (T5 has no biases, so RoBERTa's
+    get no delta).
+    """
+    out: dict[str, torch.Tensor] = {}
+    for key, value in delta.items():
+        module, _, param = key.rpartition(".")
+        renamed = t5_to_roberta_module_name(module)
+        if renamed is not None and param == "weight":
+            out[f"{renamed}.weight"] = value
+    return out
 
 
 class TextEncoderShim(nn.Module):
@@ -69,9 +132,13 @@ class TextEncoderShim(nn.Module):
     through the injected recipe, which calls ``model(input_ids=..., labels=...)``.
     """
 
-    def __init__(self, model: nn.Module, pad_token_id: int) -> None:
+    def __init__(
+        self, model: nn.Module, pad_token_id: int, module_rename: Callable[[str], str | None] | None = None
+    ) -> None:
         super().__init__()
-        self.visual = model
+        # module_rename presents the model's submodules under another architecture's names,
+        # so theseus's name-keyed activation registry lines up across two families.
+        self.visual = model if module_rename is None else _RenamedModulesView(model, module_rename)
         self.pad_token_id = int(pad_token_id)
 
     def encode_image(self, input_ids: torch.Tensor) -> torch.Tensor:

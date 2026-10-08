@@ -77,6 +77,8 @@ from ..rebase.text import (  # noqa: F401  -- import registers "steer_text"
     count_transformer_blocks,
     describe_key_coverage,
     feature_separability,
+    remap_t5_delta_to_roberta,
+    t5_to_roberta_module_name,
     head_linear,
     neutralize_intermediate_head_layers,
     steer_text_correction_context,
@@ -935,6 +937,16 @@ def main() -> None:
         source_tag = _model_tag(source_cfg)
         target_tag = _model_tag(target_cfg)
 
+        # theseus pairs A's and B's layers by module name; T5 and RoBERTa share none, so the T5 delta and
+        # A's activation hooks are renamed to RoBERTa's (rebase/text/adapters.py) instead of transporting nothing.
+        t5_to_roberta = (
+            shim_mode
+            and getattr(llm_source.model.config, "model_type", None) in {"t5", "mt5", "umt5", "longt5"}
+            and getattr(llm_target.model.config, "model_type", None) == "roberta"
+        )
+        if t5_to_roberta and not theseus_like_method:
+            raise ValueError(f"Method '{method_name}' has no T5 -> RoBERTa module mapping; only theseus does.")
+
         print(f"Source model (A): {source_cfg.model_name_or_path} ({source_cfg.model_arch})")
         print(f"Target model (B): {target_cfg.model_name_or_path} ({target_cfg.model_arch})")
 
@@ -1114,6 +1126,9 @@ def main() -> None:
                 task_delta = TaskVector.from_checkpoints(
                     source_base_sd, tuned_sd, strict=False, key_filter=delta_key_filter
                 ).delta
+                if t5_to_roberta:
+                    task_delta = remap_t5_delta_to_roberta(task_delta)
+                    print(f"  {task}: T5 delta remapped to RoBERTa names ({len(task_delta)} matrices)")
                 matched, total, unmatched = describe_key_coverage(task_delta, target_base_sd)
                 print(f"Loaded tuned checkpoint for '{task}' ({len(tuned_sd)} keys)")
                 if shim_mode:
@@ -1236,7 +1251,11 @@ def main() -> None:
                 target_model_for_method = deepcopy(llm_target.model)
                 load_into_model(source_model_for_method, source_base_sd, strict=False)
                 load_into_model(target_model_for_method, target_base_sd, strict=False)
-                source_shim = TextEncoderShim(source_model_for_method, llm_source.tokenizer.pad_token_id or 0)
+                source_shim = TextEncoderShim(
+                    source_model_for_method,
+                    llm_source.tokenizer.pad_token_id or 0,
+                    module_rename=t5_to_roberta_module_name if t5_to_roberta else None,
+                )
                 target_shim = TextEncoderShim(target_model_for_method, llm_target.tokenizer.pad_token_id or 0)
 
                 prepare_kwargs: dict[str, Any] = {

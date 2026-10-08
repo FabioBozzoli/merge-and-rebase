@@ -1,0 +1,36 @@
+{
+  "_description": "roberta-base linear probe, nearest-mean init, 200/class, seed 54, lr chosen on val.",
+  "suite": "nli6",
+  "tasks": [
+    "mnli",
+    "qnli",
+    "rte",
+    "scitail",
+    "snli",
+    "sick"
+  ],
+  "target_model_name_or_path": "FacebookAI/roberta-base",
+  "target_model_arch": "auto",
+  "model_kind": "encoder_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 54,
+  "linear_probe_shots_per_class": 200,
+  "linear_probe_support": "steer",
+  "linear_probe_init": "nearest_mean",
+  "linear_probe_epochs": 200,
+  "linear_probe_lr": [
+    0.0001,
+    0.0003,
+    0.001
+  ],
+  "linear_probe_dropout": false
+}

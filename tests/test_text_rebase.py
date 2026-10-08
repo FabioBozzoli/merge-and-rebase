@@ -1739,3 +1739,88 @@ def test_reuse_source_features_guards(tmp_path) -> None:
             tmp_path, reuse_source_features_from="tgt_enc", target_tag="tgt_rob_shifted",
             target_loaders=_roberta_pair_loaders(label_shift=1),
         )
+
+
+# --------------------------------------------------------------------------
+# theseus across families: T5 encoder -> RoBERTa
+# --------------------------------------------------------------------------
+
+
+def test_t5_to_roberta_module_names_cover_the_six_matrices_only() -> None:
+    from merge_and_rebase.rebase.text import t5_to_roberta_module_name as rename
+
+    p = "transformer.encoder.block.3.layer."
+    assert rename(p + "0.SelfAttention.q") == "roberta.encoder.layer.3.attention.self.query"
+    assert rename(p + "0.SelfAttention.k") == "roberta.encoder.layer.3.attention.self.key"
+    assert rename(p + "0.SelfAttention.v") == "roberta.encoder.layer.3.attention.self.value"
+    assert rename(p + "0.SelfAttention.o") == "roberta.encoder.layer.3.attention.output.dense"
+    assert rename(p + "1.DenseReluDense.wi") == "roberta.encoder.layer.3.intermediate.dense"
+    assert rename(p + "1.DenseReluDense.wo") == "roberta.encoder.layer.3.output.dense"
+    for other in (p + "0.layer_norm", p + "0.SelfAttention.relative_attention_bias", "transformer.shared",
+                  "transformer.encoder.final_layer_norm", "classification_head.dense", "transformer.encoder"):
+        assert rename(other) is None, other
+
+
+def test_t5_delta_remap_keeps_weights_of_the_six_matrices() -> None:
+    from merge_and_rebase.rebase.text import remap_t5_delta_to_roberta
+
+    source = _tiny_t5_encoder(d_model=32, num_layers=2, seed=0)
+    delta = {k: torch.ones_like(v) for k, v in source.state_dict().items()}
+    remapped = remap_t5_delta_to_roberta(delta)
+
+    assert len(remapped) == 2 * 6
+    target_names = set(_tiny_roberta_encoder(hidden=32, num_layers=2).state_dict())
+    assert set(remapped) <= target_names
+    assert all(k.endswith(".weight") for k in remapped)
+
+
+def test_renamed_view_reports_target_names_and_keeps_the_forward() -> None:
+    from merge_and_rebase.rebase.text import t5_to_roberta_module_name
+
+    model = _tiny_t5_encoder(d_model=32, num_layers=2, seed=0)
+    shim = TextEncoderShim(model, PAD, module_rename=t5_to_roberta_module_name)
+    names = [n for n, _ in shim.visual.named_modules() if n]
+
+    assert len(names) == 12 and all(n.startswith("roberta.encoder.layer.") for n in names)
+    batch = next(iter(_loader(_DictDataset(4, seed=0))))
+    plain = TextEncoderShim(model, PAD).encode_image(batch["input_ids"])
+    assert torch.allclose(shim.encode_image(batch["input_ids"]), plain)
+
+
+def test_theseus_transports_t5_deltas_into_roberta() -> None:
+    from merge_and_rebase.rebase.text import remap_t5_delta_to_roberta, t5_to_roberta_module_name
+
+    source_base, source_tuned = _tiny_t5_encoder(d_model=32, seed=0), _tiny_t5_encoder(d_model=32, seed=1)
+    target = _tiny_roberta_encoder(hidden=48, seed=2)
+    target_sd = {k: v.float() for k, v in target.state_dict().items()}
+    delta = remap_t5_delta_to_roberta(_delta_between(source_base, source_tuned))
+    method = get_method("theseus")
+    prepared = method.prepare(
+        source_model=TextEncoderShim(source_base, PAD, module_rename=t5_to_roberta_module_name),
+        target_model=TextEncoderShim(target, RB_PAD),
+        source_dataloader=alias_inputs_loader(_loader(_DictDataset(16, seed=0))),
+        target_dataloader=alias_inputs_loader(_loader(_RobertaPairDataset(16, seed=0))),
+        target_base=target_sd, delta=delta, device="cpu", seq_align="interpolate", patch_qkv=False,
+        verbose=False, show_progress=False,
+    )
+    out = method.transport(
+        source_base={k: v.float() for k, v in source_base.state_dict().items()},
+        target_base=target_sd, delta=delta, prepared=prepared, verbose=False, show_progress=False,
+    )
+
+    assert set(out) == set(delta) and len(out) == 2 * 6
+    for key, value in out.items():
+        assert value.shape == target_sd[key].shape, key
+        # a key theseus could not pair comes back as zeros with only a log line
+        assert value.any(), f"{key} was transported as all-zero"
+
+    # without the renaming nothing is paired: every layer is silently transported as zero
+    unpaired = method.prepare(
+        source_model=TextEncoderShim(source_base, PAD),
+        target_model=TextEncoderShim(target, RB_PAD),
+        source_dataloader=alias_inputs_loader(_loader(_DictDataset(16, seed=0))),
+        target_dataloader=alias_inputs_loader(_loader(_RobertaPairDataset(16, seed=0))),
+        target_base=target_sd, delta=delta, device="cpu", seq_align="interpolate", patch_qkv=False,
+        verbose=False, show_progress=False,
+    )
+    assert all(t.kind == "weight" and t.t_in is None for t in unpaired["transforms_by_key"].values())
