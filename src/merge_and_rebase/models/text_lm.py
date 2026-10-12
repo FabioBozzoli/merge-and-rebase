@@ -33,6 +33,9 @@ class TextBuildConfig:
     num_labels: int = 3
     trust_remote_code: bool = False
     use_fast_tokenizer: bool = True
+    # Head input of model_kind="encoder_classification": "global" (masked mean) or
+    # "segments" ([premise; hypothesis; global], 3x wider); see encoder_classifier.pool_features.
+    feature_pooling: str = "global"
 
 
 class TextLM(nn.Module):
@@ -101,6 +104,11 @@ class TextLM(nn.Module):
         is_encoder_decoder = bool(getattr(hf_cfg, "is_encoder_decoder", False))
 
         kind = str(cfg.model_kind).strip().lower()
+        if kind != "encoder_classification" and cfg.feature_pooling != "global":
+            raise ValueError(
+                f"feature_pooling={cfg.feature_pooling!r} is only supported with model_kind='encoder_classification' "
+                f"(got model_kind={kind!r})."
+            )
         common = {
             "pretrained_model_name_or_path": cfg.model_name_or_path,
             "trust_remote_code": bool(cfg.trust_remote_code),
@@ -144,10 +152,21 @@ class TextLM(nn.Module):
             # A Hub id and a local converted directory are the same call here:
             # from_pretrained accepts either, so converted checkpoints need no
             # separate code path.
-            model = wrapper_cls.from_pretrained(
-                **common,
-                num_labels=int(cfg.num_labels),
-            )
+            if cfg.feature_pooling == "global":
+                model = wrapper_cls.from_pretrained(
+                    **common,
+                    num_labels=int(cfg.num_labels),
+                )
+            else:
+                # from_pretrained only overrides config attributes that already exist and
+                # hands any other kwarg to __init__, so a new attribute goes in via config=.
+                model_cfg = AutoConfig.from_pretrained(
+                    cfg.model_name_or_path,
+                    trust_remote_code=bool(cfg.trust_remote_code),
+                    num_labels=int(cfg.num_labels),
+                )
+                model_cfg.feature_pooling = str(cfg.feature_pooling)
+                model = wrapper_cls.from_pretrained(**common, config=model_cfg)
         else:
             raise ValueError(
                 "model_kind must be one of: causal_lm, sequence_classification, encoder_classification"

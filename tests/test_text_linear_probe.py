@@ -210,3 +210,47 @@ def test_probe_on_roberta_trains_only_the_head() -> None:
 
     moved = {n for n, p in model.named_parameters() if not torch.equal(p, before[n])}
     assert moved == {"classification_head.out_proj.weight", "classification_head.out_proj.bias"}
+
+
+# --------------------------------------------------------------------------
+# feature_pooling="segments": the probe's head reads [premise; hypothesis; global]
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", ["t5", "roberta"])
+def test_probe_runs_on_a_segments_head_and_inits_it_from_3d_centroids(monkeypatch, family) -> None:
+    from test_text_rebase import _pair_text_loaders, _roberta_pair_loaders
+
+    from merge_and_rebase.rebase.text.adapters import head_linear
+    from merge_and_rebase.rebase.text.encoder_classifier import T5EncoderForSequenceClassification
+    from merge_and_rebase.rebase.text.encoder_classifier import RobertaEncoderForSequenceClassification
+
+    base = _tiny_t5_encoder(d_model=32, seed=0) if family == "t5" else _tiny_roberta_encoder(hidden=32, seed=0)
+    config = base.config
+    config.feature_pooling = "segments"
+    cls = T5EncoderForSequenceClassification if family == "t5" else RobertaEncoderForSequenceClassification
+    torch.manual_seed(0)
+    model = cls(config).eval()
+    loaders = _pair_text_loaders(n=24) if family == "t5" else _roberta_pair_loaders(n=24)
+    loaders.val = loaders.test
+
+    class _LLM:
+        def __init__(self) -> None:
+            self.model = model
+            self.tokenizer = None
+
+        def sequence_classification_accuracy(self, loader, *, device, mask_class):  # noqa: ARG002
+            return 0.5
+
+    monkeypatch.setattr(tlp, "_build_task_splits", lambda **_kwargs: {})
+    monkeypatch.setattr(tlp, "_tokenize_splits", lambda **_kwargs: loaders)
+    monkeypatch.setattr(tlp, "_resolve_eval_loader", lambda loaders_obj, split: loaders_obj.test)
+
+    row = tlp.probe_task(
+        llm=_LLM(), task="rte", cfg={"num_labels": 3, "batch_size": 4}, device="cpu",
+        seed=33, shots=2, epochs=2, lr=0.05, dropout=False, log_every=None,
+    )
+    assert row["support_size"] == 2 * len(set(loaders.local_labels["train"]))
+    _, head = head_linear(model)
+    assert head.in_features == 3 * 32
+    assert torch.isfinite(head.weight).all()

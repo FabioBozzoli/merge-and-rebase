@@ -493,3 +493,86 @@ def test_encoder_classification_registry_maps_model_types_to_wrappers() -> None:
     assert {registry[t] for t in ("t5", "mt5", "umt5", "longt5")} == {"T5EncoderForSequenceClassification"}
     assert registry["roberta"] == "RobertaEncoderForSequenceClassification"
     assert all(hasattr(encoder_classifier, name) for name in registry.values())
+
+
+# ---------------------------------------------------------------------------
+# feature_pooling="segments": the head reads [premise; hypothesis; global]
+# ---------------------------------------------------------------------------
+
+
+def _t5_pair_batch() -> tuple[torch.Tensor, torch.Tensor]:
+    """``p p p </s> h h </s> pad`` and ``p </s> h h h </s> pad pad`` (T5 eos=1, pad=0)."""
+    ids = torch.tensor([[5, 6, 7, 1, 8, 9, 1, 0], [5, 1, 6, 7, 8, 1, 0, 0]])
+    return ids, (ids != 0).long()
+
+
+@pytest.mark.parametrize("family", ["t5", "roberta"])
+def test_segments_head_reads_the_segment_pooled_last_hidden_state(family) -> None:
+    from merge_and_rebase.rebase.text.encoder_classifier import pool_features
+
+    if family == "t5":
+        config = _config()
+        config.feature_pooling = "segments"
+        torch.manual_seed(0)
+        model = T5EncoderForSequenceClassification(config).eval()
+        ids, mask = _t5_pair_batch()
+        expected_layout = {"separator_eos": 1, "bos_token_id": None, "eos": config.eos_token_id}
+    else:
+        config = _roberta_config()
+        config.feature_pooling = "segments"
+        torch.manual_seed(0)
+        model = RobertaEncoderForSequenceClassification(config).eval()
+        ids = torch.tensor([[_RB_BOS, 5, 6, _RB_EOS, _RB_EOS, 7, _RB_EOS, _RB_PAD]] * 2)
+        mask = (ids != _RB_PAD).long()
+        expected_layout = {"separator_eos": 2, "bos_token_id": _RB_BOS, "eos": _RB_EOS}
+
+    _, head = head_linear(model)
+    assert head.in_features == 3 * _D_MODEL
+
+    with torch.no_grad(), _head_as_identity(model):
+        feature = model(input_ids=ids, attention_mask=mask).logits
+    backbone = model.transformer if family == "t5" else model.roberta
+    with torch.no_grad():
+        hidden = backbone(input_ids=ids, attention_mask=mask).last_hidden_state
+    expected = segment_pooled(
+        hidden, mask, ids, expected_layout["eos"],
+        separator_eos=expected_layout["separator_eos"], bos_token_id=expected_layout["bos_token_id"],
+    )
+    assert feature.shape == (2, 3 * _D_MODEL)
+    assert torch.allclose(feature, expected, atol=1e-6)
+    assert torch.allclose(feature, pool_features(hidden, mask, ids, config, "segments"), atol=1e-6)
+    # The global third is exactly the default model's feature.
+    assert torch.allclose(feature[:, 2 * _D_MODEL :], masked_mean(hidden, mask), atol=1e-6)
+
+
+def test_feature_pooling_default_is_global_and_unknown_values_are_rejected() -> None:
+    assert _model().feature_pooling == "global"
+    _, head = head_linear(_model())
+    assert head.in_features == _D_MODEL
+
+    config = _config()
+    config.feature_pooling = "cls"
+    with pytest.raises(ValueError, match="feature_pooling"):
+        T5EncoderForSequenceClassification(config)
+
+
+def test_segments_head_needs_input_ids() -> None:
+    config = _config()
+    config.feature_pooling = "segments"
+    model = T5EncoderForSequenceClassification(config).eval()
+    ids, mask = _t5_pair_batch()
+    embeds = model.get_input_embeddings()(ids)
+    with pytest.raises(ValueError, match="input_ids"):
+        model(inputs_embeds=embeds, attention_mask=mask)
+
+
+def test_segments_feature_pooling_survives_save_and_reload(tmp_path) -> None:
+    config = _config()
+    config.feature_pooling = "segments"
+    model = T5EncoderForSequenceClassification(config).eval()
+    model.save_pretrained(tmp_path)
+    reloaded = T5EncoderForSequenceClassification.from_pretrained(tmp_path).eval()
+    assert reloaded.feature_pooling == "segments"
+    ids, mask = _t5_pair_batch()
+    with torch.no_grad():
+        assert torch.equal(model(input_ids=ids, attention_mask=mask).logits, reloaded(input_ids=ids, attention_mask=mask).logits)

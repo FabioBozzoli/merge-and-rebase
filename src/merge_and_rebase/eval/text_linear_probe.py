@@ -27,6 +27,11 @@ Two options make the control line up with a steer_text run it is compared agains
   the one the team's T5 configs use (1e-2), and on anisotropic encoders such as RoBERTa the
   result depends a lot on it.
 
+``feature_pooling`` (``"global"`` default | ``"segments"``, encoder_classification only) picks the
+head's input: the masked mean of the last layer, or ``[premise; hypothesis; global]`` means
+(3x wider head; see ``rebase/text/encoder_classifier.pool_features``). The nearest-mean init and
+the probe loop read whatever the head reads, so nothing else changes.
+
 Usage:
     python -m merge_and_rebase.eval.text_linear_probe \\
         --config configs/text_probe_t5large_nearest_mean.json
@@ -290,7 +295,8 @@ def main() -> None:
 
         model_kind = str(cfg.get("model_kind", "encoder_classification"))
         llm, build_cfg = _build_llm(cfg, role="target", model_kind=model_kind, device=device)
-        print(f"Model: {build_cfg.model_name_or_path} ({build_cfg.model_arch}, {model_kind})")
+        print(f"Model: {build_cfg.model_name_or_path} ({build_cfg.model_arch}, {model_kind}, "
+              f"feature_pooling={build_cfg.feature_pooling})")
         print(f"Probe: {shots}/class, {epochs} epochs, lr {lrs}, {support} support, nearest-mean init, dropout {'on' if dropout else 'off'}")
 
         rows = [
@@ -346,6 +352,7 @@ def main() -> None:
                 "linear_probe_support": support,
                 "linear_probe_init": init,
                 "linear_probe_dropout": dropout,
+                "feature_pooling": build_cfg.feature_pooling,
                 "per_task_support_size": {r["task"]: r["support_size"] for r in rows},
                 "per_task_val_accuracy": {r["task"]: r["probed_val_accuracy"] for r in rows},
                 "per_task_selected_lr": {r["task"]: r["selected_lr"] for r in rows},

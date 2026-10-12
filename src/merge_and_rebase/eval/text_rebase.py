@@ -562,6 +562,7 @@ def _build_llm(cfg: dict[str, Any], *, role: str, model_kind: str, device: str) 
         num_labels=int(cfg.get("num_labels", 3)),
         trust_remote_code=bool(cfg.get("trust_remote_code", False)),
         use_fast_tokenizer=bool(cfg.get("use_fast_tokenizer", True)),
+        feature_pooling=str(cfg.get(f"{role}_feature_pooling", cfg.get("feature_pooling", "global"))).strip().lower(),
     )
     return TextLM.build(build_cfg), build_cfg
 

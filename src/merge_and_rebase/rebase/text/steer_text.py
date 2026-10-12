@@ -63,6 +63,14 @@ other strategy rejects them rather than ignoring them):
 - ``block_feature_preprocessing`` (``"none"`` | ``"zscore"``): standardize every
   block with support-set statistics and fit an unpenalized intercept; folded into
   the coefficients and a bias vector, so evaluation needs no extra state.
+
+Stage-2 input of ``global_ridge`` / ``global_mlp`` (rejected by the block strategies):
+
+- ``global_input_pooling`` (``"global"`` | ``"segments"``): the regressor reads f_B, or
+  B's last hidden state pooled as ``[premise; hypothesis; global]`` (3D, see
+  ``_OutputSegmentCapture``). The prediction is still a D-dim correction added to f_B,
+  so the head and Stage 1 are unchanged. Collected from B alone and cached as
+  ``features_B_output_segpool.pt`` next to the split's other files.
 """
 
 from __future__ import annotations
@@ -94,7 +102,7 @@ from ..methods.steer import (
 )
 from ..registry import register
 from .adapters import head_linear
-from .encoder_classifier import masked_mean, segment_pooled
+from .encoder_classifier import masked_mean, pool_features, segment_layout, segment_pooled
 
 # Matched with ``search`` against ``name + "."`` and anchored on a preceding dot
 # or the string start, so a task-head wrapper's prefix does not hide the stack:
@@ -300,16 +308,6 @@ def block_attention_out_projections(model: nn.Module) -> list[nn.Module]:
     return found
 
 
-# Pair-encoding layout per model family: (EOS tokens between the two sentences, whether a leading
-# <s> is excluded from the premise segment). T5: `p </s> h </s>`; RoBERTa: `<s> p </s></s> h </s>`.
-_SEGMENT_LAYOUT_BY_MODEL_TYPE: dict[str, tuple[int, bool]] = {
-    "t5": (1, False),
-    "mt5": (1, False),
-    "umt5": (1, False),
-    "longt5": (1, False),
-    "roberta": (2, True),
-}
-
 
 class _TextBlockCapture:
     """Capture pooled per-block activations during a forward pass.
@@ -363,21 +361,7 @@ class _TextBlockCapture:
         self.separator_eos = 1
         self.bos_token_id: int | None = None
         if segment_pooling:
-            eos_token_id = getattr(model.config, "eos_token_id", None)
-            if eos_token_id is None:
-                raise ValueError("segment_pooling requires model.config.eos_token_id to be set.")
-            self.eos_token_id = int(eos_token_id)
-            model_type = str(getattr(model.config, "model_type", "")).lower()
-            if model_type not in _SEGMENT_LAYOUT_BY_MODEL_TYPE:
-                raise ValueError(
-                    f"segment_pooling does not know the pair-encoding layout of model_type='{model_type}' "
-                    f"(known: {sorted(_SEGMENT_LAYOUT_BY_MODEL_TYPE)}); refusing to guess where the "
-                    "premise/hypothesis boundary is."
-                )
-            self.separator_eos, uses_bos = _SEGMENT_LAYOUT_BY_MODEL_TYPE[model_type]
-            if uses_bos:
-                bos_token_id = getattr(model.config, "bos_token_id", None)
-                self.bos_token_id = None if bos_token_id is None else int(bos_token_id)
+            self.eos_token_id, self.separator_eos, self.bos_token_id = segment_layout(model.config)
         self.activations: dict[int, torch.Tensor] = {}
         self.attention_mask: torch.Tensor | None = None
         self.input_ids: torch.Tensor | None = None
@@ -712,6 +696,138 @@ def _load_or_compute_pooled_blocks(
     return blocks
 
 
+GLOBAL_INPUT_POOLINGS: tuple[str, ...] = ("global", "segments")
+_OUTPUT_SEGMENTS_CACHE_NAME = "features_B_output_segpool.pt"
+
+
+class _OutputSegmentCapture:
+    """Segment-pool B's last hidden state ``[premise; hypothesis; global]`` during a forward pass.
+
+    A forward hook on ``model.base_model`` (the encoder stack the classifier wrappers call
+    with ``input_ids=``/``attention_mask=`` keyword arguments) reads the tokens and the
+    ``last_hidden_state`` together, and pools them with
+    :func:`~merge_and_rebase.rebase.text.encoder_classifier.pool_features` -- the function
+    the wrappers themselves use, so the global third equals the head's pooled feature.
+    ``global_input_pooling="segments"`` feeds this ``[B, 3D]`` vector to the global
+    Stage-2 regressors; the head still reads the plain ``[B, D]`` feature.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        self.backbone = model.base_model
+        if self.backbone is model:
+            raise ValueError(
+                "global_input_pooling='segments' needs a classifier wrapping a separate encoder "
+                f"(model.base_model), but {type(model).__name__}.base_model is the model itself."
+            )
+        self.config = model.config
+        segment_layout(self.config)  # fail before the first forward
+        self.pooled: torch.Tensor | None = None
+        self._handle: Any = None
+
+    def _hook(self, _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any], output: Any) -> None:
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        if input_ids is None:
+            raise RuntimeError(
+                "steer_text: global_input_pooling='segments' needs input_ids to locate the "
+                "premise/hypothesis boundary, but the encoder was called without them."
+            )
+        hidden = output[0] if isinstance(output, (tuple, list)) else output.last_hidden_state
+        self.pooled = pool_features(hidden, kwargs.get("attention_mask"), input_ids, self.config, "segments")
+
+    def __enter__(self) -> _OutputSegmentCapture:
+        self._handle = self.backbone.register_forward_hook(self._hook, with_kwargs=True)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+
+@torch.no_grad()
+def _collect_target_output_segments(*, target: nn.Module, target_loader: Any, device: torch.device) -> torch.Tensor:
+    """B's segment-pooled last hidden state ``[N, 3D]``, from a plain forward of B alone.
+
+    Rows line up with the cached split because ``target_loader`` is the same
+    ``shuffle=False`` loader the split was collected from; ``prepare`` checks it.
+    """
+    chunks: list[torch.Tensor] = []
+    with _head_as_identity(target), _OutputSegmentCapture(target) as capture:
+        for batch in target_loader:
+            capture.pooled = None
+            _pooled_features(target, batch, device)
+            if capture.pooled is None:
+                raise RuntimeError("steer_text: the encoder hook did not fire during B's forward pass.")
+            chunks.append(capture.pooled.detach().cpu())
+    return torch.cat(chunks, dim=0)
+
+
+def _load_or_compute_output_segments(
+    *, cache_dir: Path, force_recompute: bool, compute_fn: Callable[[], torch.Tensor], verbose: bool
+) -> torch.Tensor:
+    """B's segment-pooled output feature, cached beside the split's other files (same reasoning and
+    atomic write as :func:`_load_or_compute_pooled_blocks`: only B's side changes, A's is reused)."""
+    path = cache_dir / _OUTPUT_SEGMENTS_CACHE_NAME
+    if path.exists() and not force_recompute:
+        if verbose:
+            print(f"[steer_text] using cached segment-pooled output features at {path}")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    if verbose:
+        print(f"[steer_text] computing segment-pooled output features for {path}")
+    features = compute_fn()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    torch.save(features, tmp)
+    os.replace(tmp, path)
+    return features
+
+
+# Per-row relative tolerance between the recomputed global third and the cached features_B, and the
+# share of rows allowed above it. A few rows of an older cache can disagree with today's forward (seen
+# on the 2026-09-24 t5-large linear-regime caches: <=6/4000 rows, up to 27% relative); anything beyond
+# that share means the caches do not describe the same rows or model, and the run stops.
+_GLOBAL_THIRD_ROW_RTOL = 1e-3
+_GLOBAL_THIRD_MAX_BAD_FRACTION = 0.005
+
+
+def _reconcile_global_third(
+    segments: torch.Tensor, features_b: torch.Tensor, split: str, *, verbose: bool = True
+) -> torch.Tensor:
+    """Check the global third of ``[p; h; g]`` against the cached pooled feature, row by row.
+
+    Rows whose relative difference exceeds ``_GLOBAL_THIRD_ROW_RTOL`` get their global third replaced
+    by the cached ``features_B`` row, so the regressor's input agrees with the f_B that Stage 1 and the
+    head use; they are reported. More than ``_GLOBAL_THIRD_MAX_BAD_FRACTION`` such rows raises.
+    """
+    d = features_b.shape[1]
+    if segments.shape != (features_b.shape[0], 3 * d):
+        raise ValueError(
+            f"steer_text: segment-pooled '{split}' features have shape {tuple(segments.shape)}, expected "
+            f"{(features_b.shape[0], 3 * d)} from the cached split; rerun with force_recompute_features=true."
+        )
+    g, f = segments[:, 2 * d :].double(), features_b.double()
+    rel = (g - f).norm(dim=1) / f.norm(dim=1).clamp_min(1e-12)
+    bad = (rel > _GLOBAL_THIRD_ROW_RTOL).nonzero().flatten()
+    n = int(f.shape[0])
+    if bad.numel() > _GLOBAL_THIRD_MAX_BAD_FRACTION * n:
+        raise ValueError(
+            f"steer_text: the global third of the segment-pooled '{split}' features differs from the cached "
+            f"features_B on {bad.numel()}/{n} rows (max relative {float(rel.max()):.3g}): the two caches do not "
+            "describe the same rows or the same model. Rerun with force_recompute_features=true."
+        )
+    if bad.numel() == 0:
+        return segments
+    if verbose:
+        print(
+            f"[steer_text] WARNING: '{split}': {bad.numel()}/{n} rows of the cached features_B differ from "
+            f"today's forward (max relative {float(rel[bad].max()):.3g}, rows {bad.tolist()}); their global "
+            "third is taken from the cache so the Stage-2 input agrees with f_B."
+        )
+    out = segments.clone()
+    out[bad, 2 * d :] = features_b[bad].to(dtype=out.dtype)
+    return out
+
+
 def _standardize_stats(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Support-set mean and std per channel; the std is floored at 1% of its median so a
     near-constant channel is not blown up into noise."""
@@ -802,6 +918,7 @@ class SteerTextRebase:
         block_source: str = "residual",
         block_feature_preprocessing: str = "none",
         target_block_pooling: str = "global",
+        global_input_pooling: str = "global",
         reuse_source_features_from: str | None = None,
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
@@ -862,6 +979,14 @@ class SteerTextRebase:
                     "steer_text target_block_pooling='segments' requires block_pooling='mean' "
                     "(no unitnorm/rmsnorm composition with segment pooling yet)."
                 )
+        if global_input_pooling not in GLOBAL_INPUT_POOLINGS:
+            raise ValueError(f"steer_text global_input_pooling must be one of: {', '.join(GLOBAL_INPUT_POOLINGS)}")
+        if global_input_pooling != "global" and stage_2_strategy not in {"global_ridge", "global_mlp"}:
+            raise ValueError(
+                "steer_text global_input_pooling only applies to global_ridge and global_mlp; "
+                f"stage_2_strategy={stage_2_strategy!r} would silently ignore it (block_ridge uses "
+                "target_block_pooling)."
+            )
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
         if reuse_source_features_from is not None:
@@ -879,6 +1004,23 @@ class SteerTextRebase:
         source_model = llm_source.model
         source_pretrained_model = llm_source_pretrained.model
         target_model = llm_target.model
+
+        if getattr(target_model.config, "feature_pooling", "global") != "global":
+            # Stage 1 inverts W_B and the correction is added to the head's input, both on
+            # the D-dim pooled feature; a 3D segment-pooled head is a different feature space.
+            raise ValueError(
+                "steer_text needs a target whose head reads the global pooled feature, got "
+                f"feature_pooling={target_model.config.feature_pooling!r}. Use global_input_pooling='segments' "
+                "to give the Stage-2 regressor the segment-pooled feature instead."
+            )
+        if global_input_pooling == "segments":
+            target_stacks = {stack for stack, _ in _ordered_block_keys(target_model)}
+            if "decoder" in target_stacks:
+                raise ValueError(
+                    "steer_text global_input_pooling='segments' requires an encoder-only target "
+                    "(e.g. T5EncoderForSequenceClassification): the target has a 'decoder' stack "
+                    f"({sorted(target_stacks)}), whose output never sees the premise/hypothesis sequence."
+                )
 
         if target_block_pooling == "segments":
             # A decoder block sees only the decoder's own (typically single-token) input,
@@ -1042,6 +1184,23 @@ class SteerTextRebase:
         f_b = train_data["features_B"].double()
         delta_a_test = test_data["delta_A"].double()
         f_b_test = test_data["features_B"].double()
+
+        # Stage-2 input of the global strategies: f_B itself, or B's [premise; hypothesis; global]
+        # last hidden state. Only B's side, so it is collected once and cached beside the split.
+        x_b, x_b_test = f_b, f_b_test
+        if global_input_pooling == "segments":
+            segs: dict[str, torch.Tensor] = {}
+            for split, data in (("train", train_data), ("test", test_data)):
+                segs[split] = _load_or_compute_output_segments(
+                    cache_dir=_cache_split_dir(feature_cache_dir, source_tag, target_tag, task, cache_feature_regime, split),
+                    force_recompute=force_recompute_features,
+                    compute_fn=lambda split=split: _collect_target_output_segments(
+                        target=target_model, target_loader=getattr(target_loaders, split), device=dev
+                    ),
+                    verbose=verbose,
+                )
+                segs[split] = _reconcile_global_third(segs[split], data["features_B"], split, verbose=verbose)
+            x_b, x_b_test = segs["train"].double(), segs["test"].double()
         test_labels = test_data["y_A"].long()
 
         # Support-set selection runs on *local* 0..K-1 labels, not the head-space
@@ -1077,17 +1236,18 @@ class SteerTextRebase:
         block_group_size: float | None = None
 
         if stage_2_strategy == "global_ridge":
-            coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
-            stage2_state = {"kind": "global_ridge", "coefficient": coefficient}
+            coefficient = _ridge(x_b[selected], train_target, ridge_lambda).to(dev)
+            stage2_state = {"kind": "global_ridge", "coefficient": coefficient, "input_pooling": global_input_pooling}
 
             def correction_fn(activations: Mapping[str, Any], *, _coef=coefficient) -> torch.Tensor:
                 global_act = activations["global"]
-                out = global_act.double().to(_coef.device) @ _coef
+                x = activations["global_segments"] if global_input_pooling == "segments" else global_act
+                out = x.double().to(_coef.device) @ _coef
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
         elif stage_2_strategy == "global_mlp":
             model = _fit_global_mlp(
-                f_b[selected],
+                x_b[selected],
                 train_target,
                 seed=10_000 + int(seed) * 100 + int(selected.numel()),
                 epochs=int(mlp_epochs),
@@ -1096,7 +1256,8 @@ class SteerTextRebase:
             stage2_state = {
                 "kind": "global_mlp",
                 "state_dict": model.state_dict(),
-                "input_dim": int(f_b.shape[1]),
+                "input_dim": int(x_b.shape[1]),
+                "input_pooling": global_input_pooling,
                 "hidden_dim": int(mlp_hidden_dim),
                 "output_dim": int(train_target.shape[1]),
                 "epochs": int(mlp_epochs),
@@ -1104,9 +1265,10 @@ class SteerTextRebase:
 
             def correction_fn(activations: Mapping[str, Any], *, _model=model) -> torch.Tensor:
                 global_act = activations["global"]
+                x = activations["global_segments"] if global_input_pooling == "segments" else global_act
                 model_device = next(_model.parameters()).device
                 with torch.no_grad():
-                    out = _model(global_act.double().to(model_device))
+                    out = _model(x.double().to(model_device))
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
         else:  # block_ridge / joint_ridge: both read B's grouped per-block activations
@@ -1286,6 +1448,8 @@ class SteerTextRebase:
         # goes through the live eval path instead, so a gap between the two
         # isolates a Stage 1/2 problem from a live-integration problem.
         cached_test_activations: dict[str, Any] = {"global": f_b_test}
+        if global_input_pooling == "segments":
+            cached_test_activations["global_segments"] = x_b_test
         if need_blocks:
             cached_test_activations["blocks"] = {int(b): v.double() for b, v in test_data["features_B_blocks"].items()}
         stage2_test_acc = _accuracy(
@@ -1309,6 +1473,7 @@ class SteerTextRebase:
             "block_pooling": block_pooling,
             "block_source": block_source,
             "target_block_pooling": target_block_pooling,
+            "global_input_pooling": global_input_pooling,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             # The fitted transforms themselves, so a run can be inspected or
@@ -1379,6 +1544,9 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
         if need_blocks
         else None
     )
+    output_segments = (
+        _OutputSegmentCapture(model) if prepared.get("global_input_pooling", "global") == "segments" else None
+    )
     handles: list[Any] = []
 
     def _mask_hook(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
@@ -1398,6 +1566,11 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     def _head_pre_hook(_module: nn.Module, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
         feature = inputs[0]
         activations: dict[str, Any] = {"global": feature}
+        if output_segments is not None:
+            if output_segments.pooled is None:
+                raise RuntimeError("steer_text: the segment-pooled output was not captured before the head ran.")
+            activations["global_segments"] = output_segments.pooled
+            output_segments.pooled = None  # one capture per forward; a stale one must never be reused
         if capture is not None:
             num_residual = len(capture.modules)
             missing = [b for b in range(num_residual) if b not in capture.activations]
@@ -1413,6 +1586,8 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     if capture is not None:
         capture.__enter__()
         handles.append(model.register_forward_pre_hook(_mask_hook, with_kwargs=True))
+    if output_segments is not None:
+        output_segments.__enter__()
     handles.append(head.register_forward_pre_hook(_head_pre_hook))
     try:
         yield
@@ -1421,6 +1596,8 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
             handle.remove()
         if capture is not None:
             capture.__exit__(None, None, None)
+        if output_segments is not None:
+            output_segments.__exit__(None, None, None)
 
 
 register(SteerTextRebase())

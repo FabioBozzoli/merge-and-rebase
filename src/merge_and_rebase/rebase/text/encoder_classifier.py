@@ -71,7 +71,8 @@ def masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor | None) -> to
     ``_TextBlockCapture``'s residual blocks under ``segment_pooling=True``,
     which call :func:`segment_pooled` instead (itself built from three calls
     to this function); the output block (always the plain pooled feature) is
-    unaffected either way.
+    unaffected either way. A wrapper built with ``config.feature_pooling="segments"``
+    feeds its head :func:`segment_pooled` instead (see :func:`pool_features`).
 
     Tensors that are not ``[B, T, D]`` pass through unchanged, which is what
     lets the block-capture hook feed it whatever a block returns without
@@ -162,6 +163,79 @@ def segment_pooled(
     )
 
 
+# Pair-encoding layout per model family: (EOS tokens between the two sentences, whether a leading
+# <s> is excluded from the premise segment). T5: `p </s> h </s>`; RoBERTa: `<s> p </s></s> h </s>`.
+SEGMENT_LAYOUT_BY_MODEL_TYPE: dict[str, tuple[int, bool]] = {
+    "t5": (1, False),
+    "mt5": (1, False),
+    "umt5": (1, False),
+    "longt5": (1, False),
+    "roberta": (2, True),
+}
+
+
+def segment_layout(config: Any) -> tuple[int, int, int | None]:
+    """``(eos_token_id, separator_eos, bos_token_id)`` for :func:`segment_pooled` on this model family.
+
+    Raises rather than guessing: a wrong layout splits every row at the wrong token and
+    yields plausible-looking but meaningless segment features.
+    """
+    eos_token_id = getattr(config, "eos_token_id", None)
+    if eos_token_id is None:
+        raise ValueError("segment pooling requires model.config.eos_token_id to be set.")
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if model_type not in SEGMENT_LAYOUT_BY_MODEL_TYPE:
+        raise ValueError(
+            f"segment pooling does not know the pair-encoding layout of model_type='{model_type}' "
+            f"(known: {sorted(SEGMENT_LAYOUT_BY_MODEL_TYPE)}); refusing to guess where the "
+            "premise/hypothesis boundary is."
+        )
+    separator_eos, uses_bos = SEGMENT_LAYOUT_BY_MODEL_TYPE[model_type]
+    bos_token_id = getattr(config, "bos_token_id", None) if uses_bos else None
+    return int(eos_token_id), separator_eos, (None if bos_token_id is None else int(bos_token_id))
+
+
+FEATURE_POOLINGS: tuple[str, ...] = ("global", "segments")
+
+
+def pool_features(
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    config: Any,
+    mode: str,
+) -> torch.Tensor:
+    """The sequence feature of a ``[B, T, D]`` last hidden state under ``mode``.
+
+    ``"global"`` is :func:`masked_mean` (``[B, D]``); ``"segments"`` is
+    :func:`segment_pooled` on the model family's pair layout (``[B, 3D]``). The
+    encoder classifiers' head input, ``steer_text``'s segment-pooled Stage-2 input and
+    its live correction hook all go through this one function.
+    """
+    if mode == "global":
+        return masked_mean(hidden, attention_mask)
+    if mode != "segments":
+        raise ValueError(f"feature pooling must be one of {FEATURE_POOLINGS}, got {mode!r}")
+    if input_ids is None or attention_mask is None:
+        raise ValueError(
+            "segment pooling needs input_ids and attention_mask to locate the premise/hypothesis "
+            "boundary (inputs_embeds alone carry no EOS positions)."
+        )
+    eos_token_id, separator_eos, bos_token_id = segment_layout(config)
+    return segment_pooled(
+        hidden, attention_mask, input_ids, eos_token_id, separator_eos=separator_eos, bos_token_id=bos_token_id
+    )
+
+
+def _feature_pooling(config: Any) -> str:
+    mode = str(getattr(config, "feature_pooling", "global") or "global").strip().lower()
+    if mode not in FEATURE_POOLINGS:
+        raise ValueError(f"config.feature_pooling must be one of {FEATURE_POOLINGS}, got {mode!r}")
+    if mode == "segments":
+        segment_layout(config)  # fail at construction, not at the first forward
+    return mode
+
+
 class T5EncoderClassificationHead(nn.Module):
     """A single ``out_proj`` linear, wrapped so the qualified name matches T5's.
 
@@ -209,8 +283,10 @@ class T5EncoderForSequenceClassification(T5PreTrainedModel):
 
     def __init__(self, config: T5Config) -> None:
         super().__init__(config)
+        self.feature_pooling = _feature_pooling(config)
         self.transformer = T5EncoderModel(config)
-        self.classification_head = T5EncoderClassificationHead(config.d_model, config.num_labels)
+        width = config.d_model * (3 if self.feature_pooling == "segments" else 1)
+        self.classification_head = T5EncoderClassificationHead(width, config.num_labels)
         # A T5Config arrives with is_encoder_decoder=True because it describes a
         # seq2seq architecture -- but this model has no decoder, so the flag is
         # simply false of it. Correcting it here is what makes
@@ -246,7 +322,9 @@ class T5EncoderForSequenceClassification(T5PreTrainedModel):
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
         )
-        pooled = masked_mean(encoder_outputs.last_hidden_state, attention_mask)
+        pooled = pool_features(
+            encoder_outputs.last_hidden_state, attention_mask, input_ids, self.config, self.feature_pooling
+        )
         logits = self.classification_head(pooled)
 
         loss = None
@@ -287,8 +365,10 @@ class RobertaEncoderForSequenceClassification(RobertaPreTrainedModel):
 
     def __init__(self, config: RobertaConfig) -> None:
         super().__init__(config)
+        self.feature_pooling = _feature_pooling(config)
         self.roberta = RobertaModel(config, add_pooling_layer=False)
-        self.classification_head = T5EncoderClassificationHead(config.hidden_size, config.num_labels)
+        width = config.hidden_size * (3 if self.feature_pooling == "segments" else 1)
+        self.classification_head = T5EncoderClassificationHead(width, config.num_labels)
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
@@ -308,7 +388,7 @@ class RobertaEncoderForSequenceClassification(RobertaPreTrainedModel):
     ) -> SequenceClassifierOutput:
         del return_dict, kwargs  # accepted for call-site compatibility, unused
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds)
-        pooled = masked_mean(outputs.last_hidden_state, attention_mask)
+        pooled = pool_features(outputs.last_hidden_state, attention_mask, input_ids, self.config, self.feature_pooling)
         logits = self.classification_head(pooled)
 
         loss = None

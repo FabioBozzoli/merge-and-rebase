@@ -1824,3 +1824,119 @@ def test_theseus_transports_t5_deltas_into_roberta() -> None:
         verbose=False, show_progress=False,
     )
     assert all(t.kind == "weight" and t.t_in is None for t in unpaired["transforms_by_key"].values())
+
+
+# ---------------------------------------------------------------------------
+# global_input_pooling="segments": global_ridge / global_mlp read B's [p; h; g]
+# ---------------------------------------------------------------------------
+
+
+def _live_global_segments_check(prepared, target, batch) -> None:
+    """Live corrected logits == baseline + correction_fn({global, global_segments}) @ W_B^T."""
+    from merge_and_rebase.rebase.text.encoder_classifier import pool_features
+
+    _, head = text_rebase_head(target)
+    kw = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target):
+            pooled = target(**kw).logits
+        hidden = target.base_model(**kw).last_hidden_state
+        segments = pool_features(hidden, batch["attention_mask"], batch["input_ids"], target.config, "segments")
+        baseline = target(**kw).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kw).logits
+        restored = target(**kw).logits
+    correction = prepared["correction_fn"]({"global": pooled, "global_segments": segments})
+    assert correction.shape == pooled.shape, "the regressor reads 3D but corrects the D-dim feature"
+    assert torch.allclose(corrected, baseline + correction @ head.weight.T, atol=1e-4)
+    assert not torch.allclose(corrected, baseline)
+    assert torch.allclose(restored, baseline), "the hooks must be removed on exit"
+
+
+@pytest.mark.parametrize("strategy", ["global_ridge", "global_mlp"])
+@pytest.mark.parametrize("regime", ["standard", "linear"])
+def test_global_input_segments_on_a_t5_encoder_target(tmp_path, strategy, regime) -> None:
+    extra = {"mlp_epochs": 3} if strategy == "global_mlp" else {}
+    _steer_prepare_encoder(tmp_path, feature_regime=regime, stage_2_strategy=strategy, **extra)
+    split_dir = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / regime
+    before = {s: torch.load(split_dir / s / "features_B.pt") for s in ("train", "test")}
+
+    prepared, target = _steer_prepare_encoder(
+        tmp_path, feature_regime=regime, stage_2_strategy=strategy, global_input_pooling="segments", **extra
+    )
+    d_model = 48
+    assert prepared["global_input_pooling"] == "segments"
+    state = prepared["artifacts"]["stage2_state"]
+    assert state["input_pooling"] == "segments"
+    if strategy == "global_ridge":
+        assert tuple(state["coefficient"].shape) == (3 * d_model, d_model)
+    else:
+        assert state["input_dim"] == 3 * d_model and state["output_dim"] == d_model
+    for s in ("train", "test"):
+        cached = torch.load(split_dir / s / "features_B_output_segpool.pt")
+        assert cached.shape[-1] == 3 * d_model
+        assert torch.equal(before[s], torch.load(split_dir / s / "features_B.pt")), "the split cache is reused untouched"
+        assert torch.allclose(cached[:, 2 * d_model :], before[s], atol=1e-5)
+
+    _live_global_segments_check(prepared, target, _collate([_PairDictDataset(4)[i] for i in range(4)]))
+
+
+@pytest.mark.parametrize("strategy", ["global_ridge", "global_mlp"])
+def test_global_input_segments_on_a_roberta_target(tmp_path, strategy) -> None:
+    extra = {"mlp_epochs": 3} if strategy == "global_mlp" else {}
+    prepared, target = _steer_prepare_roberta(
+        tmp_path, feature_regime="standard", stage_2_strategy=strategy, global_input_pooling="segments", **extra
+    )
+    assert all(v == v for v in prepared["diagnostics"].values())
+    _live_global_segments_check(prepared, target, _collate([_RobertaPairDataset(4)[i] for i in range(4)]))
+
+
+def test_global_input_segments_default_is_unchanged(tmp_path) -> None:
+    a, _ = _steer_prepare_encoder(tmp_path / "a", feature_regime="standard", stage_2_strategy="global_ridge")
+    b, _ = _steer_prepare_encoder(
+        tmp_path / "b", feature_regime="standard", stage_2_strategy="global_ridge", global_input_pooling="global"
+    )
+    assert torch.equal(a["artifacts"]["stage2_state"]["coefficient"], b["artifacts"]["stage2_state"]["coefficient"])
+    assert a["diagnostics"] == b["diagnostics"]
+
+
+def test_global_input_segments_rejections(tmp_path) -> None:
+    with pytest.raises(ValueError, match="only applies to global_ridge and global_mlp"):
+        _steer_prepare_encoder(tmp_path, global_input_pooling="segments")  # block_ridge
+    with pytest.raises(ValueError, match="global_input_pooling must be one of"):
+        _steer_prepare_encoder(tmp_path, stage_2_strategy="global_ridge", global_input_pooling="cls")
+    with pytest.raises(ValueError, match="encoder-only target"):
+        _steer_prepare(tmp_path, global_input_pooling="segments")  # T5ForSequenceClassification target
+
+
+def test_steer_text_rejects_a_segments_head_target(tmp_path, monkeypatch) -> None:
+    """Stage 1 and the correction live on the D-dim pooled feature; a 3D head is another feature space."""
+    original = _tiny_t5_encoder
+
+    def _segments_target(d_model: int = 32, num_layers: int = 2, seed: int = 0):
+        model = original(d_model=d_model, num_layers=num_layers, seed=seed)
+        model.config.feature_pooling = "segments"
+        return model
+
+    monkeypatch.setitem(globals(), "_tiny_t5_encoder", _segments_target)
+    with pytest.raises(ValueError, match="head reads the global pooled feature"):
+        _steer_prepare_encoder(tmp_path, feature_regime="standard", stage_2_strategy="global_ridge")
+
+
+def test_reconcile_global_third_patches_a_few_rows_and_rejects_many() -> None:
+    from merge_and_rebase.rebase.text.steer_text import _reconcile_global_third
+
+    torch.manual_seed(0)
+    n, d = 1000, 8
+    f = torch.randn(n, d)
+    seg = torch.cat([torch.randn(n, d), torch.randn(n, d), f.clone()], dim=1)
+    assert _reconcile_global_third(seg, f, "train", verbose=False) is seg  # all rows agree: untouched
+
+    drifted = seg.clone()
+    drifted[[3, 7], 2 * d :] += 0.5  # 2/1000 rows: within the tolerated share
+    out = _reconcile_global_third(drifted, f, "train", verbose=False)
+    assert torch.equal(out[:, 2 * d :], f) and torch.equal(out[:, : 2 * d], drifted[:, : 2 * d])
+
+    drifted[:20, 2 * d :] += 0.5  # 20/1000 rows: the caches do not describe the same rows
+    with pytest.raises(ValueError, match="differs from the cached features_B on"):
+        _reconcile_global_third(drifted, f, "train", verbose=False)
