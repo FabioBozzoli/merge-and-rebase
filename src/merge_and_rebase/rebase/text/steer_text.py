@@ -553,7 +553,8 @@ class SteerTextRebase:
             "task": task,
             "feature_regime": feature_regime,
             "force_recompute_features": force_recompute_features,
-            "need_blocks": need_blocks,
+            "need_source_blocks": need_blocks,
+            "need_target_blocks": need_blocks,
             "verbose": verbose,
         }
         train_data = _load_or_compute_split(split="train", compute_fn=lambda: _compute("train"), **cache_args)

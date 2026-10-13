@@ -41,6 +41,71 @@ def test_stage1_target_corrections_shapes() -> None:
     assert torch.isfinite(test_target).all()
 
 
+def _matrix_with_singular_values(values: torch.Tensor, rows: int, seed: int = 0) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    left, _ = torch.linalg.qr(torch.randn(rows, values.numel(), generator=g, dtype=torch.float64))
+    right, _ = torch.linalg.qr(torch.randn(values.numel(), values.numel(), generator=g, dtype=torch.float64))
+    return left @ torch.diag(values) @ right.T
+
+
+def test_energy_truncated_pinv_keeps_leading_singular_values() -> None:
+    # 1000 singular values summing to 10000; the first 600 carry 9995 of it (99.95%).
+    values = torch.cat([torch.full((600,), 9995.0 / 600), torch.full((400,), 5.0 / 400)]).double()
+    matrix = torch.diag(values)
+    _, kept, rank = steer_mod._energy_truncated_pinv(matrix, 0.999)
+    assert (kept, rank) == (600, 1000)
+    # Default 0.99: smallest k with k * 9995/600 >= 9900, i.e. ceil(594.30) = 595.
+    _, kept, _ = steer_mod._energy_truncated_pinv(matrix, 0.99)
+    assert kept == 595
+
+
+def test_energy_truncated_pinv_full_energy_matches_pinv() -> None:
+    values = torch.linspace(5.0, 0.1, 12, dtype=torch.float64)
+    matrix = _matrix_with_singular_values(values, rows=20)
+    pinv, kept, rank = steer_mod._energy_truncated_pinv(matrix, 1.0)
+    assert (kept, rank) == (12, 12)
+    assert torch.allclose(pinv, torch.linalg.pinv(matrix), atol=1e-10)
+    truncated, kept, _ = steer_mod._energy_truncated_pinv(matrix, 0.5)
+    assert kept < 12
+    # The truncated inverse is the exact inverse restricted to the kept singular directions.
+    u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+    expected = vh[:kept].T @ torch.diag(1.0 / s[:kept]) @ u[:, :kept].T
+    assert torch.allclose(truncated, expected, atol=1e-10)
+
+
+def test_energy_truncated_pinv_ignores_numerically_zero_singular_values() -> None:
+    values = torch.cat([torch.tensor([3.0, 2.0, 1.0]), torch.zeros(5)]).double()
+    matrix = _matrix_with_singular_values(values, rows=10)
+    pinv, kept, rank = steer_mod._energy_truncated_pinv(matrix, 1.0)
+    assert (kept, rank) == (3, 3)
+    assert torch.allclose(pinv, torch.linalg.pinv(matrix), atol=1e-10)
+
+
+def test_energy_truncated_pinv_rejects_bad_thresholds() -> None:
+    import pytest
+
+    matrix = torch.eye(4, dtype=torch.float64)
+    for threshold in (0.0, -0.1, 1.01):
+        with pytest.raises(ValueError):
+            steer_mod._energy_truncated_pinv(matrix, threshold)
+    with pytest.raises(ValueError):
+        steer_mod._energy_truncated_pinv(torch.zeros(4, 4, dtype=torch.float64), 0.99)
+
+
+def test_stage1_projection_energy_threshold_default_and_exact() -> None:
+    w_a, w_b, f_a, delta_a, f_b, _ = _synthetic_dataset()
+    selected = torch.arange(16)
+    kwargs = dict(f_a=f_a, delta_a=delta_a, w_a=w_a, f_b=f_b, w_b=w_b, selected=selected, regularization=1.0)
+    default_map, default_kept, rank = steer_mod._stage1_projection(**kwargs)
+    explicit_map, explicit_kept, _ = steer_mod._stage1_projection(**kwargs, energy_threshold=0.99)
+    assert default_kept == explicit_kept and torch.equal(default_map, explicit_map)
+    exact_map, exact_kept, _ = steer_mod._stage1_projection(**kwargs, energy_threshold=1.0)
+    residual = (f_a[selected] + delta_a[selected]) @ w_a.T - f_b[selected] @ w_b.T
+    expected = (torch.linalg.pinv(delta_a[selected]) @ residual / 2.0).T
+    assert exact_kept == rank
+    assert torch.allclose(exact_map, expected, atol=1e-10)
+
+
 def test_global_ridge_recovers_linear_map() -> None:
     g = torch.Generator().manual_seed(1)
     n, d, out_dim = 40, 6, 3
@@ -78,6 +143,50 @@ def test_block_ridge_fit_predict_roundtrip() -> None:
         pred = steer_mod._predict_block_ridge(coefficients, blocks_train)
         assert pred.shape == (n_sel, d_out)
         assert torch.isfinite(pred).all()
+
+
+def test_concat_ridge_matches_scaled_concat() -> None:
+    """Folded per-block coefficients reproduce a ridge on the hand-scaled concatenation."""
+    g = torch.Generator().manual_seed(4)
+    n, d_out = 12, 3
+    widths = [6, 6, 4]
+    raw_scales = [50.0, 0.1, 1.0]  # deep raw blocks vs L2-normalized output
+    blocks = {
+        b: raw_scales[b] * torch.randn(n, w, generator=g, dtype=torch.float64) for b, w in enumerate(widths)
+    }
+    target = torch.randn(n, d_out, generator=g, dtype=torch.float64)
+
+    for scaling in ("none", "trace"):
+        coefficients, info = steer_mod._fit_concat_ridge(
+            blocks, target, regularization=0.5, regularization_scaling=scaling
+        )
+        assert [c.shape for c in coefficients] == [(w, d_out) for w in widths]
+        scales = [float(v.square().sum().div(n).sqrt()) for v in blocks.values()]
+        x_scaled = torch.cat([v / s for v, s in zip(blocks.values(), scales)], dim=1)
+        expected_lambda = 0.5 * (len(widths) if scaling == "trace" else 1.0)
+        assert abs(info["effective_lambda"] - expected_lambda) < 1e-10
+        expected = x_scaled @ steer_mod._ridge(x_scaled, target, expected_lambda)
+        pred = steer_mod._predict_block_ridge(coefficients, blocks)
+        assert torch.allclose(pred, expected, atol=1e-10)
+
+        # Per-block scaling makes the fit invariant to rescaling any one block.
+        rescaled = dict(blocks)
+        rescaled[1] = 1e3 * rescaled[1]
+        rescaled_coefficients, _ = steer_mod._fit_concat_ridge(
+            rescaled, target, regularization=0.5, regularization_scaling=scaling
+        )
+        assert torch.allclose(steer_mod._predict_block_ridge(rescaled_coefficients, rescaled), pred, atol=1e-8)
+
+
+def test_concat_ridge_recovers_linear_map() -> None:
+    g = torch.Generator().manual_seed(5)
+    n, d_out = 60, 3
+    blocks = {b: torch.randn(n, 4, generator=g, dtype=torch.float64) * (10.0**b) for b in range(3)}
+    true_maps = [torch.randn(4, d_out, generator=g, dtype=torch.float64) / (10.0**b) for b in range(3)]
+    target = sum(blocks[b] @ true_maps[b] for b in range(3))
+    coefficients, _ = steer_mod._fit_concat_ridge(blocks, target, regularization=1e-8)
+    for coefficient, true_map in zip(coefficients, true_maps):
+        assert torch.allclose(coefficient, true_map, atol=1e-5)
 
 
 def test_group_blocks_concat_and_sum_avg() -> None:
@@ -150,7 +259,8 @@ def test_feature_cache_roundtrip(tmp_path) -> None:
         task="TaskX",
         feature_regime="standard",
         split="train",
-        need_blocks=False,
+        need_source_blocks=False,
+        need_target_blocks=False,
         compute_fn=compute_fn,
         verbose=False,
     )
@@ -275,7 +385,13 @@ def test_steer_prepare_and_correction_end_to_end(tmp_path) -> None:
     torch.manual_seed(0)
     loaders = _tiny_loaders()
 
-    for strategy, regime in [("global_ridge", "standard"), ("global_mlp", "standard"), ("block_ridge", "linear")]:
+    for strategy, regime in [
+        ("global_ridge", "standard"),
+        ("global_mlp", "standard"),
+        ("block_ridge", "linear"),
+        ("concat_ridge", "standard"),
+        ("concat_ridge", "linear"),
+    ]:
         clf_source_pretrained = _make_tiny_clf(depth=3)
         clf_source_finetuned = _make_tiny_clf(depth=3)
         clf_source_finetuned.load_state_dict(clf_source_pretrained.state_dict())
@@ -290,7 +406,7 @@ def test_steer_prepare_and_correction_end_to_end(tmp_path) -> None:
             source_loaders=loaders,
             target_loaders=loaders,
             classnames=_CLASSNAMES,
-            task=f"tiny_{strategy}",
+            task=f"tiny_{strategy}_{regime}",
             source_build_cfg_task=_BUILD_CFG,
             build_cfg_task=_BUILD_CFG,
             device="cpu",
@@ -450,3 +566,370 @@ def test_steer_block_ridge_trace_scaling_end_to_end(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="block_ridge_lambda_scaling"):
         _prepare("median")
+
+
+def test_pool_block_output_token_pooling() -> None:
+    tokens = torch.randn(2, 5, 4)
+    assert torch.equal(steer_mod._pool_block_output(tokens), tokens.mean(dim=1))
+    assert torch.equal(steer_mod._pool_block_output(tokens, "mean"), tokens.mean(dim=1))
+    assert torch.equal(steer_mod._pool_block_output((tokens, None), "cls"), tokens[:, 0])
+    # Conv maps (the ViT patch embedding) have no class token: always GAP.
+    conv = torch.randn(2, 3, 4, 4)
+    assert torch.equal(steer_mod._pool_block_output(conv), conv.mean(dim=(2, 3)))
+    assert torch.equal(steer_mod._pool_block_output(conv, "cls"), conv.mean(dim=(2, 3)))
+
+
+def test_cache_split_dir_token_pooling() -> None:
+    args = ("cache", "a", "b", "SVHN", "linear", "train")
+    assert steer_mod._cache_split_dir(*args) == steer_mod._cache_split_dir(*args, "residual", "mean")
+    assert str(steer_mod._cache_split_dir(*args)).endswith("SVHN/linear/train")
+    assert str(steer_mod._cache_split_dir(*args, "residual", "cls")).endswith("SVHN/linear_clspool/train")
+    assert str(steer_mod._cache_split_dir(*args, "attention", "cls")).endswith(
+        "SVHN/linear_attentiongranularity_clspool/train"
+    )
+
+
+def _reference_block_tokens(visual: nn.Module, x: torch.Tensor) -> dict[int, torch.Tensor]:
+    """Unpooled [B, L, D] output of every resblock, captured independently of steer."""
+    tokens: dict[int, torch.Tensor] = {}
+    handles = [
+        block.register_forward_hook(lambda _m, _i, out, b=b: tokens.__setitem__(b, out.detach()))
+        for b, block in enumerate(visual.transformer.resblocks)
+    ]
+    try:
+        with torch.no_grad():
+            visual(x)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return tokens
+
+
+def test_residual_capture_cls_pooling_matches_class_token() -> None:
+    torch.manual_seed(3)
+    visual = _TinyVisual(depth=3).eval()
+    x = torch.randn(4, 3, 16, 16)
+    reference = _reference_block_tokens(visual, x)
+
+    pooled = {}
+    for pooling in ("mean", "cls"):
+        capture, final_ids, expected = steer_mod._activation_capture_for_visual(visual, "residual", pooling)
+        with capture as c, torch.no_grad():
+            out = visual(x)
+        pooled[pooling] = steer_mod._complete_captured_activations(
+            c, final_output=out, final_ids=final_ids, expected_blocks=expected
+        )
+    for b, tok in reference.items():
+        assert torch.allclose(pooled["cls"][b], tok[:, 0])
+        assert torch.allclose(pooled["mean"][b], tok.mean(dim=1))
+        assert not torch.allclose(pooled["cls"][b], pooled["mean"][b])
+    # The final projected feature does not depend on the token pooling.
+    assert torch.equal(pooled["cls"][3], pooled["mean"][3])
+
+
+def test_steer_block_ridge_cls_pooling_end_to_end(tmp_path) -> None:
+    """token_pooling='cls' is used both for the cached fit features and for the live eval capture."""
+    import pytest
+
+    torch.manual_seed(4)
+    loaders = _tiny_loaders()
+    clf_source_pretrained = _make_tiny_clf(depth=3)
+    clf_source_finetuned = _make_tiny_clf(depth=3)
+    clf_source_finetuned.load_state_dict(clf_source_pretrained.state_dict())
+    _finetune(clf_source_finetuned)
+    clf_target = _make_tiny_clf(depth=3)
+
+    def _prepare(pooling: str):
+        return get_method("steer").prepare(
+            clf_source=clf_source_finetuned,
+            clf_source_pretrained=clf_source_pretrained,
+            clf_target=clf_target,
+            source_loaders=loaders,
+            target_loaders=loaders,
+            classnames=_CLASSNAMES,
+            task="tiny_cls",
+            source_build_cfg_task=_BUILD_CFG,
+            build_cfg_task=_BUILD_CFG,
+            device="cpu",
+            feature_regime="linear",
+            stage_2_strategy="block_ridge",
+            block_granularity="residual",
+            token_pooling=pooling,
+            few_shot=2,
+            feature_cache_dir=str(tmp_path / "features"),
+            force_recompute_features=True,
+            verbose=False,
+        )
+
+    mean_prepared, cls_prepared = _prepare("mean"), _prepare("cls")
+    assert mean_prepared["token_pooling"] == "mean" and cls_prepared["token_pooling"] == "cls"
+
+    # Fit side: cached target block features are the class token of each resblock.
+    visual = clf_target.model.visual
+    x_all = loaders.test.dataset.tensors[0]
+    reference = _reference_block_tokens(visual, x_all)
+    for pooling, reduce in (("cls", lambda t: t[:, 0]), ("mean", lambda t: t.mean(dim=1))):
+        cache_dir = steer_mod._cache_split_dir(
+            str(tmp_path / "features"), "source", "target", "tiny_cls", "linear", "test", "residual", pooling
+        )
+        cached_blocks = torch.load(cache_dir / "features_B_blocks.pt", weights_only=True)
+        for b, tok in reference.items():
+            assert torch.allclose(cached_blocks[b], reduce(tok), atol=1e-6)
+
+    # Eval side: the live wrapper must feed the predictor CLS-pooled activations.
+    x = torch.randn(4, 3, 16, 16)
+    capture, final_ids, expected = steer_mod._activation_capture_for_visual(visual, "residual", "cls")
+    with capture as c, torch.no_grad():
+        out_norm = steer_mod._l2_normalize(clf_target.model.encode_image(x))
+    blocks = steer_mod._complete_captured_activations(c, final_output=out_norm, final_ids=final_ids, expected_blocks=expected)
+    expected_feature = out_norm + cls_prepared["correction_fn"]({"global": out_norm, "blocks": blocks})
+    with steer_correction_context(clf_target, cls_prepared, alpha=1.0), torch.no_grad():
+        live_feature = clf_target.model.encode_image(x)
+    assert torch.allclose(live_feature, expected_feature, atol=1e-6)
+
+    with pytest.raises(ValueError, match="token_pooling"):
+        _prepare("max")
+
+
+def _prepare_tiny(models, loaders, cache_dir, *, strategy="block_ridge", pooling="mean", force=False):
+    source_finetuned, source_pretrained, target = models
+    return get_method("steer").prepare(
+        clf_source=source_finetuned,
+        clf_source_pretrained=source_pretrained,
+        clf_target=target,
+        source_loaders=loaders,
+        target_loaders=loaders,
+        classnames=_CLASSNAMES,
+        task="tiny_reuse",
+        source_build_cfg_task=_BUILD_CFG,
+        build_cfg_task=_BUILD_CFG,
+        device="cpu",
+        feature_regime="linear",
+        stage_2_strategy=strategy,
+        token_pooling=pooling,
+        few_shot=2,
+        feature_cache_dir=str(cache_dir),
+        force_recompute_features=force,
+        verbose=False,
+    )
+
+
+def _tiny_models(seed: int):
+    torch.manual_seed(seed)
+    source_pretrained = _make_tiny_clf(depth=3)
+    source_finetuned = _make_tiny_clf(depth=3)
+    source_finetuned.load_state_dict(source_pretrained.state_dict())
+    _finetune(source_finetuned)
+    return source_finetuned, source_pretrained, _make_tiny_clf(depth=3)
+
+
+def test_cls_pooling_reuses_mean_cache_and_matches_full_extraction(tmp_path, monkeypatch) -> None:
+    """With a mean-pooled cache present, cls only recomputes B's blocks, and the result
+    (cached tensors and fitted correction) equals a from-scratch cls extraction."""
+    models = _tiny_models(5)
+    loaders = _tiny_loaders()
+    reuse_dir, full_dir = tmp_path / "reuse", tmp_path / "full"
+
+    _prepare_tiny(models, loaders, reuse_dir, pooling="mean", force=True)
+    full = _prepare_tiny(models, loaders, full_dir, pooling="cls", force=True)
+
+    def _no_source_extraction(**_kwargs):
+        raise AssertionError("A-side extraction must be skipped when the mean cache is reusable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(steer_mod, "_collect_linear_split", _no_source_extraction)
+        reused = _prepare_tiny(models, loaders, reuse_dir, pooling="cls")
+
+    for split in ("train", "test"):
+        a = steer_mod._cache_split_dir(str(reuse_dir), "source", "target", "tiny_reuse", "linear", split, "residual", "cls")
+        b = steer_mod._cache_split_dir(str(full_dir), "source", "target", "tiny_reuse", "linear", split, "residual", "cls")
+        for name in ("features_A", "delta_A", "delta_A_blocks", "features_B", "y_A"):
+            assert torch.allclose(torch.load(a / f"{name}.pt"), torch.load(b / f"{name}.pt"), atol=1e-6), name
+        blocks_a, blocks_b = torch.load(a / "features_B_blocks.pt"), torch.load(b / "features_B_blocks.pt")
+        assert blocks_a.keys() == blocks_b.keys()
+        assert all(torch.allclose(blocks_a[k], blocks_b[k], atol=1e-6) for k in blocks_a)
+    assert reused["diagnostics"]["stage2_test_acc"] == full["diagnostics"]["stage2_test_acc"]
+
+
+def test_cls_pooling_falls_back_when_mean_cache_is_for_another_target(tmp_path) -> None:
+    models = _tiny_models(6)
+    loaders = _tiny_loaders()
+    _prepare_tiny(models, loaders, tmp_path, pooling="mean", force=True)
+    other_target = _make_tiny_clf(depth=3)  # same tags, different weights: stale cache
+    reused = _prepare_tiny((models[0], models[1], other_target), loaders, tmp_path, pooling="cls")
+    full = _prepare_tiny((models[0], models[1], other_target), loaders, tmp_path / "fresh", pooling="cls", force=True)
+    assert reused["diagnostics"]["stage0_test_acc"] == full["diagnostics"]["stage0_test_acc"]
+
+
+def test_global_strategies_ignore_token_pooling_in_cache(tmp_path) -> None:
+    models = _tiny_models(7)
+    loaders = _tiny_loaders()
+    mean = _prepare_tiny(models, loaders, tmp_path, strategy="global_ridge", pooling="mean", force=True)
+    cls = _prepare_tiny(models, loaders, tmp_path, strategy="global_ridge", pooling="cls")
+    assert not list(tmp_path.rglob("*_clspool"))
+    assert mean["diagnostics"] == cls["diagnostics"]
+
+
+def _prepare_tiny_steer(tmp_path, clfs, *, task: str, loaders: _Loaders | None = None, **params):
+    source_finetuned, source_pretrained, target = clfs
+    loaders = loaders or _tiny_loaders()
+    return get_method("steer").prepare(
+        clf_source=source_finetuned,
+        clf_source_pretrained=source_pretrained,
+        clf_target=target,
+        source_loaders=loaders,
+        target_loaders=loaders,
+        classnames=_CLASSNAMES,
+        task=task,
+        source_build_cfg_task=_BUILD_CFG,
+        build_cfg_task=_BUILD_CFG,
+        device="cpu",
+        few_shot=2,
+        feature_cache_dir=str(tmp_path / "features"),
+        verbose=False,
+        **params,
+    )
+
+
+def _tiny_steer_models(target_depth: int = 3):
+    source_pretrained = _make_tiny_clf(depth=3)
+    source_finetuned = _make_tiny_clf(depth=3)
+    source_finetuned.load_state_dict(source_pretrained.state_dict())
+    _finetune(source_finetuned)
+    return source_finetuned, source_pretrained, _make_tiny_clf(depth=target_depth)
+
+
+def test_concat_ridge_adds_target_blocks_to_standard_cache(tmp_path) -> None:
+    """A standard cache built by global_ridge gains only features_B_blocks.pt for concat_ridge."""
+    torch.manual_seed(6)
+    clfs = _tiny_steer_models()
+    loaders = _tiny_loaders()
+    _prepare_tiny_steer(
+        tmp_path, clfs, task="TaskC", loaders=loaders, feature_regime="standard", stage_2_strategy="global_ridge"
+    )
+    split_dirs = [p.parent for p in (tmp_path / "features").rglob("features_A.pt")]
+    assert split_dirs and all(not (d / "features_B_blocks.pt").exists() for d in split_dirs)
+    mtimes = {p: p.stat().st_mtime_ns for d in split_dirs for p in d.glob("*.pt")}
+
+    prepared = _prepare_tiny_steer(
+        tmp_path, clfs, task="TaskC", loaders=loaders, feature_regime="standard", stage_2_strategy="concat_ridge"
+    )
+    assert all((d / "features_B_blocks.pt").exists() for d in split_dirs)
+    assert {p: p.stat().st_mtime_ns for p in mtimes} == mtimes  # A-side and final features not rewritten
+
+    # The cached blocks are the live ones: cached-space and live corrections agree.
+    loader = loaders.test
+    target = clfs[2]
+    captured = []
+    with steer_correction_context(target, prepared, alpha=1.0):
+        for x, _ in loader:
+            captured.append(target.model.encode_image(x))
+    cache_dir = next(d for d in split_dirs if d.name == "test")
+    f_b = torch.load(cache_dir / "features_B.pt").double()
+    blocks = {b: v.double() for b, v in torch.load(cache_dir / "features_B_blocks.pt").items()}
+    cached = f_b + prepared["correction_fn"]({"global": f_b, "blocks": blocks})
+    assert torch.allclose(torch.cat(captured).double(), cached, atol=1e-5)
+
+
+def test_concat_ridge_cross_arch_deeper_target(tmp_path) -> None:
+    """No block grouping: a deeper target simply contributes more concatenated blocks."""
+    torch.manual_seed(7)
+    clfs = _tiny_steer_models(target_depth=6)
+    for regime in ("standard", "linear"):
+        prepared = _prepare_tiny_steer(
+            tmp_path,
+            clfs,
+            task=f"crossarch_concat_{regime}",
+            feature_regime=regime,
+            stage_2_strategy="concat_ridge",
+            force_recompute_features=True,
+        )
+        x = torch.randn(4, 3, 16, 16)
+        with steer_correction_context(clfs[2], prepared, alpha=1.0):
+            logits = clfs[2](x)
+        assert logits.shape == (4, len(_CLASSNAMES))
+        assert torch.isfinite(logits).all()
+
+
+def test_concat_ridge_standard_reads_target_blocks_from_linear_cache(tmp_path) -> None:
+    """target_blocks_cache_dir: B's blocks come from the linear cache; the standard cache is never written to."""
+    import pytest
+
+    torch.manual_seed(8)
+    clfs = _tiny_steer_models()
+    loaders = _tiny_loaders()
+    common = dict(task="TaskE", loaders=loaders, stage_2_strategy="concat_ridge")
+    _prepare_tiny_steer(tmp_path, clfs, feature_regime="linear", **common)
+    _prepare_tiny_steer(
+        tmp_path, clfs, task="TaskE", loaders=loaders, feature_regime="standard", stage_2_strategy="global_ridge"
+    )
+    standard_dirs = [p.parent for p in (tmp_path / "features").rglob("standard/*/features_A.pt")]
+    mtimes = {p: p.stat().st_mtime_ns for d in standard_dirs for p in d.glob("*.pt")}
+
+    prepared = _prepare_tiny_steer(
+        tmp_path,
+        clfs,
+        feature_regime="standard",
+        target_blocks_cache_dir=str(tmp_path / "features"),
+        **common,
+    )
+    assert all(not (d / "features_B_blocks.pt").exists() for d in standard_dirs)
+    assert {p: p.stat().st_mtime_ns for d in standard_dirs for p in d.glob("*.pt")} == mtimes
+    x = torch.randn(4, 3, 16, 16)
+    with steer_correction_context(clfs[2], prepared, alpha=1.0):
+        assert torch.isfinite(clfs[2](x)).all()
+
+    # A linear cache built for a different target must be rejected, not silently paired.
+    other = (clfs[0], clfs[1], _make_tiny_clf(depth=3))
+    with pytest.raises(ValueError, match="do not match"):
+        _prepare_tiny_steer(
+            tmp_path / "other",
+            other,
+            feature_regime="standard",
+            target_blocks_cache_dir=str(tmp_path / "features"),
+            **common,
+        )
+
+
+def test_concat_ridge_standard_reads_target_blocks_from_linear_cache(tmp_path) -> None:
+    """target_blocks_cache_dir: B's blocks come from the linear cache; the standard cache is never written to."""
+    torch.manual_seed(8)
+    clfs = _tiny_steer_models()
+    loaders = _tiny_loaders()
+    _prepare_tiny_steer(tmp_path, clfs, task="TaskE", loaders=loaders, feature_regime="linear", stage_2_strategy="concat_ridge")
+    _prepare_tiny_steer(tmp_path, clfs, task="TaskE", loaders=loaders, feature_regime="standard", stage_2_strategy="global_ridge")
+    standard_files = {p: p.stat().st_mtime_ns for p in (tmp_path / "features").rglob("standard/*/*.pt")}
+
+    prepared = _prepare_tiny_steer(
+        tmp_path,
+        clfs,
+        task="TaskE",
+        loaders=loaders,
+        feature_regime="standard",
+        stage_2_strategy="concat_ridge",
+        target_blocks_cache_dir=str(tmp_path / "features"),
+    )
+    assert {p: p.stat().st_mtime_ns for p in (tmp_path / "features").rglob("standard/*/*.pt")} == standard_files
+    with steer_correction_context(clfs[2], prepared, alpha=1.0):
+        assert torch.isfinite(clfs[2](torch.randn(4, 3, 16, 16))).all()
+
+    # A linear cache of a different target must be rejected, not silently paired with these images.
+    other_target = (clfs[0], clfs[1], _make_tiny_clf(depth=3))
+    _prepare_tiny_steer(
+        tmp_path / "other", other_target, task="TaskE", loaders=loaders, feature_regime="standard",
+        stage_2_strategy="global_ridge",
+    )
+    try:
+        _prepare_tiny_steer(
+            tmp_path / "other",
+            other_target,
+            task="TaskE",
+            loaders=loaders,
+            feature_regime="standard",
+            stage_2_strategy="concat_ridge",
+            target_blocks_cache_dir=str(tmp_path / "features"),
+        )
+    except ValueError as err:
+        assert "do not match" in str(err)
+    else:
+        raise AssertionError("mismatched target_blocks_cache_dir was accepted")

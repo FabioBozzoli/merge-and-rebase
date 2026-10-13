@@ -6,8 +6,9 @@ weight-space task-vector delta. It learns, from a tiny few-shot support set, a
 correction to the target model B's pooled visual feature that makes B behave
 like a fine-tuned source model A, without ever touching B's weights. Only
 ``global_ridge`` is a pure linear map on B's final feature (foldable into a
-weight delta); ``global_mlp`` (nonlinear) and ``block_ridge`` (built from B's
-*intermediate* per-block activations) cannot be expressed as a weight delta
+weight delta); ``global_mlp`` (nonlinear), ``block_ridge`` and ``concat_ridge``
+(built from B's *intermediate* per-block activations; the latter is one ridge
+on their concatenation) cannot be expressed as a weight delta
 under any approximation. So this method does not implement the ``transport()``
 weight-delta contract meaningfully -- ``vision_rebase.py`` special-cases
 ``method_name == "steer"`` (mirroring its existing transfusion_mode/
@@ -20,12 +21,13 @@ steer4rebase (https://github.com internal repo at rebasin_linear/steer4rebase):
   - ``prepare()``: compute-or-load-from-disk-cache A's and B's features (Stage 0,
     replaces steer4rebase's external bea_utils.py feature collection), fit
     Stage 1 (head-aware logit-space correction) and the selected Stage 2
-    predictor (global_ridge / global_mlp / block_ridge).
+    predictor (global_ridge / global_mlp / block_ridge / concat_ridge).
   - ``apply_correction()`` / the eval-time hook wrapper in vision_rebase.py:
     apply the fitted Stage 2 predictor to B's real forward-pass activations.
 """
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
@@ -305,6 +307,52 @@ def _predict_block_ridge(coefficients: Sequence[torch.Tensor], block_activations
     if prediction is None:
         raise ValueError("steer block_ridge has no fitted blocks.")
     return prediction
+
+
+def _fit_concat_ridge(
+    blocks_train: Mapping[int, torch.Tensor],
+    train_target: torch.Tensor,
+    *,
+    regularization: float,
+    regularization_scaling: str = "none",
+) -> tuple[list[torch.Tensor], dict[str, Any]]:
+    """
+    Fit a single ridge from the concatenation of all target blocks to ``train_target``.
+
+    Each block ``X_b`` (rows already restricted to the support set) is divided
+    by ``s_b = sqrt(tr(X_b X_bᵀ) / n)`` before concatenation, so every block
+    enters with unit mean squared norm: raw residual activations grow with
+    depth while the final feature is L2-normalized, and an unscaled penalty
+    would shrink the blocks unevenly. ``regularization_scaling="trace"``
+    further multiplies the penalty by ``tr(X Xᵀ) / n`` of the scaled
+    concatenation (= number of blocks).
+
+    The solution ``W`` is split by block rows with ``s_b`` folded in
+    (``W_b = W[rows_b] / s_b``), so ``_predict_block_ridge`` on raw block
+    activations returns exactly ``X_scaled @ W``.
+    """
+    if regularization_scaling not in {"none", "trace"}:
+        raise ValueError(f"Unknown steer concat_ridge regularization_scaling: {regularization_scaling}")
+    block_ids = sorted(blocks_train)
+    if block_ids != list(range(len(block_ids))):
+        raise ValueError(f"steer concat_ridge expects contiguous block ids from 0, got {block_ids}")
+    n = train_target.shape[0]
+    scales = [
+        float(blocks_train[b].square().sum().div(n).sqrt().clamp_min(1e-12)) for b in block_ids
+    ]
+    features = torch.cat([blocks_train[b] / scale for b, scale in zip(block_ids, scales)], dim=1)
+    effective_regularization = regularization
+    if regularization_scaling == "trace":
+        effective_regularization = regularization * float(features.square().sum()) / n
+    coefficient = _ridge(features, train_target, effective_regularization)
+    coefficients: list[torch.Tensor] = []
+    offset = 0
+    for b, scale in zip(block_ids, scales):
+        width = blocks_train[b].shape[1]
+        coefficients.append(coefficient[offset : offset + width] / scale)
+        offset += width
+    info = {"input_dim": int(features.shape[1]), "block_scales": scales, "effective_lambda": effective_regularization}
+    return coefficients, info
 
 
 def _group_blocks_concat(blocks: Mapping[int, torch.Tensor], num_groups: int) -> dict[int, torch.Tensor]:
@@ -1024,8 +1072,21 @@ def _collect_standard_split(
     source_loader: Any,
     target_loader: Any,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Standard/nonlinear regime: plain forward passes, delta_A = f_A_ft(x) - f_A_pre(x)."""
+    block_granularity: str | None = None,
+    token_pooling: str = "mean",
+) -> dict[str, Any]:
+    """
+    Standard/nonlinear regime: plain forward passes, delta_A = f_A_ft(x) - f_A_pre(x).
+
+    With ``block_granularity`` set, B's per-site activations are captured in the
+    same forward pass and returned as ``features_B_blocks`` (concat_ridge).
+    """
+    target_capture = None
+    if block_granularity is not None:
+        target_capture, final_ids, num_target_blocks = _activation_capture_for_visual(
+            target_visual, block_granularity, token_pooling
+        )
+        features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_blocks)}
     features_a: list[torch.Tensor] = []
     delta_a: list[torch.Tensor] = []
     features_b: list[torch.Tensor] = []
@@ -1035,14 +1096,23 @@ def _collect_standard_split(
         f_a_pre = _l2_normalize(clf_source_pretrained_visual(x_a))
         features_a.append(f_a_pre.cpu())
         delta_a.append((f_a_ft - f_a_pre).cpu())
-        features_b.append(_l2_normalize(target_visual(x_b)).cpu())
+        if target_capture is None:
+            out_b = _l2_normalize(target_visual(x_b))
+        else:
+            out_b, blocks = _target_batch_activations(target_visual, x_b, target_capture, final_ids, num_target_blocks)
+            for block_id in range(num_target_blocks):
+                features_b_blocks[block_id].append(blocks[block_id].cpu())
+        features_b.append(out_b.cpu())
         labels.append(y_a.cpu())
-    return {
+    data: dict[str, Any] = {
         "features_A": torch.cat(features_a, dim=0),
         "delta_A": torch.cat(delta_a, dim=0),
         "features_B": torch.cat(features_b, dim=0),
         "y_A": torch.cat(labels, dim=0),
     }
+    if target_capture is not None:
+        data["features_B_blocks"] = {b: torch.cat(chunks, dim=0) for b, chunks in features_b_blocks.items()}
+    return data
 
 
 @torch.no_grad()
@@ -1106,14 +1176,17 @@ def _reuse_mean_pooled_split(
     target_part: Callable[[], dict[str, torch.Tensor]],
     *,
     verbose: bool,
+    need_source_blocks: bool = True,
 ) -> dict[str, Any] | None:
     """Combine pooling-invariant tensors from ``mean_cache_dir`` with freshly pooled B blocks.
 
     Returns None (caller falls back to a full extraction) when the mean cache
     is missing or does not describe the same examples/model: labels must match
     exactly and B's recomputed final feature must match the cached one.
+    ``need_source_blocks=False`` accepts a cache without ``delta_A_blocks``
+    (standard regime), so B's blocks can be added to it without redoing A.
     """
-    cached = _load_cached_split(mean_cache_dir, need_blocks=True)
+    cached = _load_cached_split(mean_cache_dir, need_source_blocks=need_source_blocks, need_target_blocks=False)
     if cached is None:
         return None
     fresh = target_part()
@@ -1129,9 +1202,52 @@ def _reuse_mean_pooled_split(
         return None
     if verbose:
         print(f"[steer] reusing pooling-invariant features from {mean_cache_dir}; recomputed target blocks only")
-    reused = dict(cached)
+    reused: dict[str, Any] = dict(cached)
     reused["features_B_blocks"] = fresh["features_B_blocks"]
+    reused["_reused_from"] = (mean_cache_dir, tuple(cached))
     return reused
+
+
+# B's final features recomputed on different GPUs/kernels agree to ~1e-5 in
+# 1 - cosine (ViT-L/14 caches: worst row 0.9989); a different model, transform
+# or example order gives far lower similarity.
+_EXTERNAL_BLOCKS_MIN_COSINE = 0.995
+
+
+def _attach_external_target_blocks(data: dict[str, Any], external_dir: Path, *, verbose: bool) -> None:
+    """Attach ``features_B_blocks`` from another cache of the same examples, after checking it matches.
+
+    The external split must hold the same examples in the same order (identical
+    labels) seen by the same target (row-wise cosine of B's final features
+    >= ``_EXTERNAL_BLOCKS_MIN_COSINE``); otherwise this raises instead of
+    pairing blocks with the wrong images.
+    """
+    required = ("features_B_blocks.pt", "features_B.pt", "y_A.pt")
+    missing = [name for name in required if not (external_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"steer target_blocks_cache_dir: {external_dir} lacks {missing}")
+    labels = torch.load(external_dir / "y_A.pt", map_location="cpu", weights_only=True)
+    if not torch.equal(labels.long(), data["y_A"].long()):
+        raise ValueError(f"steer target_blocks_cache_dir: labels at {external_dir} differ from the feature cache")
+    external_b = torch.load(external_dir / "features_B.pt", map_location="cpu", weights_only=True).double()
+    own_b = data["features_B"].double()
+    if external_b.shape != own_b.shape:
+        raise ValueError(
+            f"steer target_blocks_cache_dir: features_B shape {tuple(external_b.shape)} at {external_dir} "
+            f"!= {tuple(own_b.shape)}"
+        )
+    cosine = F.cosine_similarity(external_b, own_b, dim=1)
+    if float(cosine.min()) < _EXTERNAL_BLOCKS_MIN_COSINE:
+        raise ValueError(
+            f"steer target_blocks_cache_dir: B's final features at {external_dir} do not match the feature cache "
+            f"(min cosine {float(cosine.min()):.4f} < {_EXTERNAL_BLOCKS_MIN_COSINE})"
+        )
+    data["features_B_blocks"] = torch.load(external_dir / "features_B_blocks.pt", map_location="cpu", weights_only=True)
+    if verbose:
+        print(
+            f"[steer] using B's block activations from {external_dir} "
+            f"(features_B min cosine {float(cosine.min()):.6f}, mean 1-cos {float((1 - cosine).mean()):.2e})"
+        )
 
 
 def _collect_linear_split(
@@ -1255,10 +1371,14 @@ def _load_cached_head(path: Path) -> torch.Tensor | None:
     return value.double()
 
 
-def _load_cached_split(cache_dir: Path, *, need_blocks: bool) -> dict[str, torch.Tensor] | None:
+def _load_cached_split(
+    cache_dir: Path, *, need_source_blocks: bool, need_target_blocks: bool
+) -> dict[str, torch.Tensor] | None:
     required = ["features_A", "delta_A", "features_B", "y_A"]
-    if need_blocks:
-        required += ["delta_A_blocks", "features_B_blocks"]
+    if need_source_blocks:
+        required.append("delta_A_blocks")
+    if need_target_blocks:
+        required.append("features_B_blocks")
     if not all((cache_dir / f"{name}.pt").exists() for name in required):
         return None
     try:
@@ -1270,7 +1390,10 @@ def _load_cached_split(cache_dir: Path, *, need_blocks: bool) -> dict[str, torch
 def _save_split_cache(cache_dir: Path, data: Mapping[str, torch.Tensor]) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     for name, value in data.items():
-        torch.save(value, cache_dir / f"{name}.pt")
+        # Write-then-rename: concurrent jobs sharing a cache never read a partial file.
+        tmp = cache_dir / f".{name}.pt.{os.getpid()}.tmp"
+        torch.save(value, tmp)
+        os.replace(tmp, cache_dir / f"{name}.pt")
 
 
 def _load_or_compute_split(
@@ -1282,7 +1405,8 @@ def _load_or_compute_split(
     feature_regime: str,
     split: str,
     force_recompute_features: bool,
-    need_blocks: bool,
+    need_source_blocks: bool,
+    need_target_blocks: bool,
     compute_fn: Callable[[], dict[str, Any]],
     verbose: bool,
     block_granularity: str = "residual",
@@ -1299,7 +1423,9 @@ def _load_or_compute_split(
         token_pooling,
     )
     if not force_recompute_features:
-        cached = _load_cached_split(cache_dir, need_blocks=need_blocks)
+        cached = _load_cached_split(
+            cache_dir, need_source_blocks=need_source_blocks, need_target_blocks=need_target_blocks
+        )
         if cached is not None:
             if verbose:
                 print(f"[steer] using cached features at {cache_dir}")
@@ -1307,7 +1433,11 @@ def _load_or_compute_split(
     if verbose:
         print(f"[steer] computing features for {cache_dir}")
     data = compute_fn()
-    _save_split_cache(cache_dir, data)
+    # Tensors reused from this very cache dir are already on disk: write only
+    # the new ones (e.g. features_B_blocks added to an existing standard cache).
+    reused_dir, reused_keys = data.pop("_reused_from", (None, ()))
+    to_save = {k: v for k, v in data.items() if not (reused_dir == cache_dir and k in reused_keys)}
+    _save_split_cache(cache_dir, to_save)
     if verbose:
         print(f"[steer] computed and cached features to {cache_dir}")
     return data
@@ -1365,6 +1495,8 @@ class SteerRebase:
         block_ridge_lambda_scaling: str = "none",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
+        target_blocks_cache_dir: str | None = None,
+        target_blocks_regime: str = "linear",
         seed: int = 42,
         verbose: bool = True,
         **kwargs: Any,
@@ -1372,8 +1504,8 @@ class SteerRebase:
         del kwargs
         if feature_regime not in {"standard", "linear"}:
             raise ValueError("steer feature_regime must be 'standard' or 'linear'")
-        if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge"}:
-            raise ValueError("steer stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge")
+        if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge", "concat_ridge"}:
+            raise ValueError("steer stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge, concat_ridge")
         if stage_2_strategy == "block_ridge" and feature_regime != "linear":
             raise ValueError("steer block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
         if block_granularity not in _BLOCK_GRANULARITIES:
@@ -1389,10 +1521,21 @@ class SteerRebase:
 
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         log_prefix = "[steer]"
-        need_blocks = stage_2_strategy == "block_ridge"
-        # Only block_ridge reads token-pooled activations; every other strategy
-        # shares the mean-pooled cache, whose tensors are identical for it.
-        cache_pooling = token_pooling if need_blocks else "mean"
+        # block_ridge needs A's per-block deltas and B's block activations;
+        # concat_ridge only B's block activations (so it also runs in the
+        # standard regime).
+        need_source_blocks = stage_2_strategy == "block_ridge"
+        need_target_blocks = stage_2_strategy in {"block_ridge", "concat_ridge"}
+        # Only strategies reading B's blocks see token-pooled activations; every
+        # other strategy shares the mean-pooled cache, whose tensors are identical for it.
+        cache_pooling = token_pooling if need_target_blocks else "mean"
+        # B's block activations do not depend on A's regime: in the standard
+        # regime they can be read from another (e.g. linear) cache of the same
+        # pair/task instead of being extracted. Nothing is written in that case.
+        external_target_blocks = (
+            need_target_blocks and feature_regime == "standard" and target_blocks_cache_dir is not None
+        )
+        load_target_blocks = need_target_blocks and not external_target_blocks
 
         # steer4rebase's data.py loads head_A.pt/head_B.pt from the train split
         # directory (a dict with a "weight" key, or a raw tensor) rather than
@@ -1493,7 +1636,7 @@ class SteerRebase:
         if token_pooling == "cls":
             if _is_resnet_visual(target_visual):
                 raise ValueError("steer token_pooling='cls' requires a CLIP ViT target; ResNets have no class token.")
-            if stage_2_strategy != "block_ridge" and verbose:
+            if not need_target_blocks and verbose:
                 # The final encode_image feature is already the projected class
                 # token, so only block_ridge's intermediate activations change.
                 print(f"{log_prefix} token_pooling='cls' has no effect with stage_2_strategy='{stage_2_strategy}'.")
@@ -1522,6 +1665,25 @@ class SteerRebase:
                 per_class=train_per_class if split == "train" else None,
             )
             if feature_regime == "standard":
+                if load_target_blocks and not force_recompute_features:
+                    # Add B's blocks to an existing standard cache (mean-pooled
+                    # dir, possibly this one) without redoing A's forward passes.
+                    reused = _reuse_mean_pooled_split(
+                        _cache_split_dir(
+                            feature_cache_dir, source_tag, target_tag, task, feature_regime, cache_split, block_granularity
+                        ),
+                        lambda: _collect_target_blocks_split(
+                            target_visual=target_visual,
+                            target_loader=target_loader,
+                            device=dev,
+                            block_granularity=block_granularity,
+                            token_pooling=token_pooling,
+                        ),
+                        verbose=verbose,
+                        need_source_blocks=False,
+                    )
+                    if reused is not None:
+                        return reused
                 return _collect_standard_split(
                     clf_source_finetuned_visual=source_finetuned_visual,
                     clf_source_pretrained_visual=source_pretrained_visual,
@@ -1529,6 +1691,8 @@ class SteerRebase:
                     source_loader=source_loader,
                     target_loader=target_loader,
                     device=dev,
+                    block_granularity=block_granularity if load_target_blocks else None,
+                    token_pooling=token_pooling,
                 )
             if cache_pooling != "mean" and not force_recompute_features:
                 reused = _reuse_mean_pooled_split(
@@ -1569,7 +1733,8 @@ class SteerRebase:
             feature_regime=feature_regime,
             split=train_split,
             force_recompute_features=force_recompute_features,
-            need_blocks=need_blocks,
+            need_source_blocks=need_source_blocks,
+            need_target_blocks=load_target_blocks,
             compute_fn=lambda: _compute("train", train_split),
             verbose=verbose,
             block_granularity=block_granularity,
@@ -1583,12 +1748,30 @@ class SteerRebase:
             feature_regime=feature_regime,
             split="test",
             force_recompute_features=force_recompute_features,
-            need_blocks=need_blocks,
+            need_source_blocks=need_source_blocks,
+            need_target_blocks=load_target_blocks,
             compute_fn=lambda: _compute("test", "test"),
             verbose=verbose,
             block_granularity=block_granularity,
             token_pooling=cache_pooling,
         )
+
+        if external_target_blocks:
+            for split_name, data in ((train_split, train_data), ("test", test_data)):
+                _attach_external_target_blocks(
+                    data,
+                    _cache_split_dir(
+                        target_blocks_cache_dir,
+                        source_tag,
+                        target_tag,
+                        task,
+                        target_blocks_regime,
+                        split_name,
+                        block_granularity,
+                        cache_pooling,
+                    ),
+                    verbose=verbose,
+                )
 
         f_a = train_data["features_A"].double()
         delta_a = train_data["delta_A"].double()
@@ -1642,6 +1825,44 @@ class SteerRebase:
                 model_device = next(_model.parameters()).device
                 with torch.no_grad():
                     out = _model(activations["global"].double().to(model_device))
+                return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
+
+        elif stage_2_strategy == "concat_ridge":
+            # Select the support rows before upcasting and drop the full-split
+            # blocks: they are the largest tensors here (GBs for ViT-L).
+            features_b_blocks_train = {b: v[selected].double() for b, v in train_data.pop("features_B_blocks").items()}
+            num_target_blocks_total = len(features_b_blocks_train)
+            concat_dim = sum(v.shape[1] for v in features_b_blocks_train.values())
+            if verbose and concat_dim > 50_000:
+                print(
+                    f"{log_prefix} WARNING: concat_ridge input has {concat_dim} dims; X needs "
+                    f"{int(selected.numel()) * concat_dim * 8 / 2**30:.1f} GiB in float64."
+                )
+            fitted, concat_info = _fit_concat_ridge(
+                features_b_blocks_train,
+                train_target,
+                regularization=ridge_lambda,
+                regularization_scaling=block_ridge_lambda_scaling,
+            )
+            coefficients = [c.to(dev) for c in fitted]
+            if verbose:
+                scales = ", ".join(f"{s:.3g}" for s in concat_info["block_scales"])
+                print(
+                    f"{log_prefix} prepare: concat_ridge over {num_target_blocks_total} blocks, "
+                    f"input dim {concat_info['input_dim']}, lambda_eff {concat_info['effective_lambda']:.4g}, "
+                    f"block scales [{scales}]"
+                )
+
+            def correction_fn(
+                activations: Mapping[str, torch.Tensor],
+                *,
+                _coefficients=coefficients,
+            ) -> torch.Tensor:
+                # One block at a time, so only a single block is ever upcast/moved.
+                out = None
+                for block_id, coefficient in enumerate(_coefficients):
+                    contribution = activations["blocks"][block_id].to(coefficient.device).double() @ coefficient
+                    out = contribution if out is None else out + contribution
                 return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
         else:  # block_ridge
@@ -1765,8 +1986,9 @@ class SteerRebase:
         # (activation hooks + alpha sweep), so comparing the two isolates a
         # Stage 1/2 problem from a live-integration problem.
         cached_test_activations: dict[str, Any] = {"global": f_b_test}
-        if need_blocks:
-            cached_test_activations["blocks"] = {b: v.double() for b, v in test_data["features_B_blocks"].items()}
+        if need_target_blocks:
+            # Left in the cached dtype: every correction_fn upcasts per block itself.
+            cached_test_activations["blocks"] = dict(test_data["features_B_blocks"])
         stage2_test_acc = _accuracy(f_b_test + correction_fn(cached_test_activations), w_b, test_labels)
         # Uncorrected zero-shot accuracy of B in cached-tensor space. This must
         # match the target_zeroshot baseline vision_rebase.py measures with a
@@ -1842,7 +2064,7 @@ def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, al
     """
     visual = clf_target.model.visual
     original_encode_image = clf_target.model.encode_image
-    needs_blocks = prepared["stage_2_strategy"] == "block_ridge"
+    needs_blocks = prepared["stage_2_strategy"] in {"block_ridge", "concat_ridge"}
     block_granularity = str(prepared.get("block_granularity", "residual"))
     token_pooling = str(prepared.get("token_pooling", "mean"))
 

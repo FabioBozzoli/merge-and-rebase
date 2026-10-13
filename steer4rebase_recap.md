@@ -10,7 +10,7 @@ It is architecturally different from every other rebase method in this repo (`gr
 
 | steer4rebase piece | Ported as | Notes |
 |---|---|---|
-| `stage1.py` (`projection`, `target_corrections`) | `_stage1_projection`, `_stage1_target_corrections` | Unchanged math. |
+| `stage1.py` (`projection`, `target_corrections`) | `_stage1_projection`, `_stage1_target_corrections` | Same math, except the pseudo-inverse of the support-set delta is energy-truncated (`stage1_energy_threshold`, default 0.99; `1.0` = original exact `pinv`). |
 | `stage2.py` (`ridge`, `global_ridge`, `ResidualMLP`/`global_mlp`, `block_ridge`) | `_ridge`, `_fit_global_mlp`, `_fit_block_ridge`/`_predict_block_ridge` | Unchanged math. |
 | `data.py` (`few_shot`, `random_sample`, `group_blocks`) | `_few_shot`, `_random_sample`, `_group_blocks_concat`/`_group_blocks_sum_avg` | Only `concat`/`sum_avg` grouping ported (the two non-experimental strategies); `group_grid.py`'s V11/V12 distributed-weight variants are **not** ported. |
 | `linearize.py` (`clip_vit_parameter_blocks`, `clip_resnet_parameter_blocks`, activation hooks) | `_clip_vit_parameter_blocks`, `_clip_resnet_parameter_blocks`, `_BlockActivationCapture` | Both ViT and ResNet CLIP visual backbones are supported as the **target** model. |
@@ -36,16 +36,17 @@ Everything lives in one file: `src/merge_and_rebase/rebase/methods/steer.py` (sa
 | Parameter | Default | Values | Notes |
 |---|---:|---|---|
 | `feature_regime` | `"standard"` | `"standard"` \| `"linear"` | `"linear"` required for `block_ridge`. |
-| `stage_2_strategy` | `"global_ridge"` | `"global_ridge"` \| `"global_mlp"` \| `"block_ridge"` | |
+| `stage_2_strategy` | `"global_ridge"` | `"global_ridge"` \| `"global_mlp"` \| `"block_ridge"` \| `"concat_ridge"` | `concat_ridge`: one ridge from `[h_1/s_1, …, h_L/s_L, f_B/s_{L+1}]` (all of B's blocks at `block_granularity` + final feature, `s_b = sqrt(tr(X_b X_bᵀ)/n)` on the support set) to the same global Stage 1 target as `global_ridge`. Works in both regimes. |
 | `block_group_strategy` | `"concat"` | `"concat"` \| `"sum_avg"` | Only used by `block_ridge` when source/target depths differ (must be an integer ratio, e.g. 12→24). |
 | `block_ridge_mode` | `"independent"` | `"independent"` \| `"smoothed_residual"` | Chained per-block residual smoothing, controlled by `rho`. |
 | `rho` | `0.9` | `[0, 1]` | Only used when `block_ridge_mode="smoothed_residual"`. |
-| `block_ridge_lambda_scaling` | `"none"` | `"none"` \| `"trace"` | `block_ridge` only. `"trace"` fits block `b` with `ridge_lambda * tr(X_b X_bᵀ) / n`, so one dimensionless `ridge_lambda` gives comparable shrinkage on blocks whose activation scales differ (raw residual blocks vs the L2-normalized output). |
+| `block_ridge_lambda_scaling` | `"none"` | `"none"` \| `"trace"` | For `concat_ridge`, `"trace"` multiplies `ridge_lambda` by `tr(XXᵀ)/n` of the scaled concatenation (= number of blocks). For `block_ridge`: `"trace"` fits block `b` with `ridge_lambda * tr(X_b X_bᵀ) / n`, so one dimensionless `ridge_lambda` gives comparable shrinkage on blocks whose activation scales differ (raw residual blocks vs the L2-normalized output). |
 | `block_granularity` | `"residual"` | `"residual"` \| `"attention"` \| `"linear"` \| `"model"` | Where target features are taken: `"residual"` = end of each resblock. |
 | `few_shot` | — | int | Shots per class. Exactly one of `few_shot` / `total_support_examples` must be set. |
 | `total_support_examples` | — | int | Fixed-size random support set instead of per-class few-shot. |
 | `stage1_lambda` | `1.0` | float | Stage 1 ridge regularization. |
-| `ridge_lambda` | `1.0` | float | Stage 2 `global_ridge`/`block_ridge` regularization. |
+| `stage1_energy_threshold` | `0.99` | `(0, 1]` | Stage 1 inverts the support-set delta with a truncated pseudo-inverse: it keeps the smallest number of leading singular values whose **sum** reaches this fraction of the sum of all (non-zero) singular values, so the rank adapts to the spectrum. `1.0` = exact `pinv` (behaviour before this option). The kept/total rank is logged and returned in `diagnostics`. |
+| `ridge_lambda` | `1.0` | float | Stage 2 `global_ridge`/`block_ridge`/`concat_ridge` regularization. |
 | `mlp_hidden_dim` | `1024` | int | `global_mlp` only. |
 | `mlp_epochs` | `100` | int | `global_mlp` only. |
 | `feature_cache_dir` | `"src/.cache/steer_features"` | path | Where computed features are cached/looked up. |
@@ -71,6 +72,7 @@ To try the other Stage 2 strategies, edit `method_params.stage_2_strategy`:
 - `"global_ridge"` — works with `feature_regime: "standard"` or `"linear"`.
 - `"global_mlp"` — same, plus `mlp_hidden_dim`/`mlp_epochs`.
 - `"block_ridge"` — **requires** `feature_regime: "linear"`.
+- `"concat_ridge"` — either regime. In `"standard"`, B's block activations are added to an existing cache (`features_B_blocks.pt`) without recomputing A. Grid: `configs/vision8_steer_concat/` + `scripts/slurm/submit_vision_concatridge.sh`.
 
 First run for a given `(source, target, task, regime)` combination computes and caches features (slower); subsequent runs reuse the cache automatically unless `force_recompute_features: true` is set.
 
