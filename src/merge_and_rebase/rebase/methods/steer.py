@@ -170,7 +170,7 @@ def _stage1_projection(
     The support-set delta is inverted with ``_energy_truncated_pinv``; returns the map plus the kept and
     full rank of that inverse.
     """
-    if regularization <= 0:
+    if regularization < 0:
         raise ValueError("steer stage1 regularization must be positive")
     residual = (f_a[selected] + delta_a[selected]) @ w_a.T - f_b[selected] @ w_b.T
     pinv, kept_rank, rank = _energy_truncated_pinv(delta_a[selected], energy_threshold)
