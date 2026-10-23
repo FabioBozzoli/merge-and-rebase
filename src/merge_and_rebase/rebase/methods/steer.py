@@ -164,20 +164,60 @@ def _stage1_projection(
     w_b: torch.Tensor,
     selected: torch.Tensor,
     regularization: float,
+    regularization_mode: str = "transported",
     energy_threshold: float = 0.99,
 ) -> tuple[torch.Tensor, int, int]:
     """
-    Fit the logit correction map with a penalty on the transported residual.
+    Fit the Stage 1 logit correction map.
 
-    The support-set delta is inverted with ``_energy_truncated_pinv``; returns the map plus the kept and
-    full rank of that inverse.
+    ``regularization_mode="transported"`` preserves the original objective,
+    whose penalty is ``lambda * ||R D_A||_F^2``.  The support-set delta is
+    inverted with ``_energy_truncated_pinv`` and the unregularized solution is
+    shrunk by ``1 / (1 + lambda)``.
+
+    ``regularization_mode="standard"`` instead solves standard matrix ridge,
+    ``||E - R D_A||_F^2 + lambda * ||R||_F^2``, using the primal or dual
+    closed form according to the smaller system.
+
+    Returns the map plus the kept and full rank.  Standard ridge does not
+    truncate singular values, so its kept rank equals its full numerical rank.
     """
-    if regularization <= 0:
-        raise ValueError("steer stage1 regularization must be positive")
+    if regularization < 0:
+        raise ValueError("steer stage1 regularization must be non-negative")
+    if regularization_mode not in {"transported", "standard"}:
+        raise ValueError("steer stage1 regularization_mode must be 'transported' or 'standard'")
     residual = (f_a[selected] + delta_a[selected]) @ w_a.T - f_b[selected] @ w_b.T
-    pinv, kept_rank, rank = _energy_truncated_pinv(delta_a[selected], energy_threshold)
-    logit_map = pinv @ residual
-    return (logit_map / (1.0 + regularization)).T, kept_rank, rank
+    support_delta = delta_a[selected]
+
+    if regularization_mode == "transported":
+        pinv, kept_rank, rank = _energy_truncated_pinv(support_delta, energy_threshold)
+        logit_map = pinv @ residual
+        return (logit_map / (1.0 + regularization)).T, kept_rank, rank
+
+    rank = int(torch.linalg.matrix_rank(support_delta))
+    if regularization == 0:
+        # The closed-form systems need not be invertible at lambda=0.  The
+        # Moore-Penrose solution is the corresponding minimum-norm least-
+        # squares solution and keeps zero regularization useful for ablations.
+        logit_map = torch.linalg.pinv(support_delta) @ residual
+        return logit_map.T, rank, rank
+
+    n, dimension = support_delta.shape
+    if n <= dimension:
+        # Dual form: R^T = D_A^T (D_A D_A^T + lambda I)^-1 E^T.
+        eye = torch.eye(n, dtype=support_delta.dtype, device=support_delta.device)
+        logit_map = support_delta.T @ torch.linalg.solve(
+            support_delta @ support_delta.T + regularization * eye,
+            residual,
+        )
+    else:
+        # Primal form: R^T = (D_A^T D_A + lambda I)^-1 D_A^T E^T.
+        eye = torch.eye(dimension, dtype=support_delta.dtype, device=support_delta.device)
+        logit_map = torch.linalg.solve(
+            support_delta.T @ support_delta + regularization * eye,
+            support_delta.T @ residual,
+        )
+    return logit_map.T, rank, rank
 
 
 def _stage1_target_corrections(
@@ -190,6 +230,7 @@ def _stage1_target_corrections(
     delta_a_test: torch.Tensor,
     selected: torch.Tensor,
     regularization: float,
+    regularization_mode: str = "transported",
     energy_threshold: float = 0.99,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return train and test target corrections in B's feature space."""
@@ -201,6 +242,7 @@ def _stage1_target_corrections(
         w_b=w_b,
         selected=selected,
         regularization=regularization,
+        regularization_mode=regularization_mode,
         energy_threshold=energy_threshold,
     )
     p_b = torch.linalg.pinv(w_b)
@@ -1488,6 +1530,7 @@ class SteerRebase:
         few_shot: int | None = None,
         total_support_examples: int | None = None,
         stage1_lambda: float = 1.0,
+        stage1_regularization_mode: str = "transported",
         stage1_energy_threshold: float = 0.99,
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
@@ -1516,6 +1559,8 @@ class SteerRebase:
             raise ValueError(f"steer token_pooling must be one of: {sorted(_TOKEN_POOLINGS)}")
         if block_ridge_lambda_scaling not in {"none", "trace"}:
             raise ValueError("steer block_ridge_lambda_scaling must be 'none' or 'trace'")
+        if stage1_regularization_mode not in {"transported", "standard"}:
+            raise ValueError("steer stage1_regularization_mode must be 'transported' or 'standard'")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer requires exactly one of few_shot or total_support_examples")
 
@@ -1794,6 +1839,7 @@ class SteerRebase:
             w_b=w_b,
             selected=selected,
             regularization=stage1_lambda,
+            regularization_mode=stage1_regularization_mode,
             energy_threshold=stage1_energy_threshold,
         )
         p_b = torch.linalg.pinv(w_b)
@@ -1801,10 +1847,17 @@ class SteerRebase:
         test_target = delta_a_test @ logit_map.T @ p_b.T
         stage1_test_acc = _accuracy(f_b_test + test_target, w_b, test_labels)
         if verbose:
-            print(
-                f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
-                f"(energy threshold {stage1_energy_threshold})"
-            )
+            if stage1_regularization_mode == "transported":
+                print(
+                    f"{log_prefix} prepare: stage1 transported regularization; pinv kept "
+                    f"{stage1_kept_rank}/{stage1_rank} singular values "
+                    f"(energy threshold {stage1_energy_threshold})"
+                )
+            else:
+                print(
+                    f"{log_prefix} prepare: stage1 standard ridge regularization; "
+                    f"numerical rank {stage1_rank}"
+                )
             print(f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} (uses A's delta at test time; diagnostic only)")
 
         num_source_blocks = None
@@ -2011,6 +2064,7 @@ class SteerRebase:
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
+            "stage1_regularization_mode": stage1_regularization_mode,
             "block_granularity": block_granularity,
             "token_pooling": token_pooling,
             "block_ridge_lambda_scaling": block_ridge_lambda_scaling,
@@ -2023,6 +2077,7 @@ class SteerRebase:
                 "stage2_test_acc": stage2_test_acc,
                 "stage1_kept_rank": stage1_kept_rank,
                 "stage1_rank": stage1_rank,
+                "stage1_regularization_mode": stage1_regularization_mode,
                 "stage1_energy_threshold": stage1_energy_threshold,
             },
         }
