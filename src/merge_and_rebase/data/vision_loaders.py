@@ -399,6 +399,7 @@ def build_vision_loaders(
     classnames_override: Sequence[str] | None = None,
     strict_classnames: bool = True,
     drop_last_train: bool = False,
+    svhn_custom_preprocess: bool | None = None,
 ) -> VisionLoaders:
     """
     Build train/val/test DataLoaders for HF image classification datasets.
@@ -431,7 +432,9 @@ def build_vision_loaders(
     if hf_path == "tanganke/emnist_mnist":
         eval_preprocess = emnist_fix_transform(eval_preprocess)
         train_transform = emnist_fix_transform(train_transform)
-    train_transform, eval_preprocess = maybe_svhn_transforms(hf_path, train_transform, eval_preprocess)
+    train_transform, eval_preprocess = maybe_svhn_transforms(
+        hf_path, train_transform, eval_preprocess, enabled=svhn_custom_preprocess
+    )
 
     # Wrap with torch datasets
     train_ds = HFVisionDataset(

@@ -933,3 +933,206 @@ def test_concat_ridge_standard_reads_target_blocks_from_linear_cache(tmp_path) -
         assert "do not match" in str(err)
     else:
         raise AssertionError("mismatched target_blocks_cache_dir was accepted")
+
+
+def test_block_ridge_shared_input_independent_equals_global_ridge() -> None:
+    """With the same input X for every block, independent block ridges sum to one ridge on the summed
+    target (ridge is linear in its target); the smoothed carry breaks this equivalence."""
+    g = torch.Generator().manual_seed(7)
+    n_sel, num_blocks, d_in, d_out, lam = 12, 4, 6, 3, 0.5
+    x = torch.randn(n_sel, d_in, generator=g, dtype=torch.float64)
+    targets = torch.randn(n_sel, num_blocks, d_out, generator=g, dtype=torch.float64)
+    shared = {b: x for b in range(num_blocks)}
+    selected = torch.arange(n_sel)
+    global_pred = x @ steer_mod._ridge(x, targets.sum(dim=1), lam)
+
+    independent = steer_mod._fit_block_ridge(shared, targets, selected=selected, regularization=lam, mode="independent")
+    assert torch.allclose(steer_mod._predict_block_ridge(independent, shared), global_pred, atol=1e-8)
+
+    smoothed = steer_mod._fit_block_ridge(
+        shared, targets, selected=selected, regularization=lam, mode="smoothed_residual", rho=0.9
+    )
+    assert not torch.allclose(steer_mod._predict_block_ridge(smoothed, shared), global_pred, atol=1e-6)
+
+
+def test_steer_block_ridge_final_input_end_to_end(tmp_path) -> None:
+    """block_ridge_input='final': every block ridge reads B's final feature. Runs through prepare()
+    without B's block activations, applies global @ sum_b W_b live, and in independent mode matches
+    global_ridge up to the linearized per-block decomposition error."""
+    import pytest
+
+    torch.manual_seed(4)
+    loaders = _tiny_loaders()
+    clf_source_pretrained = _make_tiny_clf(depth=3)
+    clf_source_finetuned = _make_tiny_clf(depth=3)
+    clf_source_finetuned.load_state_dict(clf_source_pretrained.state_dict())
+    _finetune(clf_source_finetuned)
+    clf_target = _make_tiny_clf(depth=3)
+
+    def _prepare(stage_2_strategy: str = "block_ridge", **overrides):
+        params = dict(
+            clf_source=clf_source_finetuned,
+            clf_source_pretrained=clf_source_pretrained,
+            clf_target=clf_target,
+            source_loaders=loaders,
+            target_loaders=loaders,
+            classnames=_CLASSNAMES,
+            task="tiny_final_input",
+            source_build_cfg_task=_BUILD_CFG,
+            build_cfg_task=_BUILD_CFG,
+            device="cpu",
+            feature_regime="linear",
+            stage_2_strategy=stage_2_strategy,
+            block_granularity="residual",
+            ridge_lambda=0.1,
+            few_shot=2,
+            feature_cache_dir=str(tmp_path / "features"),
+            verbose=False,
+        )
+        params.update(overrides)
+        return get_method("steer").prepare(**params)
+
+    smoothed = _prepare(
+        block_ridge_input="final", block_ridge_mode="smoothed_residual", rho=0.9, block_ridge_lambda_scaling="trace"
+    )
+    assert smoothed["block_ridge_input"] == "final" and smoothed["needs_target_blocks"] is False
+    assert smoothed["diagnostics"]["stage2_global_equiv_test_acc"] is not None
+
+    x = torch.randn(4, 3, 16, 16)
+    base = clf_target.model.encode_image(x)
+    base = base / base.norm(dim=-1, keepdim=True)
+    coef = smoothed["correction_fn"].__kwdefaults__["_coef"]
+    with steer_correction_context(clf_target, smoothed, alpha=1.0):
+        corrected = clf_target.model.encode_image(x)
+    assert torch.allclose(corrected, base + (base.double() @ coef).to(base.dtype), atol=1e-5)
+
+    independent = _prepare(block_ridge_input="final", block_ridge_mode="independent")
+    global_ridge = _prepare("global_ridge")
+    feats = torch.randn(6, base.shape[1])
+    got = independent["correction_fn"]({"global": feats})
+    want = global_ridge["correction_fn"]({"global": feats})
+    assert torch.allclose(got, want, rtol=1e-3, atol=1e-4)
+    assert not torch.allclose(smoothed["correction_fn"]({"global": feats}), got, atol=1e-6)
+
+    with pytest.raises(ValueError, match="block_ridge_input"):
+        _prepare(block_ridge_input="last")
+    with pytest.raises(ValueError, match="block_ridge_input"):
+        _prepare("concat_ridge", block_ridge_input="final")
+
+
+def test_per_class_subset_matches_few_shot_and_caps_small_classes() -> None:
+    """Classes with >= per_class examples get exactly _few_shot's draw (existing caches keep their rows);
+    smaller classes are kept whole instead of raising."""
+    labels = torch.tensor([0] * 60 + [1] * 55 + [2] * 70)
+    assert torch.equal(steer_mod._per_class_subset(labels, 50, seed=0), steer_mod._few_shot(labels, 50, seed=0))
+
+    small = torch.tensor([0] * 60 + [1] * 12 + [2] * 70)
+    picked = steer_mod._per_class_subset(small, 50, seed=0)
+    counts = torch.bincount(small[picked])
+    assert counts.tolist() == [50, 12, 50]
+    assert picked.unique().numel() == picked.numel()
+
+
+def test_stage1_target_corrections_logit_space_skips_head_pinv() -> None:
+    w_a, w_b, f_a, delta_a, f_b, labels = _synthetic_dataset(d_b=7, classes=4)
+    selected = torch.arange(16)
+    kwargs = dict(f_a=f_a, delta_a=delta_a, w_a=w_a, f_b=f_b, w_b=w_b, delta_a_test=delta_a, selected=selected, regularization=1.0)
+    logit_train, logit_test = steer_mod._stage1_target_corrections(correction_space="logit", **kwargs)
+    feature_train, feature_test = steer_mod._stage1_target_corrections(**kwargs)
+    assert logit_train.shape == (16, w_b.shape[0])
+    assert logit_test.shape == (f_a.shape[0], w_b.shape[0])
+    # w_b [C, D_B] with C < D_B has full row rank, so w_b @ pinv(w_b) = I: the feature-space target
+    # read through the head is exactly the logit-space one.
+    assert torch.allclose(feature_train @ w_b.T, logit_train, atol=1e-10)
+    assert torch.allclose(feature_test @ w_b.T, logit_test, atol=1e-10)
+
+
+def _prepare_tiny_logit(tmp_path, *, strategy: str, regime: str, **overrides):
+    torch.manual_seed(0)
+    loaders = _tiny_loaders()
+    clf_source_pretrained = _make_tiny_clf(depth=3)
+    clf_source_finetuned = _make_tiny_clf(depth=3)
+    clf_source_finetuned.load_state_dict(clf_source_pretrained.state_dict())
+    _finetune(clf_source_finetuned)
+    clf_target = _make_tiny_clf(depth=3)
+    kwargs = dict(
+        clf_source=clf_source_finetuned,
+        clf_source_pretrained=clf_source_pretrained,
+        clf_target=clf_target,
+        source_loaders=loaders,
+        target_loaders=loaders,
+        classnames=_CLASSNAMES,
+        task=f"tiny_logit_{strategy}_{regime}",
+        source_build_cfg_task=_BUILD_CFG,
+        build_cfg_task=_BUILD_CFG,
+        device="cpu",
+        feature_regime=regime,
+        stage_2_strategy=strategy,
+        few_shot=2,
+        feature_cache_dir=str(tmp_path / "features"),
+        force_recompute_features=True,
+        mlp_epochs=3,
+        verbose=False,
+    )
+    kwargs.update(overrides)
+    return get_method("steer").prepare(**kwargs), clf_target, loaders
+
+
+def test_steer_logit_space_end_to_end(tmp_path) -> None:
+    """correction_space='logit': Stage 2 predicts [C] logit offsets, added after the head at eval."""
+    import pytest
+
+    cases = [
+        ("global_ridge", "standard", {}),
+        ("global_mlp", "standard", {}),
+        ("block_ridge", "linear", {}),
+        ("block_ridge", "linear", {"block_ridge_input": "final", "block_ridge_mode": "smoothed_residual"}),
+        ("concat_ridge", "standard", {}),
+        ("concat_ridge", "linear", {}),
+    ]
+    for strategy, regime, extra in cases:
+        prepared, clf_target, loaders = _prepare_tiny_logit(
+            tmp_path, strategy=strategy, regime=regime, correction_space="logit", **extra
+        )
+        assert prepared["correction_space"] == "logit"
+        assert prepared["logit_unit_scale"] == pytest.approx(1.0)
+        x = torch.randn(4, 3, 16, 16)
+        plain = clf_target(x)
+        with steer_correction_context(clf_target, prepared, alpha=0.0):
+            at_zero = clf_target(x)
+            # encode_image is untouched: the correction never enters feature space.
+            assert torch.equal(clf_target.model.encode_image(x), clf_target.model.visual(x))
+        assert torch.allclose(at_zero, plain, atol=1e-5)
+        with steer_correction_context(clf_target, prepared, alpha=1.0):
+            logits = clf_target(x)
+        assert "forward" not in vars(clf_target)  # restored
+        assert logits.shape == (4, len(_CLASSNAMES))
+        assert torch.isfinite(logits).all()
+
+        # logits == logit_scale * (norm(f) @ W^T + c), with c the raw Stage 2 prediction.
+        global_feat = torch.nn.functional.normalize(clf_target.model.encode_image(x), dim=-1)
+        activations = {"global": global_feat}
+        if prepared["needs_target_blocks"]:
+            capture_context, final_ids, expected = steer_mod._activation_capture_for_visual(
+                clf_target.model.visual, prepared["block_granularity"], prepared["token_pooling"]
+            )
+            with capture_context as capture:
+                out = clf_target.model.encode_image(x)
+            activations["blocks"] = steer_mod._complete_captured_activations(
+                capture, final_output=torch.nn.functional.normalize(out, dim=-1), final_ids=final_ids, expected_blocks=expected
+            )
+        correction = prepared["correction_fn"](activations)
+        assert correction.shape == (4, len(_CLASSNAMES))
+        want = plain + clf_target.logit_scale * correction
+        assert torch.allclose(logits, want, rtol=1e-4, atol=1e-3)
+
+        # Live accuracy through the wrapper matches the cached-space Stage 2 diagnostic.
+        correct = total = 0
+        with steer_correction_context(clf_target, prepared, alpha=1.0):
+            for images, labels in loaders.test:
+                correct += int(clf_target(images).argmax(dim=-1).eq(labels).sum())
+                total += int(labels.numel())
+        assert correct / total == pytest.approx(prepared["diagnostics"]["stage2_test_acc"])
+
+    with pytest.raises(ValueError, match="correction_space"):
+        _prepare_tiny_logit(tmp_path, strategy="global_ridge", regime="standard", correction_space="weights")

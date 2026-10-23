@@ -1,0 +1,43 @@
+{
+  "suite": "vision8",
+  "tasks": "SVHN",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-B-16",
+  "target_clip_pretrained": "laion2b_s34b_b88k",
+  "method": "steer",
+  "method_params": {
+    "feature_regime": "linear",
+    "stage_2_strategy": "block_ridge",
+    "block_granularity": "residual",
+    "block_ridge_mode": "smoothed_residual",
+    "rho": 0.9,
+    "block_ridge_lambda_scaling": "trace",
+    "ridge_lambda": 0.1,
+    "stage1_lambda": 1.0,
+    "few_shot": 5,
+    "seed": 89,
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/features/steer_svhn96_source_only",
+    "force_recompute_features": false
+  },
+  "alpha_search": false,
+  "alpha_selection": "shared",
+  "alpha": 1.0,
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "no_humanize": true,
+  "weights": null,
+  "tuned_ckpts": {
+    "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/full__linearized_ntk_best_ep.pt",
+    "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/full__linearized_ntk_best_ep.pt",
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full__linearized_ntk_best_ep.pt",
+    "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/full__linearized_ntk_best_ep.pt",
+    "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/full__linearized_ntk_best_ep.pt",
+    "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/full__linearized_ntk_best_ep.pt",
+    "Cars": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/full__linearized_ntk_best_ep.pt",
+    "SUN397": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/full__linearized_ntk_best_ep.pt"
+  },
+  "seed": 89,
+  "_description": "steer block_ridge per-block (trace recipe), ViT-B/16 -> ViT-B/16, SVHN with resize-96+pad on the SOURCE only (MR_SVHN_PREPROCESS=1, MR_SVHN_AUGMENTATION=none, MR_SVHN_PREPROCESS_SCOPE=source): B keeps its stock preprocessing. Cache built by scripts/build_steer_target_cache.py. few_shot=5, seed=89."
+}

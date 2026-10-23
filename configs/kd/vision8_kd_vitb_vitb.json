@@ -1,0 +1,38 @@
+{
+  "suite": "vision8",
+  "tasks": "all",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-B-16",
+  "target_clip_pretrained": "laion2b_s34b_b88k",
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "no_humanize": true,
+  "tuned_ckpts": {
+    "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/EuroSAT/full__linearized_ntk_best_ep.pt",
+    "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/RESISC45/full__linearized_ntk_best_ep.pt",
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full__linearized_ntk_best_ep.pt",
+    "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/DTD/full__linearized_ntk_best_ep.pt",
+    "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/MNIST/full__linearized_ntk_best_ep.pt",
+    "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/GTSRB/full__linearized_ntk_best_ep.pt",
+    "Cars": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/Cars/full__linearized_ntk_best_ep.pt",
+    "SUN397": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints/ViT-B-16/datacomp_xl_s13b_b90k/SUN397/full__linearized_ntk_best_ep.pt"
+  },
+  "dtype": "fp32",
+  "seed": 33,
+  "kd": {
+    "few_shot": 10,
+    "seed": 33,
+    "epochs": 20,
+    "lr": 1e-05,
+    "weight_decay": 0.0,
+    "temperature": 1.0,
+    "ce_weight": 0.0,
+    "batch_size": 32,
+    "grad_clip": 1.0,
+    "amp": null,
+    "train_mode": "eval"
+  },
+  "_description": "Few-shot KD baseline for steer: teacher = ViT-B/16 DataComp fine-tuned (tuned_ckpts), student = ViT-B/16 LAION (all visual params trained, logit KL). few_shot/seed overridden by --kd in the sweep."
+}

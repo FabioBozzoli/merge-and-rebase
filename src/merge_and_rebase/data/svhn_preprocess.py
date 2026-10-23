@@ -38,6 +38,10 @@ SVHN_CUSTOM_PREPROCESS = False
 SVHN_TARGET_SIZE = 96
 # Augmentation applied to the train split. Env override: MR_SVHN_AUGMENTATION
 SVHN_AUGMENTATION = "autoaugment"
+# Which model's loaders get the custom pipeline in a source -> target run: "both", or "source"
+# only (the target keeps its stock preprocessing). Env override: MR_SVHN_PREPROCESS_SCOPE
+SVHN_PREPROCESS_SCOPE = "both"
+SVHN_PREPROCESS_SCOPES = ("both", "source")
 
 # open_clip / OpenAI CLIP normalization, used only when the incoming preprocess
 # does not expose a Normalize we can reuse.
@@ -176,6 +180,13 @@ def svhn_preprocess_enabled() -> bool:
     return _env_bool("MR_SVHN_PREPROCESS", SVHN_CUSTOM_PREPROCESS)
 
 
+def svhn_preprocess_scope() -> str:
+    scope = str(os.environ.get("MR_SVHN_PREPROCESS_SCOPE", SVHN_PREPROCESS_SCOPE)).strip()
+    if scope not in SVHN_PREPROCESS_SCOPES:
+        raise ValueError(f"SVHN preprocess scope must be one of: {SVHN_PREPROCESS_SCOPES}. Got {scope!r}.")
+    return scope
+
+
 def svhn_target_size() -> int:
     size = _env_int("MR_SVHN_TARGET_SIZE", SVHN_TARGET_SIZE)
     if size <= 0:
@@ -280,14 +291,19 @@ def maybe_svhn_transforms(
     hf_path: str | None,
     train_transform: Transform | None,
     eval_preprocess: Transform | None,
+    *,
+    enabled: bool | None = None,
 ) -> tuple[Transform | None, Transform | None]:
     """
     Swap in the custom SVHN pipeline, or pass the arguments straight through.
 
     Returns ``(train_transform, eval_preprocess)`` unchanged for every dataset other than
-    SVHN, and for SVHN when the override is disabled.
+    SVHN, and for SVHN when the override is disabled. ``enabled=None`` follows
+    :func:`svhn_preprocess_enabled`; a bool forces it for this call only.
     """
-    if hf_path != SVHN_HF_PATH or not svhn_preprocess_enabled():
+    if enabled is None:
+        enabled = svhn_preprocess_enabled()
+    if hf_path != SVHN_HF_PATH or not enabled:
         return train_transform, eval_preprocess
 
     target_size = svhn_target_size()

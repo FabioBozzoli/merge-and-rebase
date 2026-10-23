@@ -40,6 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
+from ...models.openclip_classifier import zero_shot_logits_from_features
 from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
 from ..registry import register
@@ -191,8 +192,13 @@ def _stage1_target_corrections(
     selected: torch.Tensor,
     regularization: float,
     energy_threshold: float = 0.99,
+    correction_space: str = "feature",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return train and test target corrections in B's feature space."""
+    """
+    Return train and test target corrections in B's feature space.
+
+    ``correction_space="logit"`` instead returns them in logit space ([n, C]), skipping ``pinv(w_b)``.
+    """
     logit_map, _, _ = _stage1_projection(
         f_a=f_a,
         delta_a=delta_a,
@@ -203,6 +209,8 @@ def _stage1_target_corrections(
         regularization=regularization,
         energy_threshold=energy_threshold,
     )
+    if correction_space == "logit":
+        return delta_a[selected] @ logit_map.T, delta_a_test @ logit_map.T
     p_b = torch.linalg.pinv(w_b)
     train_target = delta_a[selected] @ logit_map.T @ p_b.T
     test_target = delta_a_test @ logit_map.T @ p_b.T
@@ -422,6 +430,22 @@ def _few_shot(labels: torch.Tensor, shots: int, seed: int) -> torch.Tensor:
         if len(indices) < shots:
             raise ValueError(f"Class {class_id} has {len(indices)} examples, need {shots}")
         selected.append(indices[torch.randperm(len(indices), generator=generator)[:shots]])
+    return torch.cat(selected)
+
+
+def _per_class_subset(labels: torch.Tensor, per_class: int, seed: int) -> torch.Tensor:
+    """
+    Up to ``per_class`` examples of every class (all of them for smaller classes).
+
+    For classes with at least ``per_class`` examples the draw is identical to
+    ``_few_shot(labels, per_class, seed)``, so existing subsampled caches keep their rows.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    classes = int(labels.max().item()) + 1
+    selected = []
+    for class_id in range(classes):
+        indices = torch.where(labels == class_id)[0]
+        selected.append(indices[torch.randperm(len(indices), generator=generator)[:per_class]])
     return torch.cat(selected)
 
 
@@ -778,6 +802,11 @@ def _get_block_module(visual: nn.Module, block_id: int) -> nn.Module:
 # embedding (conv1), which runs before the class token is concatenated.
 _TOKEN_POOLINGS = frozenset({"mean", "cls"})
 
+# "feature": Stage 1's logit correction is mapped to B's feature space through pinv(w_b) and added to
+# the normalized feature (the original method). "logit": it stays in logit space and is added to the
+# logits, so the head's pseudo-inverse never appears.
+_CORRECTION_SPACES = frozenset({"feature", "logit"})
+
 
 def _pool_block_output(output: Any, token_pooling: str = "mean") -> torch.Tensor:
     out = output[0] if isinstance(output, (tuple, list)) else output
@@ -1055,7 +1084,7 @@ def _aligned_loader_pair(
         )
     if per_class is not None:
         # Fixed seed, independent of the run seed, so every run shares one cache.
-        indices = _few_shot(_dataset_labels(source_ds), per_class, seed=0).tolist()
+        indices = _per_class_subset(_dataset_labels(source_ds), per_class, seed=0).tolist()
         source_ds, target_ds = Subset(source_ds, indices), Subset(target_ds, indices)
     batch_size = source_loader.batch_size
     aligned_source = DataLoader(source_ds, batch_size=batch_size, shuffle=False)
@@ -1493,15 +1522,23 @@ class SteerRebase:
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
         block_ridge_lambda_scaling: str = "none",
+        block_ridge_input: str = "per_block",
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         target_blocks_cache_dir: str | None = None,
         target_blocks_regime: str = "linear",
+        train_features_per_class: int | None = None,
+        correction_space: str = "feature",
         seed: int = 42,
         verbose: bool = True,
         **kwargs: Any,
     ) -> dict[str, Any]:
         del kwargs
+        if correction_space not in _CORRECTION_SPACES:
+            raise ValueError(f"steer correction_space must be one of: {sorted(_CORRECTION_SPACES)}")
+        # "logit": Stage 1's target stays in logit space (no pinv(w_b)), every Stage 2 predictor
+        # regresses a [C] logit offset, and eval adds it to the logits without passing through the head.
+        logit_space = correction_space == "logit"
         if feature_regime not in {"standard", "linear"}:
             raise ValueError("steer feature_regime must be 'standard' or 'linear'")
         if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge", "concat_ridge"}:
@@ -1516,6 +1553,12 @@ class SteerRebase:
             raise ValueError(f"steer token_pooling must be one of: {sorted(_TOKEN_POOLINGS)}")
         if block_ridge_lambda_scaling not in {"none", "trace"}:
             raise ValueError("steer block_ridge_lambda_scaling must be 'none' or 'trace'")
+        if block_ridge_input not in {"per_block", "final"}:
+            raise ValueError("steer block_ridge_input must be 'per_block' or 'final'")
+        if block_ridge_input == "final" and stage_2_strategy != "block_ridge":
+            raise ValueError("steer block_ridge_input='final' requires stage_2_strategy='block_ridge'")
+        if train_features_per_class is not None and int(train_features_per_class) <= 0:
+            raise ValueError("steer train_features_per_class must be a positive integer")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer requires exactly one of few_shot or total_support_examples")
 
@@ -1523,9 +1566,11 @@ class SteerRebase:
         log_prefix = "[steer]"
         # block_ridge needs A's per-block deltas and B's block activations;
         # concat_ridge only B's block activations (so it also runs in the
-        # standard regime).
+        # standard regime). block_ridge_input="final" feeds every block ridge
+        # B's final feature, so B's block activations are not needed.
+        final_input = block_ridge_input == "final"
         need_source_blocks = stage_2_strategy == "block_ridge"
-        need_target_blocks = stage_2_strategy in {"block_ridge", "concat_ridge"}
+        need_target_blocks = stage_2_strategy in {"block_ridge", "concat_ridge"} and not final_input
         # Only strategies reading B's blocks see token-pooled activations; every
         # other strategy shares the mean-pooled cache, whose tensors are identical for it.
         cache_pooling = token_pooling if need_target_blocks else "mean"
@@ -1638,8 +1683,11 @@ class SteerRebase:
                 raise ValueError("steer token_pooling='cls' requires a CLIP ViT target; ResNets have no class token.")
             if not need_target_blocks and verbose:
                 # The final encode_image feature is already the projected class
-                # token, so only block_ridge's intermediate activations change.
-                print(f"{log_prefix} token_pooling='cls' has no effect with stage_2_strategy='{stage_2_strategy}'.")
+                # token, so only the intermediate block activations change.
+                print(
+                    f"{log_prefix} token_pooling='cls' has no effect with stage_2_strategy='{stage_2_strategy}', "
+                    f"block_ridge_input='{block_ridge_input}'."
+                )
 
         # The whole method transports A's fine-tuning delta, so an A whose visual
         # weights equal the pretrained ones yields delta_A == 0 and silently
@@ -1722,7 +1770,11 @@ class SteerRebase:
                 token_pooling=token_pooling,
             )
 
-        train_per_class = _TRAIN_FEATURES_PER_CLASS.get(task)
+        # train_features_per_class caps the train features of *every* task (classes with fewer
+        # examples are kept whole); otherwise only the tasks in _TRAIN_FEATURES_PER_CLASS are capped.
+        train_per_class = (
+            int(train_features_per_class) if train_features_per_class is not None else _TRAIN_FEATURES_PER_CLASS.get(task)
+        )
         # Separate cache dir so a subsampled cache never masquerades as a full one.
         train_split = "train" if train_per_class is None else f"train_{train_per_class}perclass"
         train_data = _load_or_compute_split(
@@ -1796,10 +1848,15 @@ class SteerRebase:
             regularization=stage1_lambda,
             energy_threshold=stage1_energy_threshold,
         )
-        p_b = torch.linalg.pinv(w_b)
-        train_target = delta_a[selected] @ logit_map.T @ p_b.T
-        test_target = delta_a_test @ logit_map.T @ p_b.T
-        stage1_test_acc = _accuracy(f_b_test + test_target, w_b, test_labels)
+        if logit_space:
+            train_target = delta_a[selected] @ logit_map.T
+            test_target = delta_a_test @ logit_map.T
+            stage1_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, test_target)
+        else:
+            p_b = torch.linalg.pinv(w_b)
+            train_target = delta_a[selected] @ logit_map.T @ p_b.T
+            test_target = delta_a_test @ logit_map.T @ p_b.T
+            stage1_test_acc = _accuracy(f_b_test + test_target, w_b, test_labels)
         if verbose:
             print(
                 f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
@@ -1809,6 +1866,7 @@ class SteerRebase:
 
         num_source_blocks = None
         block_group_size = None
+        stage2_global_equiv_test_acc = None
         if stage_2_strategy == "global_ridge":
             coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
 
@@ -1865,9 +1923,48 @@ class SteerRebase:
                     out = contribution if out is None else out + contribution
                 return out.to(dtype=activations["global"].dtype, device=activations["global"].device)
 
+        elif final_input:  # block_ridge, every block ridge reads B's final feature
+            delta_a_blocks_train = train_data["delta_A_blocks"].double()
+            if logit_space:
+                block_targets = delta_a_blocks_train[selected] @ logit_map.T  # [n_sel, num_A_blocks, C]
+            else:
+                block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T  # [n_sel, num_A_blocks, D_B]
+            num_source_blocks = block_targets.shape[1]
+            f_b_selected = f_b[selected]
+            fitted = _fit_block_ridge(
+                {b: f_b_selected for b in range(num_source_blocks)},
+                block_targets,
+                selected=torch.arange(int(selected.numel())),
+                regularization=ridge_lambda,
+                mode=block_ridge_mode,
+                rho=rho,
+                regularization_scaling=block_ridge_lambda_scaling,
+            )
+            # Shared input: sum_b X @ W_b == X @ sum_b W_b, so predict with one matmul.
+            coefficient_sum = torch.stack(fitted).sum(dim=0).to(dev)
+
+            # The independent-mode limit: ridge is linear in its target, so N
+            # ridges on a shared X sum to one ridge on sum_b T_b (~ train_target
+            # in the linear regime). Its accuracy isolates the smoothed carry's effect.
+            equiv_lambda = ridge_lambda
+            if block_ridge_lambda_scaling == "trace":
+                equiv_lambda = ridge_lambda * float(f_b_selected.square().sum()) / f_b_selected.shape[0]
+            equiv_coefficient = _ridge(f_b_selected, block_targets.sum(dim=1), equiv_lambda)
+            if logit_space:
+                stage2_global_equiv_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, f_b_test @ equiv_coefficient)
+            else:
+                stage2_global_equiv_test_acc = _accuracy(f_b_test + f_b_test @ equiv_coefficient, w_b, test_labels)
+
+            def correction_fn(activations: Mapping[str, torch.Tensor], *, _coef=coefficient_sum) -> torch.Tensor:
+                global_act = activations["global"].double().to(_coef.device)
+                return (global_act @ _coef).to(dtype=activations["global"].dtype, device=activations["global"].device)
+
         else:  # block_ridge
             delta_a_blocks_train = train_data["delta_A_blocks"].double()
-            block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T  # [n_sel, num_A_blocks, D_B]
+            if logit_space:
+                block_targets = delta_a_blocks_train[selected] @ logit_map.T  # [n_sel, num_A_blocks, C]
+            else:
+                block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T  # [n_sel, num_A_blocks, D_B]
 
             features_b_full_train = {b: v.double() for b, v in train_data["features_B_blocks"].items()}
             num_target_blocks_total = len(features_b_full_train)
@@ -1989,7 +2086,10 @@ class SteerRebase:
         if need_target_blocks:
             # Left in the cached dtype: every correction_fn upcasts per block itself.
             cached_test_activations["blocks"] = dict(test_data["features_B_blocks"])
-        stage2_test_acc = _accuracy(f_b_test + correction_fn(cached_test_activations), w_b, test_labels)
+        if logit_space:
+            stage2_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, correction_fn(cached_test_activations))
+        else:
+            stage2_test_acc = _accuracy(f_b_test + correction_fn(cached_test_activations), w_b, test_labels)
         # Uncorrected zero-shot accuracy of B in cached-tensor space. This must
         # match the target_zeroshot baseline vision_rebase.py measures with a
         # live forward pass; a material gap means the cached features/head do
@@ -2006,14 +2106,22 @@ class SteerRebase:
                 f"{log_prefix} prepare: stage2 ({stage_2_strategy}) cached test acc = {stage2_test_acc:.4f} "
                 f"(predicted from B's cached features, no alpha -- matches run.py's reported metric)"
             )
+            if stage2_global_equiv_test_acc is not None:
+                print(
+                    f"{log_prefix} prepare: stage2 independent-equivalent global ridge cached test acc = "
+                    f"{stage2_global_equiv_test_acc:.4f} (block_ridge_input='final' with mode='independent' "
+                    f"reduces to this; the gap is the effect of mode='{block_ridge_mode}')"
+                )
 
-        return {
+        prepared: dict[str, Any] = {
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
             "block_granularity": block_granularity,
             "token_pooling": token_pooling,
             "block_ridge_lambda_scaling": block_ridge_lambda_scaling,
+            "block_ridge_input": block_ridge_input,
+            "needs_target_blocks": need_target_blocks,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             "eval_basis_mismatch": eval_basis_mismatch,
@@ -2021,11 +2129,19 @@ class SteerRebase:
                 "stage0_test_acc": stage0_test_acc,
                 "stage1_test_acc": stage1_test_acc,
                 "stage2_test_acc": stage2_test_acc,
+                "stage2_global_equiv_test_acc": stage2_global_equiv_test_acc,
                 "stage1_kept_rank": stage1_kept_rank,
                 "stage1_rank": stage1_rank,
                 "stage1_energy_threshold": stage1_energy_threshold,
             },
         }
+        if logit_space:
+            # The correction is in units of the cached head's logits. Unlike the feature-space
+            # correction (whose scale cancels through pinv(w_b)), a logit offset does not rescale
+            # with the head, so convert it to units of the live eval head at apply time.
+            prepared["correction_space"] = correction_space
+            prepared["logit_unit_scale"] = float(w_b.norm(dim=-1).mean() / live_w_b.norm(dim=-1).mean().clamp_min(1e-12))
+        return prepared
 
     def apply_correction(self, prepared: Mapping[str, Any], *, activations: Mapping[str, torch.Tensor], alpha: float = 1.0) -> torch.Tensor:
         correction = prepared["correction_fn"](activations)
@@ -2051,6 +2167,13 @@ def _accuracy(features: torch.Tensor, head: torch.Tensor, labels: torch.Tensor) 
     return float(logits.argmax(dim=1).eq(labels).double().mean())
 
 
+def _logit_accuracy(features: torch.Tensor, head: torch.Tensor, labels: torch.Tensor, correction: torch.Tensor) -> float:
+    """Accuracy with a logit-space ``correction`` added after the head (``correction_space="logit"``)."""
+    normed = features / features.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    logits = normed @ head.T + correction
+    return float(logits.argmax(dim=1).eq(labels).double().mean())
+
+
 @contextmanager
 def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, alpha: float = 1.0):
     """
@@ -2061,12 +2184,64 @@ def steer_correction_context(clf_target: Any, prepared: Mapping[str, Any], *, al
     the raw pooled feature -- to match the scale it was calibrated against.
     Used by vision_rebase.py's steer_mode eval branch in place of
     axpy_state_dict + load_into_model.
+
+    With ``correction_space="logit"`` it wraps ``clf_target.forward`` instead and adds
+    ``alpha * correction`` to the zero-shot logits (scaled by ``logit_scale``), never through the head.
     """
     visual = clf_target.model.visual
     original_encode_image = clf_target.model.encode_image
-    needs_blocks = prepared["stage_2_strategy"] in {"block_ridge", "concat_ridge"}
+    needs_blocks = bool(
+        prepared.get("needs_target_blocks", prepared["stage_2_strategy"] in {"block_ridge", "concat_ridge"})
+    )
     block_granularity = str(prepared.get("block_granularity", "residual"))
     token_pooling = str(prepared.get("token_pooling", "mean"))
+
+    if prepared.get("correction_space", "feature") == "logit":
+        # The correction is a logit offset: patch the classifier's forward and add it after the head,
+        # in the cached head's units converted to the live head's and scaled like the logits.
+        logit_unit_scale = float(prepared.get("logit_unit_scale", 1.0))
+        had_instance_forward = "forward" in vars(clf_target)
+        previous_forward = clf_target.forward
+
+        @torch.no_grad()
+        def patched_forward(images: torch.Tensor) -> torch.Tensor:
+            if needs_blocks:
+                capture_context, final_ids, expected_blocks = _activation_capture_for_visual(
+                    visual, block_granularity, token_pooling
+                )
+                with capture_context as capture:
+                    out = original_encode_image(images)
+                out_norm = _l2_normalize(out)
+                blocks = _complete_captured_activations(
+                    capture,
+                    final_output=out_norm,
+                    final_ids=final_ids,
+                    expected_blocks=expected_blocks,
+                )
+                activations = {"global": out_norm, "blocks": blocks}
+            else:
+                out = original_encode_image(images)
+                out_norm = _l2_normalize(out)
+                activations = {"global": out_norm}
+            logits = zero_shot_logits_from_features(clf_target, out_norm, normalize_image_features=False)
+            correction = _STEER_SINGLETON.apply_correction(prepared, activations=activations, alpha=alpha)
+            logits = logits + float(clf_target.logit_scale) / logit_unit_scale * correction.to(
+                dtype=logits.dtype, device=logits.device
+            )
+            clf_target._last_visual_features = out
+            clf_target._last_image_features = out_norm
+            clf_target._last_logits = logits
+            return logits
+
+        clf_target.forward = patched_forward
+        try:
+            yield
+        finally:
+            if had_instance_forward:
+                clf_target.forward = previous_forward
+            else:
+                del clf_target.forward
+        return
 
     def patched_encode_image(images: torch.Tensor) -> torch.Tensor:
         if needs_blocks:
