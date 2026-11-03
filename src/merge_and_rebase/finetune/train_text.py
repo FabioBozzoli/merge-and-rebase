@@ -43,8 +43,9 @@ from ..utils.distributed import (
     reduce_gradients_,
     shutdown_distributed,
 )
-from .forward_mode import apply_training_forward_mode, resolve_training_forward_mode
+from .forward_mode import apply_training_forward_mode, attach_full_rank_deltas, resolve_training_forward_mode
 from .schedulers import build_lr_scheduler
+from .sharded_adamw import ShardedMasterAdamW
 
 NLI_SUITES: dict[str, tuple[str, ...]] = {
     "nli6": tuple(NLI_TASKS),
@@ -463,20 +464,30 @@ def _configure_text_strategy(
     steps: int,
     device: torch.device,
     model_kind: str = "sequence_classification",
+    dist_info: DistInfo | None = None,
 ) -> tuple[nn.Module, optim.Optimizer, Any, dict[str, int], dict[str, Any]]:
     cfg = dict(strategy_cfg or {})
     name = str(strategy).strip().lower()
     is_causal = str(model_kind) == "causal_lm"
     peft_cfg_out: dict[str, Any] = {}
+    # Causal full-rank is linearized only: a frozen W0 plus a dW per parameter, trained with the fp32-master,
+    # state-sharded AdamW (a plain AdamW on 3B bf16 params would round lr~1e-5 updates away, and fp32 states
+    # do not fit one GPU).
+    full_rank_ntk = is_causal and name == "full" and str(cfg.get("forward_mode", "standard")) == "linearized_ntk"
 
-    if is_causal and name != "peft_lora":
+    if is_causal and name != "peft_lora" and not full_rank_ntk:
         raise ValueError(
-            f"model_kind='causal_lm' supports strategy.name='peft_lora' only (got '{name}'). "
-            "'full' has no memory headroom under linearized_ntk and 'linear_probe' needs a "
-            "classification head this model does not have."
+            f"model_kind='causal_lm' supports strategy.name='peft_lora', or 'full' with "
+            f"forward_mode='linearized_ntk' (got '{name}'). 'linear_probe' needs a classification "
+            "head this model does not have."
         )
 
-    if name == "full":
+    if full_rank_ntk:
+        if str(optimizer_name).strip().lower() != "adamw":
+            raise ValueError("Causal full-rank linearized training uses AdamW (sharded fp32 master).")
+        attach_full_rank_deltas(model)
+
+    elif name == "full":
         for p in model.parameters():
             p.requires_grad = True
 
@@ -550,7 +561,10 @@ def _configure_text_strategy(
     if len(trainable_params) == 0:
         raise RuntimeError(f"Strategy '{name}' produced zero trainable parameters.")
 
-    opt = _optimizer_from_name(trainable_params, optimizer_name, lr, weight_decay)
+    if full_rank_ntk:
+        opt = ShardedMasterAdamW(trainable_params, dist_info or DistInfo(), lr=lr, weight_decay=weight_decay)
+    else:
+        opt = _optimizer_from_name(trainable_params, optimizer_name, lr, weight_decay)
     scheduler = build_lr_scheduler(
         opt,
         name=scheduler_name,
@@ -755,6 +769,39 @@ def _save_peft_text_adapter(
     return meta
 
 
+def _read_full_rank_delta(path: str | Path, model: nn.Module, params: list[nn.Parameter]) -> list[torch.Tensor]:
+    """The dW for each full-rank ``params`` entry (``model.ntk_delta``), in order, from a .pt file.
+
+    Accepts our *_best_trainable.pt / *_epoch{N}_delta.pt ({"trainable_state": {...}}) or a bare {name: tensor}
+    dict, keyed 'ntk_delta.model/layers/0/...' or by plain HF names ('model.layers.0...'), any float dtype.
+    """
+    obj = torch.load(path, map_location="cpu", weights_only=True)
+    state = obj.get("trainable_state", obj)
+    names = {id(p): n for n, p in model.named_parameters()}
+    want = {names[id(p)].removeprefix("ntk_delta.").replace("/", "."): p for p in params}
+    base_ids = {id(model.get_parameter(k)): k for k in want}
+    got: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        k = key.removeprefix("ntk_delta.").replace("/", ".")
+        if k in want:
+            got[k] = value
+            continue
+        try:
+            alias = base_ids.get(id(model.get_parameter(k)))
+        except AttributeError:
+            alias = None
+        if alias is None:
+            raise ValueError(f"{path}: '{key}' matches no full-rank dW of this model.")
+        # A tied weight (lm_head.weight when tied to embed_tokens): its dW is the alias's.
+    missing = [k for k in want if k not in got]
+    if missing:
+        raise ValueError(f"{path}: no dW for {len(missing)} of {len(want)} params, e.g. {missing[:3]}")
+    for k, p in want.items():
+        if tuple(got[k].shape) != tuple(p.shape):
+            raise ValueError(f"{path}: '{k}' has shape {tuple(got[k].shape)}, expected {tuple(p.shape)}")
+    return [got[k] for k in want]
+
+
 def _export_hf_merged_model(
     *,
     model: nn.Module,
@@ -770,17 +817,37 @@ def _export_hf_merged_model(
 
     This is what lm_eval's `hf_rebased` loads as `source_finetuned`; it must be
     a directory `AutoModelForCausalLM.from_pretrained` accepts, not an adapter.
+
+    Full-rank linearized dW (`model.ntk_delta`) is merged the same way, W0 + dW in fp32 rounded to the model
+    dtype, and the dW each tensor round-trips to, (W0 + dW) - W0, is scored against the exact dW in the meta.
     """
-    if not hasattr(model, "merge_and_unload"):
+    full_rank = hasattr(model, "ntk_delta")
+    if not full_rank and not hasattr(model, "merge_and_unload"):
         raise ValueError("save_format='hf' expects a PEFT-wrapped model with .merge_and_unload().")
 
-    if trainable_state:
+    if trainable_state and not full_rank:
         incompatible = model.load_state_dict(trainable_state, strict=False)
         unexpected = list(getattr(incompatible, "unexpected_keys", []))
         if unexpected:
             raise RuntimeError(f"Unexpected keys while restoring the best adapter: {unexpected[:5]}")
 
-    merged = model.merge_and_unload()
+    roundtrip: dict[str, float] = {}
+    if full_rank:
+        with torch.no_grad():
+            for key, d in model.ntk_delta.items():
+                d = trainable_state.get(f"ntk_delta.{key}", d)  # the stashed fp32 master dW, not its bf16 copy
+                w = model.get_parameter(key.replace("/", "."))
+                # On the stash's device (CPU): the GPU is near full after training and fp32 copies are 1.5 GB each.
+                w0, d = w.detach().to(d.device, torch.float32), d.float()
+                merged_w = (w0 + d).to(w.dtype)
+                d_norm = float(d.norm())
+                if d_norm > 0:
+                    roundtrip[key.replace("/", ".")] = float((merged_w.float() - w0 - d).norm()) / d_norm
+                w.copy_(merged_w)
+        del model.ntk_delta
+        merged = model
+    else:
+        merged = model.merge_and_unload()
     _ensure_dir(out_dir)
     merged.save_pretrained(out_dir)
     if hasattr(tokenizer, "save_pretrained"):
@@ -806,6 +873,13 @@ def _export_hf_merged_model(
             "trained model. Consume it with feature_regime='linear' (steer_text / theseus), "
             "which applies the same first-order expansion around W0."
         )
+    if roundtrip:
+        errs = sorted(roundtrip.values())
+        meta["full_rank_roundtrip_rel_err"] = {
+            "median": errs[len(errs) // 2],
+            "max": errs[-1],
+            "per_tensor": roundtrip,
+        }
     _save_json(out_dir / "merge_and_rebase_meta.json", meta)
     return meta
 
@@ -916,6 +990,8 @@ def train_task(
     resume_from: str | Path | None = None,
     resume_allow_lr_change: bool = False,
     save_best_to_disk: bool = True,
+    init_from: str | Path | None = None,
+    save_delta_every_epoch: bool = False,
     seed: int,
     deterministic: bool,
     device: str,
@@ -1019,9 +1095,18 @@ def train_task(
         steps=total_steps,
         device=dev,
         model_kind=build_cfg.model_kind,
+        dist_info=ddp,
     )
     trainable_info = dict(trainable_info)
     trainable_info["forward_mode"] = forward_mode
+    if (init_from is not None or save_delta_every_epoch) and not isinstance(opt, ShardedMasterAdamW):
+        # shortcut: full-rank only; LoRA warm starts would need the adapter factors loaded instead.
+        raise NotImplementedError("train.init_from / output.save_delta_every_epoch need a full-rank linearized run.")
+    if init_from is not None:
+        # A new run (its own warmup and schedule) that starts from a saved dW instead of zeros.
+        opt.load_full_(_read_full_rank_delta(init_from, model, opt.params))
+        trainable_info["init_from"] = str(init_from)
+        _print(f"[{task}] warm start: dW from {init_from}")
     trainable_info.update(
         apply_training_forward_mode(
             model=model,
@@ -1029,6 +1114,7 @@ def train_task(
             device=dev,
             output_transform=lambda out: out.logits,
             output_builder=lambda logits: SimpleNamespace(loss=None, logits=logits),
+            recompute=bool(dict(strategy_cfg or {}).get("recompute", False)),
         )
     )
 
@@ -1128,6 +1214,14 @@ def train_task(
                 "Raise or clear train.max_steps for the continuation."
             )
 
+    def _full_rank_delta() -> dict[str, torch.Tensor] | None:
+        """The fp32 master dW by param name on rank 0, None on other ranks. Collective."""
+        values = opt.full_master()
+        if values is None:
+            return None
+        names = {id(p): n for n, p in model.named_parameters()}
+        return {names[id(p)]: v for p, v in zip(opt.params, values, strict=True)}
+
     def _build_checkpoint_payload(
         *,
         epoch_i: int,
@@ -1188,10 +1282,17 @@ def train_task(
                 # after training instead.
                 # ponytail: best epoch only; save_last_epoch still writes the .pt,
                 # not a second merged directory.
-                best_trainable_state.clear()
-                best_trainable_state.update(
-                    {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
-                )
+                # Only rank 0 reads it (export, best_trainable.pt, resume payload); a full-rank dW is 6 GB.
+                if isinstance(opt, ShardedMasterAdamW):
+                    best_trainable_state.clear()  # free the old 12.8 GB fp32 dW before gathering the new one
+                    delta = _full_rank_delta()  # collective: every rank gathers, rank 0 keeps the fp32 dW
+                    if delta is not None:
+                        best_trainable_state.update(delta)
+                elif ddp.is_main:
+                    best_trainable_state.clear()
+                    best_trainable_state.update(
+                        {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
+                    )
         else:
             raise ValueError("save_format must be 'full', 'head', 'peft', or 'hf'")
 
@@ -1293,7 +1394,7 @@ def train_task(
         model.train()
         return stop
 
-    def _resume_payload(*, epoch_i: int, consumed: int) -> dict[str, Any]:
+    def _resume_payload(*, epoch_i: int, consumed: int, optimizer_state: dict[str, Any]) -> dict[str, Any]:
         return {
             "fingerprint": dict(fingerprint),
             "global_update_step": int(global_update_step),
@@ -1303,7 +1404,7 @@ def train_task(
             "rows_consumed_in_epoch": int(consumed) * int(batch_size) * int(ddp.world_size),
             "world_size": int(ddp.world_size),
             "trainable_state": {n: p.detach().cpu().clone() for n, p in _trainable_params().items()},
-            "optimizer": opt.state_dict(),
+            "optimizer": optimizer_state,
             "best_val": float(best_val),
             "best_epoch": int(best_epoch),
             "best_step": int(best_step),
@@ -1436,12 +1537,14 @@ def train_task(
                     # Clipping must see the final gradient, so both happen before it.
                     total_items = torch.tensor([float(window_items)], dtype=torch.float64, device=dev)
                     all_reduce_sum_(total_items, ddp)
-                    reduce_gradients_(
-                        trainable_params_list, ddp, scale=loss_scale / max(1.0, float(total_items.item()))
-                    )
+                    grad_scale = loss_scale / max(1.0, float(total_items.item()))
                     window_items = 0
-                    if clip_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+                    if isinstance(opt, ShardedMasterAdamW):
+                        opt.reduce_and_clip_(scale=grad_scale, max_norm=clip_grad_norm)
+                    else:
+                        reduce_gradients_(trainable_params_list, ddp, scale=grad_scale)
+                        if clip_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
                     scheduler(global_update_step)
                     opt.step()
                     opt.zero_grad(set_to_none=True)
@@ -1504,9 +1607,11 @@ def train_task(
                     or preempted
                     or (save_every_n_steps > 0 and global_update_step % save_every_n_steps == 0)
                 ):
+                    optimizer_state = opt.state_dict()  # collective for ShardedMasterAdamW
                     if ddp.is_main:
                         last_resume_path = _save_resume_checkpoint(
-                            resume_dir, _resume_payload(epoch_i=epoch, consumed=i + 1)
+                            resume_dir,
+                            _resume_payload(epoch_i=epoch, consumed=i + 1, optimizer_state=optimizer_state),
                         )
                         _print(f"[{task}] resume checkpoint: {last_resume_path}")
                 if hit_cap or preempted:
@@ -1521,6 +1626,12 @@ def train_task(
         if last_eval_step != global_update_step and _validate_and_track(epoch=epoch, train_loss=train_loss):
             stop_reason = "early_stopping"
             break
+        if save_delta_every_epoch:
+            delta = _full_rank_delta()
+            if delta is not None:
+                path = task_dir / f"{ckpt_stem}_epoch{epoch}_delta.pt"
+                torch.save({"epoch": epoch, "step": global_update_step, "trainable_state": delta}, path)
+                _print(f"[{task}] saved epoch {epoch} dW (fp32): {path}")
 
     if prev_sigusr1 is not None:
         signal.signal(signal.SIGUSR1, prev_sigusr1)
@@ -1834,10 +1945,7 @@ def main() -> None:
             strategy = str(_get(task_cfg, "strategy.name", "full"))
             if strategy not in {"full", "linear_probe", "peft_lora"}:
                 raise ValueError(f"[{task}] Unsupported strategy '{strategy}'. Use one of: full, linear_probe, peft_lora")
-            if is_causal and strategy != "peft_lora":
-                raise ValueError(
-                    f"[{task}] model_kind='causal_lm' supports strategy.name='peft_lora' only (got '{strategy}')."
-                )
+            # Causal strategies (peft_lora, or full with linearized_ntk) are checked in _configure_text_strategy.
 
             optimizer_name = str(_get(task_cfg, "train.optimizer.name", "adamw"))
             lr = float(_get(task_cfg, "train.lr", 1e-4))
@@ -1879,6 +1987,8 @@ def main() -> None:
             resume_from = str(resume_from_raw) if resume_from_raw else None
             resume_allow_lr_change = bool(_get(task_cfg, "train.resume_allow_lr_change", False))
             save_best_to_disk = bool(_get(task_cfg, "train.save_best_to_disk", True))
+            init_from = _get(task_cfg, "train.init_from", None) or None
+            save_delta_every_epoch = bool(_get(task_cfg, "output.save_delta_every_epoch", False))
 
             task_out_dir = Path(_get(task_cfg, "output.out_dir", str(out_dir)))
             save_format = str(_get(task_cfg, "output.save_format", save_format_default))
@@ -1887,7 +1997,8 @@ def main() -> None:
 
             if save_format not in {"full", "head", "peft", "hf"}:
                 raise ValueError(f"[{task}] output.save_format must be one of: full, head, peft, hf")
-            if save_format in {"peft", "hf"} and strategy != "peft_lora":
+            causal_full_hf = is_causal and strategy == "full" and save_format == "hf"  # exports W0 + dW
+            if save_format in {"peft", "hf"} and strategy != "peft_lora" and not causal_full_hf:
                 raise ValueError(f"[{task}] save_format='{save_format}' requires strategy.name='peft_lora'.")
             if is_causal and save_format in {"head"}:
                 raise ValueError(f"[{task}] save_format='head' is meaningless for model_kind='causal_lm'.")
@@ -1931,6 +2042,8 @@ def main() -> None:
                 resume_from=resume_from,
                 resume_allow_lr_change=resume_allow_lr_change,
                 save_best_to_disk=save_best_to_disk,
+                init_from=init_from,
+                save_delta_every_epoch=save_delta_every_epoch,
                 seed=seed,
                 deterministic=deterministic,
                 device=str(device),

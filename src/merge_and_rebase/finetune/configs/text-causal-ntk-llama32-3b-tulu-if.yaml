@@ -1,0 +1,322 @@
+# Linearized-NTK rsLoRA fine-tuning of Llama-3.2-3B (BASE) on
+# allenai/tulu-3-sft-personas-instruction-following -- 2 epochs, LR picked by a capped sweep.
+#
+#   python -m merge_and_rebase.finetune.train_text \
+#       --text-config src/merge_and_rebase/finetune/configs/text-causal-ntk-llama32-3b-tulu-if.yaml \
+#       --tasks tulu_if_lr2e-5
+#
+# Data: the Hub dataset nests the response inside `messages`, which the causal loader cannot
+# read (it needs a top-level string response column). data.hf_path therefore points at a
+# flattened {id, prompt, response} parquet made by a one-off script that lives next to the
+# run outputs, not in this repo. Provenance, sbatch scripts and the run log:
+#   /work/spal_phd/pmoriello/ntk-ft/llama32-3b-tulu-if/README.md
+#
+# Text format is the repo's plain `<bos>prompt\n\nresponse<eos>` -- no chat template -- so
+# IFEval on this model runs WITHOUT --apply_chat_template.
+#
+# Measured on all 29,980 rows (Llama-3.2 BPE): prompt mean 60 / p99 166; response mean 318 /
+# p95 739 / p99 1549 / max 11K; total mean 378 / p95 816 / p99 1631. Truncated rows:
+# 2.62% at max_length 1024, 1.12% at 1536, 0.56% at 2048. Instruction-following constraints
+# often sit at the end of the response ("end with...", P.S.), so as long as fits: 1536
+# (97.1% of supervised tokens kept). 2048 does not fit a 45 GB L40S (see Memory).
+#
+# Step math: val_fraction 0.02 carves 600 rows -> 29,380 train rows / 64 rows per step
+# = 460 steps per epoch, total_steps = 920; warmup 30 (~3%), cosine to 0 at 920.
+#
+# LR sweep, then continue the winner (the resume fingerprint pins total_steps, warmup, lr,
+# rows_per_step, max_length, seed and peft, so a capped arm continues the SAME run):
+#   1. each datasets.<key> below is one arm; common.train.max_steps: 200 caps every arm on
+#      the full 920-step schedule, and the cap writes <key>/resume/step_0000200.pt.
+#   2. compare val loss at steps 50..200; in the winner's entry set
+#        train: {max_steps: null, save_every_n_steps: 300, eval_every_n_steps: 100,
+#                resume_from: <out_dir>/meta-llama__Llama-3.2-3B/<key>/resume/resume_last.pt}
+#        output: {save_format: hf}
+#      and relaunch the same --tasks on the same GPU count.
+#   3. sweep arms save `peft` (a 6.4 GB merged export per arm does not fit the quota). The
+#      best-adapter stash behind the hf export is filled only in hf mode, so check the
+#      continuation summary has best_step > 200 (otherwise the export holds the last weights).
+#
+# rsLoRA: scale alpha/sqrt(r) = 32/sqrt(32) ~ 5.66. Under Adam the dW step goes as scale x lr,
+# so lr 1e-5 / 2e-5 here act like ~5.7e-5 / ~1.1e-4 in plain LoRA with alpha = r.
+#
+# Memory (measured, one micro-batch fwd+bwd, bf16, peak allocated): 1x1024 23.0 GiB,
+# 1x1536 32.3 GiB, 1x2048 44.5 GiB (> the L40S's 44.4 GiB), 5x400 27.3 GiB. With
+# micro_batch_tokens 2048 and max_length 1536 the worst micro-batch is 1x1536 or 2x1024,
+# ~32-33 GiB: fits a 45 GB L40S with ~11 GiB headroom.
+
+common:
+  seed: 42
+  deterministic: false
+
+  device: cuda
+  dtype: bf16
+
+  backbone:
+    name: hf_text
+    model_name_or_path: meta-llama/Llama-3.2-3B
+    model_arch: auto
+    model_kind: causal_lm
+    trust_remote_code: false
+    use_fast_tokenizer: true
+
+  data:
+    batch_size: 1
+    micro_batch_tokens: 2048
+    num_workers: 2
+    max_length: 1536
+    hf_path: /work/spal_phd/pmoriello/ntk-ft/llama32-3b-tulu-if/data/tulu_if_flat
+    hf_config: null
+    split: train
+    prompt_fields: prompt
+    response_field: response
+    max_train_samples: null
+    val_fraction: 0.02            # 600 rows, seeded carve: identical across arms
+
+  train:
+    epochs: 2
+    optimizer:
+      name: adamw
+    accumulate_grad_batches: 64   # 64 rows per optimizer step
+    weight_decay: 0.0
+    lr_scheduler:
+      name: cosine
+      warmup_steps: 30
+    grad_clip_norm: 1.0
+    eval_every_n_steps: 50
+    early_stopping: false         # model selection on val loss still keeps the best step
+    max_steps: 200                # sweep cap; null in the winner's continuation
+    save_every_n_steps: 0         # the cap writes its own resume checkpoint
+
+  strategy:
+    name: peft_lora
+    forward_mode: linearized_ntk
+    peft:
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+      r: 32
+      lora_alpha: 32
+      use_rslora: true
+      lora_dropout: 0.0
+      bias: none
+
+  output:
+    out_dir: /work/spal_phd/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints
+    save_format: peft             # hf for the winner's continuation
+    save_last_epoch: false
+    extract_heads: false
+
+  logging:
+    use_wandb: false
+    project: null
+    entity: null
+    tags: []
+    mode: online
+    local_log_dir: /work/spal_phd/pmoriello/ntk-ft/llama32-3b-tulu-if/run_logs
+    log_every_n_steps: 10
+    run_name: null
+
+# Causal task names are config keys; each key is one LR arm with its own output dir.
+datasets_order:
+  - tulu_if_lr1e-5
+  - tulu_if_lr2e-5
+  - tulu_if_lr2e-5_4ep
+  - tulu_if_full
+  - tulu_if_full_s2
+  - tulu_if_full_s3
+  - tulu_if_mb1
+  - tulu_if_mb01
+  - tulu_if_mb1_6ep
+  - tulu_if_mb1_10ep_bs1344
+
+datasets:
+  tulu_if_lr1e-5:
+    train:
+      lr: 1.0e-5
+  # Sweep winner (jobs 160603_0/1, val loss @200: 1.1334 vs 1.1482 for 1e-5), continued to step 920.
+  tulu_if_lr2e-5:
+    train:
+      lr: 2.0e-5
+      max_steps: null
+      save_every_n_steps: 300
+      eval_every_n_steps: 100
+      resume_from: /work/spal_phd/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/meta-llama__Llama-3.2-3B/tulu_if_lr2e-5/resume/resume_last.pt
+    output:
+      save_format: hf
+  # Same recipe as the winner, 4 epochs from scratch: 1840 steps, warmup 30, cosine to 0 at 1840.
+  # Own key so its HF export does not overwrite the 2-epoch one. No periodic resume checkpoints
+  # (not needed, and the quota is tight); --signal=USR1 still writes one if walltime is hit.
+  tulu_if_lr2e-5_4ep:
+    train:
+      lr: 2.0e-5
+      epochs: 4
+      max_steps: null
+      save_every_n_steps: 0
+      eval_every_n_steps: 100
+    output:
+      save_format: hf
+  # Full-rank linearized dW on all 3.21B parameters (embeddings and norms included), aligned with the
+  # MergeBench full fine-tune: 128 rows/step, lr 1e-5, ~10% warmup, cosine, wd 0, 2 epochs, max_length 2048.
+  # 230 steps/epoch, 460 total, warmup 46, for any number of ranks (1 RTX Pro 6000 or 4 L40S).
+  # recompute: one checkpointed jvp per decoder layer (math-SDPA activations ~33 -> ~3.4 GiB at 2048);
+  # ShardedMasterAdamW keeps an fp32 master + Adam state sharded over the ranks. Not resumable; the best dW
+  # (rank-0 CPU stash) is exported as hf at the end, also when the walltime signal stops the run.
+  # Written as fp32 dW (12.8 GB each): best_trainable.pt at each new best, epoch{N}_delta.pt per epoch.
+  # Further 2-epoch stints: a new key with train.init_from: <one of those .pt> (fresh warmup + cosine).
+  tulu_if_full:
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      lr: 1.0e-5
+      accumulate_grad_batches: 128
+      lr_scheduler: {name: cosine, warmup_steps: 46}
+      max_steps: null
+      save_every_n_steps: 0
+      eval_every_n_steps: 50
+      save_best_to_disk: true
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
+  # Stint 2 (epochs 3-4): tulu_if_full again, warm-started from its epoch-2 fp32 dW (job 173161), with a fresh
+  # warmup + cosine to 0. seed 44: epoch order is randperm(seed + epoch), so 45/46 here vs 43/44 in stint 1;
+  # the val split has its own fixed seed and stays the same.
+  tulu_if_full_s2:
+    seed: 44
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      lr: 1.0e-5
+      accumulate_grad_batches: 128
+      lr_scheduler: {name: cosine, warmup_steps: 46}
+      max_steps: null
+      save_every_n_steps: 0
+      eval_every_n_steps: 50
+      save_best_to_disk: true
+      init_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/meta-llama__Llama-3.2-3B/tulu_if_full/full__linearized_ntk_epoch2_delta.pt
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
+  tulu_if_full_s3:
+    seed: 46
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      lr: 1.0e-5
+      accumulate_grad_batches: 128
+      lr_scheduler: {name: cosine, warmup_steps: 46}
+      max_steps: null
+      save_every_n_steps: 0
+      eval_every_n_steps: 50
+      save_best_to_disk: true
+      init_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/meta-llama__Llama-3.2-3B/tulu_if_full_s2/full__linearized_ntk_epoch2_delta.pt
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
+  # Warm start from MergeBench's full-FT update, dW = MergeBench/Llama-3.2-3B_instruction - Llama-3.2-3B
+  # (sbatch/mergebench_delta.py), at scale 1.0 (mb1) and 0.1 (mb01). A 2-epoch schedule capped at step 230
+  # (= 1 epoch): the lower-val run continues for epoch 2 with max_steps: null and
+  # resume_from: <task dir>/resume/resume_last.pt (exact: fp32 master + Adam moments, same data order).
+  tulu_if_mb1:
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      lr: 1.0e-5
+      accumulate_grad_batches: 128
+      lr_scheduler: {name: cosine, warmup_steps: 46}
+      max_steps: null  # epoch 2: was 230 (job 174559, val 0.8859 vs 1.0601 for mb01)
+      resume_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/meta-llama__Llama-3.2-3B/tulu_if_mb1/resume/resume_last.pt
+      save_every_n_steps: 0
+      eval_every_n_steps: 50
+      save_best_to_disk: true
+      init_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/mergebench_delta/mergebench_instruction_dW_s1.pt
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
+  # 6-epoch schedule (1380 steps, warmup 138 = MergeBench's 0.1 ratio) from the MergeBench dW x1.0, run 2 epochs at a
+  # time: capped at 460 with an exact resume checkpoint; continue with max_steps: 920 and resume_from.
+  tulu_if_mb1_6ep:
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      epochs: 6
+      lr: 1.0e-5
+      accumulate_grad_batches: 128
+      lr_scheduler: {name: cosine, warmup_steps: 138}
+      max_steps: null  # stint 3 (epochs 5-6, to 1380); stints 1-2 capped at 460 (job 178881) and 920 (job 179975)
+      resume_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/meta-llama__Llama-3.2-3B/tulu_if_mb1_6ep/resume/resume_last.pt
+      save_every_n_steps: 0
+      eval_every_n_steps: 50
+      save_best_to_disk: true
+      init_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/mergebench_delta/mergebench_instruction_dW_s1.pt
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
+  # MergeBench's tokens per optimizer step (paper, 3B: 128 packed x 4096 ~ 514K tokens; 378 tokens/row here -> 1344
+  # rows, ~508K tokens). 22 steps/epoch, 10-epoch schedule = 220 steps, warmup 22 (0.1 ratio). Run 2 epochs at a time:
+  # max_steps 44, then 88, 132, 176, null with resume_from: .../tulu_if_mb1_10ep_bs1344/resume/resume_last.pt.
+  tulu_if_mb1_10ep_bs1344:
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      epochs: 10
+      lr: 1.0e-5
+      accumulate_grad_batches: 1344
+      lr_scheduler: {name: cosine, warmup_steps: 22}
+      max_steps: 44
+      resume_from: null
+      save_every_n_steps: 0
+      eval_every_n_steps: 11
+      save_best_to_disk: true
+      init_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/mergebench_delta/mergebench_instruction_dW_s1.pt
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
+  tulu_if_mb01:
+    strategy:
+      name: full
+      recompute: true
+    data:
+      max_length: 2048
+      micro_batch_tokens: 2048
+    train:
+      lr: 1.0e-5
+      accumulate_grad_batches: 128
+      lr_scheduler: {name: cosine, warmup_steps: 46}
+      max_steps: 230
+      resume_from: null
+      save_every_n_steps: 0
+      eval_every_n_steps: 50
+      save_best_to_disk: true
+      init_from: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints/mergebench_delta/mergebench_instruction_dW_s0.1.pt
+    output:
+      save_format: hf
+      save_delta_every_epoch: true
+      out_dir: /work/horizon_nextarc/pmoriello/ntk-ft/llama32-3b-tulu-if/checkpoints  # spal_phd is full
