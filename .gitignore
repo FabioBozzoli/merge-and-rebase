@@ -1,3 +1,7 @@
+# Local Claude Code / graphify state
+.claude/
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -254,3 +258,4 @@ src/merge_and_rebase/finetune/configs/vision-tak-*
 todo.md
 out
 sbatch*
+graphify*
