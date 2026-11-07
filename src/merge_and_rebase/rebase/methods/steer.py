@@ -341,6 +341,58 @@ def _fit_block_ridge(
     return coefficients
 
 
+def _block_ridge_error_profile(
+    coefficients: Sequence[torch.Tensor],
+    blocks: Mapping[int, torch.Tensor],
+    targets: torch.Tensor,
+    head: torch.Tensor | None = None,
+) -> dict[str, list[float]]:
+    """
+    Per-block residual errors of a fitted block ridge chain, as raw Frobenius norms
+    over the samples (not divided by anything, so they scale with sqrt(n_samples)).
+
+    ``local``: ||T_b - X_b C_b|| (error of block b alone).
+    ``cumulative``: ||sum_{k<=b}(T_k - X_k C_k)|| (error left after b blocks, i.e. what
+    smoothing is meant to keep from accumulating).
+    ``target_cumulative``: ||sum_{k<=b} T_k|| (norm of the true target accumulated up to b; independent of
+    the fitted mode, so dividing ``cumulative`` by it gives the relative error of the partial sum).
+
+    When ``head`` (the target linear head ``w_b``, shape [K, D_B]) is given, the same three quantities are also
+    reported in logit space (``logit_local``, ``logit_cumulative``, ``logit_target_cumulative``), i.e. the
+    errors/targets are multiplied by ``head.T`` before taking the norm.
+    """
+    local: list[float] = []
+    cumulative: list[float] = []
+    target_cumulative: list[float] = []
+    logit_local: list[float] = []
+    logit_cumulative: list[float] = []
+    logit_target_cumulative: list[float] = []
+    device = coefficients[0].device  # coefficients live on the compute device; cached tensors may be on CPU
+    head_t = None if head is None else head.to(device=device, dtype=coefficients[0].dtype).T
+    err_sum = torch.zeros_like(targets[:, 0], device=device)
+    target_sum = torch.zeros_like(targets[:, 0], device=device)
+    for block_id, coefficient in enumerate(coefficients):
+        target_b = targets[:, block_id].to(device)
+        err = target_b - blocks[block_id].to(device) @ coefficient
+        err_sum = err_sum + err
+        target_sum = target_sum + target_b
+        local.append(float(err.norm()))
+        cumulative.append(float(err_sum.norm()))
+        target_cumulative.append(float(target_sum.norm()))
+        if head_t is not None:
+            logit_local.append(float((err @ head_t).norm()))
+            logit_cumulative.append(float((err_sum @ head_t).norm()))
+            logit_target_cumulative.append(float((target_sum @ head_t).norm()))
+    profile = {"local": local, "cumulative": cumulative, "target_cumulative": target_cumulative}
+    if head_t is not None:
+        profile.update(
+            logit_local=logit_local,
+            logit_cumulative=logit_cumulative,
+            logit_target_cumulative=logit_target_cumulative,
+        )
+    return profile
+
+
 def _predict_block_ridge(coefficients: Sequence[torch.Tensor], block_activations: Mapping[int, torch.Tensor]) -> torch.Tensor:
     prediction = None
     for block_id, coefficient in enumerate(coefficients):
@@ -1536,6 +1588,7 @@ class SteerRebase:
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
         block_ridge_lambda_scaling: str = "none",
+        block_ridge_diagnostics: bool = False,
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         target_blocks_cache_dir: str | None = None,
@@ -1862,6 +1915,7 @@ class SteerRebase:
 
         num_source_blocks = None
         block_group_size = None
+        block_error_profile: dict[str, Any] | None = None
         if stage_2_strategy == "global_ridge":
             coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
 
@@ -1992,6 +2046,24 @@ class SteerRebase:
                 )
             ]
 
+            if block_ridge_diagnostics:
+                if block_granularity != "residual" or block_group_size != 1 or "delta_A_blocks" not in test_data:
+                    print(f"{log_prefix} block_ridge_diagnostics skipped: needs residual granularity, 1:1 blocks, cached test deltas.")
+                else:
+                    test_targets = test_data["delta_A_blocks"].double() @ logit_map.T @ p_b.T
+                    test_blocks = {b: v.double() for b, v in test_data["features_B_blocks"].items()}
+                    block_error_profile = {
+                        "mode": block_ridge_mode,
+                        "rho": rho,
+                        "train": _block_ridge_error_profile(coefficients, local_blocks_train, block_targets, head=w_b),
+                        "test": _block_ridge_error_profile(coefficients, test_blocks, test_targets, head=w_b),
+                    }
+                    if verbose:
+                        for split_name in ("train", "test"):
+                            prof = block_error_profile[split_name]
+                            for key in prof:
+                                print(f"{log_prefix} block_err[{split_name}/{key}] " + " ".join(f"{v:.3f}" for v in prof[key]))
+
             def correction_fn(
                 activations: Mapping[str, torch.Tensor],
                 *,
@@ -2079,6 +2151,7 @@ class SteerRebase:
                 "stage1_rank": stage1_rank,
                 "stage1_regularization_mode": stage1_regularization_mode,
                 "stage1_energy_threshold": stage1_energy_threshold,
+                **({"block_error_profile": block_error_profile} if block_error_profile is not None else {}),
             },
         }
 

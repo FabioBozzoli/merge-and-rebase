@@ -271,3 +271,28 @@ def test_text_kd_runs_end_to_end_and_reports_the_steer_summary_schema(
     else:
         # Epoch 0 is the baseline, so the selected epoch can never be worse on val.
         assert diag["best_val"] >= diag["baseline_val"]
+
+
+def test_micro_batch_defaults_to_batch_size_and_is_clamped() -> None:
+    assert kd_rebase.resolve_kd_config({"kd": {"few_shot": 1}})["micro_batch_size"] == 32
+    assert kd_rebase.resolve_kd_config({"kd": {"few_shot": 1, "micro_batch_size": 8}})["micro_batch_size"] == 8
+    assert kd_rebase.resolve_kd_config({"kd": {"few_shot": 1, "micro_batch_size": 99}})["micro_batch_size"] == 32
+    with pytest.raises(ValueError, match="micro_batch_size"):
+        kd_rebase.resolve_kd_config({"kd": {"few_shot": 1, "micro_batch_size": 0}})
+
+
+@pytest.mark.parametrize("micro", [1, 3, 4, 10])
+def test_gradient_accumulation_matches_the_full_batch_gradient(micro: int) -> None:
+    torch.manual_seed(0)
+    x, labels, t = torch.randn(10, 6), torch.randint(0, 5, (10,)), torch.randn(10, 5)
+    w_full = torch.randn(6, 5, requires_grad=True)
+    w_acc = w_full.detach().clone().requires_grad_(True)
+    kd_kwargs = {"temperature": 2.0, "ce_weight": 0.5}
+
+    kd_rebase.kd_loss(x @ w_full, t, labels=labels, **kd_kwargs).backward()
+    idx = torch.arange(10)
+    for sub in idx.split(micro):  # same weighting as run_vision's accumulation loop
+        loss = kd_rebase.kd_loss(x[sub] @ w_acc, t[sub], labels=labels[sub], **kd_kwargs)
+        (loss * (len(sub) / len(idx))).backward()
+
+    assert torch.allclose(w_full.grad, w_acc.grad, atol=1e-6)

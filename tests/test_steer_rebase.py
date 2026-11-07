@@ -933,3 +933,71 @@ def test_concat_ridge_standard_reads_target_blocks_from_linear_cache(tmp_path) -
         assert "do not match" in str(err)
     else:
         raise AssertionError("mismatched target_blocks_cache_dir was accepted")
+
+
+def test_block_ridge_error_profile_matches_hand_computation() -> None:
+    g = torch.Generator().manual_seed(11)
+    n, num_blocks, d_block, d_out = 12, 3, 5, 4
+    blocks = {b: torch.randn(n, d_block, generator=g, dtype=torch.float64) for b in range(num_blocks)}
+    targets = torch.randn(n, num_blocks, d_out, generator=g, dtype=torch.float64)
+    coefs = steer_mod._fit_block_ridge(
+        blocks, targets, selected=torch.arange(n), regularization=0.1, mode="smoothed_residual", rho=0.9
+    )
+    prof = steer_mod._block_ridge_error_profile(coefs, blocks, targets)
+    err_sum = torch.zeros(n, d_out, dtype=torch.float64)
+    target_sum = torch.zeros(n, d_out, dtype=torch.float64)
+    assert set(prof) == {"local", "cumulative", "target_cumulative"}
+    for b in range(num_blocks):
+        err = targets[:, b] - blocks[b] @ coefs[b]
+        err_sum = err_sum + err
+        target_sum = target_sum + targets[:, b]
+        assert abs(prof["local"][b] - float(err.norm())) < 1e-9
+        assert abs(prof["cumulative"][b] - float(err_sum.norm())) < 1e-9
+        assert abs(prof["target_cumulative"][b] - float(target_sum.norm())) < 1e-9
+
+    # Optional logit-space profile: same quantities projected with the target head (K x D_B).
+    head = torch.randn(3, d_out, generator=g, dtype=torch.float64)
+    prof_logit = steer_mod._block_ridge_error_profile(coefs, blocks, targets, head=head)
+    assert set(prof_logit) == {
+        "local", "cumulative", "target_cumulative", "logit_local", "logit_cumulative", "logit_target_cumulative",
+    }
+    for key in ("local", "cumulative", "target_cumulative"):
+        assert prof_logit[key] == prof[key]  # default keys unchanged by the head
+    err_sum = torch.zeros(n, d_out, dtype=torch.float64)
+    target_sum = torch.zeros(n, d_out, dtype=torch.float64)
+    for b in range(num_blocks):
+        err = targets[:, b] - blocks[b] @ coefs[b]
+        err_sum = err_sum + err
+        target_sum = target_sum + targets[:, b]
+        assert abs(prof_logit["logit_local"][b] - float((err @ head.T).norm())) < 1e-9
+        assert abs(prof_logit["logit_cumulative"][b] - float((err_sum @ head.T).norm())) < 1e-9
+        assert abs(prof_logit["logit_target_cumulative"][b] - float((target_sum @ head.T).norm())) < 1e-9
+
+
+def test_steer_block_ridge_diagnostics_flag_is_opt_in(tmp_path) -> None:
+    torch.manual_seed(2)
+    loaders = _tiny_loaders()
+    clf_pre = _make_tiny_clf(depth=3)
+    clf_ft = _make_tiny_clf(depth=3)
+    clf_ft.load_state_dict(clf_pre.state_dict())
+    _finetune(clf_ft)
+    clf_target = _make_tiny_clf(depth=3)
+
+    def _prepare(diagnostics: bool):
+        return get_method("steer").prepare(
+            clf_source=clf_ft, clf_source_pretrained=clf_pre, clf_target=clf_target,
+            source_loaders=loaders, target_loaders=loaders, classnames=_CLASSNAMES, task="tiny_diag",
+            source_build_cfg_task=_BUILD_CFG, build_cfg_task=_BUILD_CFG, device="cpu",
+            feature_regime="linear", stage_2_strategy="block_ridge", block_granularity="residual",
+            block_ridge_mode="smoothed_residual", rho=0.9, ridge_lambda=0.1, block_ridge_lambda_scaling="trace",
+            block_ridge_diagnostics=diagnostics, few_shot=2, feature_cache_dir=str(tmp_path / "features"),
+            force_recompute_features=not diagnostics, verbose=False,
+        )
+
+    off, on = _prepare(False), _prepare(True)
+    assert "block_error_profile" not in off["diagnostics"]
+    prof = on["diagnostics"]["block_error_profile"]
+    assert prof["mode"] == "smoothed_residual"
+    assert len(prof["train"]["local"]) == len(prof["test"]["cumulative"]) == 4  # 3 residual blocks + output
+    assert len(prof["train"]["logit_cumulative"]) == len(prof["test"]["logit_local"]) == 4
+    assert off["diagnostics"]["stage2_test_acc"] == on["diagnostics"]["stage2_test_acc"]

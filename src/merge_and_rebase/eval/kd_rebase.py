@@ -62,6 +62,10 @@ _KD_DEFAULTS: dict[str, Any] = {
     "temperature": 1.0,
     "ce_weight": 0.0,
     "batch_size": 32,
+    # Gradient accumulation: each optimizer batch of ``batch_size`` is processed in chunks of at most
+    # ``micro_batch_size`` (None = no chunking). The update is the same as with one big batch (losses are
+    # weighted by chunk_size / batch_size), only peak GPU memory changes.
+    "micro_batch_size": None,
     "grad_clip": 1.0,
     "amp": None,  # None (model dtype) | "bf16"
     "train_mode": "eval",  # "eval" | "train" (dropout on)
@@ -92,6 +96,11 @@ def resolve_kd_config(cfg: dict[str, Any]) -> dict[str, Any]:
         kd[key] = int(kd[key])
         if kd[key] <= 0:
             raise ValueError(f"kd.{key} must be > 0.")
+    if kd.get("micro_batch_size") is None:
+        kd["micro_batch_size"] = kd["batch_size"]
+    kd["micro_batch_size"] = min(int(kd["micro_batch_size"]), kd["batch_size"])
+    if kd["micro_batch_size"] <= 0:
+        raise ValueError("kd.micro_batch_size must be > 0.")
     for key in ("lr", "weight_decay", "temperature", "ce_weight", "grad_clip"):
         kd[key] = float(kd[key])
     if kd["temperature"] <= 0.0:
@@ -477,25 +486,31 @@ def run_vision(args: argparse.Namespace) -> None:
                 clf_target.model.train(kd["train_mode"] == "train")
                 total_loss = 0.0
                 for idx in _support_batches(n_support, kd["batch_size"], generator):
-                    x = xs_student[idx].to(dev)
-                    amp = torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=kd["amp"] == "bf16")
-                    with amp:
-                        feats = F.normalize(clf_target.model.encode_image(x).float(), dim=-1)
-                    s_logits = float(clf_target.logit_scale) * feats @ w_b.t()
-                    loss = kd_loss(
-                        s_logits,
-                        teacher_logits[idx].to(dev),
-                        temperature=kd["temperature"],
-                        labels=ys_t[idx].to(dev),
-                        ce_weight=kd["ce_weight"],
-                    )
                     opt.zero_grad(set_to_none=True)
-                    loss.backward()
+                    batch_loss = 0.0
+                    # Gradient accumulation: chunk losses are means over the chunk, so weighting by
+                    # len(chunk) / len(idx) gives exactly the gradient of the full-batch mean loss.
+                    for sub in idx.split(kd["micro_batch_size"]):
+                        x = xs_student[sub].to(dev)
+                        amp = torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=kd["amp"] == "bf16")
+                        with amp:
+                            feats = F.normalize(clf_target.model.encode_image(x).float(), dim=-1)
+                        s_logits = float(clf_target.logit_scale) * feats @ w_b.t()
+                        loss = kd_loss(
+                            s_logits,
+                            teacher_logits[sub].to(dev),
+                            temperature=kd["temperature"],
+                            labels=ys_t[sub].to(dev),
+                            ce_weight=kd["ce_weight"],
+                        )
+                        weighted = loss * (len(sub) / len(idx))
+                        weighted.backward()
+                        batch_loss += float(weighted.detach())
                     if kd["grad_clip"] > 0.0:
                         torch.nn.utils.clip_grad_norm_(visual_params, kd["grad_clip"])
                     opt.step()
                     sched.step()
-                    total_loss += float(loss.detach()) * len(idx)
+                    total_loss += batch_loss * len(idx)
                 clf_target.model.eval()
                 val_acc = eval_task_top1(
                     clf=clf_target, loaders=loaders, classnames=classnames, build_cfg_task=build_cfg_task,
@@ -511,6 +526,11 @@ def run_vision(args: argparse.Namespace) -> None:
                 if kd["epoch_selection"] == "val" and val_acc > best_val:  # ties keep the earlier epoch
                     best_val, best_epoch, best_state = val_acc, epoch, _snapshot()
 
+            if dev.type == "cuda":
+                print(
+                    f"  {task}: peak GPU memory {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB "
+                    f"(batch_size={kd['batch_size']}, micro_batch_size={kd['micro_batch_size']})"
+                )
             if kd["epoch_selection"] == "val":
                 clf_target.model.visual.load_state_dict(best_state)
             else:
