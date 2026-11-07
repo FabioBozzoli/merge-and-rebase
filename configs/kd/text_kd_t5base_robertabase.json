@@ -1,0 +1,42 @@
+{
+  "_comment": "Few-shot KD baseline for steer_text: teacher A = google-t5/t5-base fine-tuned on SNLI (Hub checkpoint, same as text_rebase_t5base_t5large_steer_hubcheckpoint.json), student B trained on the same few_shot support set, logit KL on the 3 NLI classes. The student's head starts from the nearest-mean head (target_task_heads), which also defines the baseline column; build it with scripts/build_nearest_mean_head.py on the student base, with the same --few-shot/--seed as kd.",
+  "suite": "nli6",
+  "tasks": "snli",
+  "source_model_name_or_path": "google-t5/t5-base",
+  "source_model_arch": "t5",
+  "model_kind": "sequence_classification",
+  "num_labels": 3,
+  "device": "cuda",
+  "dtype": "fp32",
+  "eval_mode": "head_logits",
+  "target_task_heads": "REPLACE_WITH_NEAREST_MEAN_HEAD_PATH",
+  "source_input_template": "premise: {premise} hypothesis: {hypothesis}",
+  "split": "test",
+  "val_fraction": 0.1,
+  "max_samples_per_task": 2000,
+  "max_train_samples": 4000,
+  "batch_size": 16,
+  "num_workers": 0,
+  "max_length": 256,
+  "seed": 33,
+  "tuned_ckpts": {
+    "snli": "varun-v-rao/t5-base-snli"
+  },
+  "kd": {
+    "few_shot": 300,
+    "seed": 33,
+    "epochs": 20,
+    "lr": 1e-05,
+    "weight_decay": 0.0,
+    "temperature": 2.0,
+    "ce_weight": 0.0,
+    "batch_size": 16,
+    "grad_clip": 1.0,
+    "amp": null,
+    "train_mode": "train"
+  },
+  "target_model_name_or_path": "FacebookAI/roberta-base",
+  "target_model_arch": "auto",
+  "head_key_pattern": "classifier",
+  "_target_note": "Cross-architecture: RoBERTa-base (BPE tokenizer, <s> pooling, head = classifier.dense/out_proj). model_arch must be 'auto' (TextLM only accepts t5/llama/auto). The nearest-mean head must be built on roberta-base itself: python -m scripts.build_nearest_mean_head --model-name-or-path FacebookAI/roberta-base --model-arch auto --task snli --few-shot K --seed S --output ..."
+}

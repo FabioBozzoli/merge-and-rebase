@@ -24,6 +24,7 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ..data.svhn_preprocess import svhn_preprocess_scope
 from ..data.templates import get_templates
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.utils import (
@@ -330,6 +331,10 @@ def main() -> None:
                 "method that already defines method_params.shots_per_class / method_params.few_shot."
             )
         linear_probe_shots = int(linear_probe_shots) if linear_probe_shots is not None else None
+        if linear_probe_head and steer_mode and method_params.get("correction_space", "feature") == "logit":
+            # The probe encodes through encode_image and applies the head itself, so it would bypass
+            # the logit-space correction, which steer_correction_context adds in the classifier forward.
+            raise ValueError("linear_probe_head is not supported with steer correction_space='logit'.")
         if linear_probe_head and bool(cfg.get("alpha_search", False)):
             print(
                 "WARNING: linear_probe_head with alpha_search: the head is probed once, on the backbone at "
@@ -534,6 +539,8 @@ def main() -> None:
                 hf_ds=hf_ds,
                 hf_path=hf_path,
                 preprocess=clf_target.preprocess,
+                # MR_SVHN_PREPROCESS_SCOPE=source: only A's loaders get the custom SVHN pipeline.
+                svhn_custom_preprocess=False if svhn_preprocess_scope() == "source" else None,
                 ft_epochs=1,
                 split_map=split_map,
                 batch_size=int(cfg.get("batch_size", 128)),

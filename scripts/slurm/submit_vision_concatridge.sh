@@ -8,7 +8,8 @@
 # Requests keep ~1.5x headroom and short walltimes for backfill; any GPU >= 11 GB fits (ViT-L fp32 eval).
 # Runs only read existing caches. Resubmitting skips seeds whose summary exists (e.g. after an OOM).
 #
-#   bash scripts/slurm/submit_vision_concatridge.sh [linear|nonlinear ...]   (env PAIRS="vitb vitl", DATASETS=...)
+#   bash scripts/slurm/submit_vision_concatridge.sh [linear|nonlinear ...]   (env PAIRS="vitb vitl", DATASETS=...,
+#                                                                             LOG_SUFFIX=..., CODE_ROOT=... forwarded to the jobs)
 
 cd /homes/fbozzoli/merge-and-rebase || exit 1
 FEATURE_SETS=("${@:-linear nonlinear}")
@@ -36,7 +37,7 @@ for FEATURES in "${FEATURE_SETS[@]}"; do
         vitb:*)                 RES=(--mem=8G  --time=0:40:00) ;;
         vitl:*)                 RES=(--mem=12G --time=1:00:00) ;;
       esac
-      DIR=".log/steer_concatridge_${FEATURES}/${PAIR_DIR}/${TASK}"
+      DIR=".log/steer_concatridge_${FEATURES}${LOG_SUFFIX:-}/${PAIR_DIR}/${TASK}"
       for K in 1 2 5 10 20; do mkdir -p "${DIR}/K${K}"; done
       JOB=$(sbatch --parsable --job-name="${TAG}_${PAIR}_${TASK}" --array=1,2,5,10,20 "${RES[@]}" \
         --output="${DIR}/K%a/slurm_%A_%a.out" --error="${DIR}/K%a/slurm_%A_%a.err" \

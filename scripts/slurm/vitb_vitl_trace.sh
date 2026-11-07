@@ -10,7 +10,7 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
+#SBATCH --mem=96G
 #SBATCH --constraint="gpu_A40_45G|gpu_L40S_45G"
 #SBATCH --account=intesasanpaolo_phd
 #SBATCH --partition=boost_usr_prod
@@ -32,13 +32,6 @@ PREFIX="vision8_steer_trace_vitl"
 
 # 8 dataset del benchmark Vision8
 DATASETS=(
-"Cars"
-"DTD"
-"EuroSAT"
-"GTSRB"
-"MNIST"
-"RESISC45"
-"SUN397"
 "SVHN"
 )
 FEW_SHOTS=(1 2 5 10 20)

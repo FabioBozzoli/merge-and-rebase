@@ -1,0 +1,39 @@
+{
+  "suite": "vision8",
+  "source_clip_model": "ViT-B-16",
+  "source_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "target_clip_model": "ViT-L-14",
+  "target_clip_pretrained": "datacomp_xl_s13b_b90k",
+  "batch_size": 32,
+  "num_workers": 0,
+  "val_fraction": 0.1,
+  "no_humanize": true,
+  "weights": null,
+  "tuned_ckpts": {
+    "EuroSAT": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/eurosat/best.pt",
+    "RESISC45": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/resisc45/best.pt",
+    "SVHN": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/SVHN/full_best_ep.pt",
+    "DTD": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/dtd/best.pt",
+    "MNIST": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/mnist/best.pt",
+    "GTSRB": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/gtsrb/best.pt",
+    "Cars": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/cars/best.pt",
+    "SUN397": "/work/intesasanpaolo_phd/merge-and-rebase/checkpoints_nonlinear/ViT-B-16/datacomp_xl_s13b_b90k/sun397/best.pt"
+  },
+  "tasks": "SVHN",
+  "method": "steer",
+  "alpha_search": false,
+  "alpha_selection": "shared",
+  "alpha": 1.0,
+  "seed": 89,
+  "method_params": {
+    "feature_regime": "standard",
+    "stage_2_strategy": "global_ridge",
+    "ridge_lambda": 1.0,
+    "stage1_lambda": 1.0,
+    "few_shot": 2,
+    "seed": 89,
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/features/steer_svhn96_source_only",
+    "force_recompute_features": false
+  },
+  "_description": "SVHN ViT-B/16 datacomp -> ViT-L/14 datacomp, steer global_ridge, nonlinear (standard regime, full fine-tuning source checkpoint), stage1_lambda=1, ridge_lambda=1.0, alpha=1; resize-96+pad on the SOURCE only, B stock preprocessing (MR_SVHN_PREPROCESS_SCOPE=source); cache steer_svhn96_source_only/.../SVHN/standard (A side copied from nonlinear_feature, B side from steer_svhn96_source_only linear). few_shot=2, seed=89."
+}

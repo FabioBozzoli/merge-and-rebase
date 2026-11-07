@@ -26,6 +26,8 @@
 # Output, <dir> = .log/steer_concatridge_<features>/<source>_to_<target>/:
 #   <Dataset>/K<k>/seed<S>.log, <Dataset>/K<k>/slurm_<job>.out, summaries/<Dataset>_K<k>_seed<S>.json
 # A run whose summary exists is skipped, so resubmitting only fills the gaps.
+# Env: LOG_SUFFIX appends to steer_concatridge_<features> (e.g. a rerun), CODE_ROOT picks another snapshot,
+#      CONFIG_DIR another config dir, MR_SVHN_PREPROCESS_SCOPE=source keeps B on its stock SVHN preprocessing.
 
 FEATURES="$1"
 PAIR="$2"
@@ -41,16 +43,19 @@ case "$PAIR" in
 esac
 [ -n "$TASK" ] && [ -n "$K" ] || { echo "$USAGE" >&2; exit 1; }
 
-ROOT=".log/steer_concatridge_${FEATURES}/${PAIR_DIR}"
+ROOT=".log/steer_concatridge_${FEATURES}${LOG_SUFFIX:-}/${PAIR_DIR}"
 RUN_DIR="${ROOT}/${TASK}/K${K}"
 SUMMARIES="${ROOT}/summaries"
 mkdir -p "$RUN_DIR" "$SUMMARIES"
 
 echo "concat_ridge ${FEATURES} | ${PAIR_DIR} | ${TASK} | K=${K} | node=$(hostname) gpu=${CUDA_VISIBLE_DEVICES}"
-CODE_ROOT=/work/intesasanpaolo_phd/merge-and-rebase/code_snapshots/concatridge_20261012
+CODE_ROOT="${CODE_ROOT:-/work/intesasanpaolo_phd/merge-and-rebase/code_snapshots/concatridge_20261012}"
 source .venv/bin/activate
 export PYTHONUNBUFFERED=1 PYTHONPATH="${CODE_ROOT}/src"
 export MR_SVHN_PREPROCESS=1 MR_SVHN_TARGET_SIZE=96 MR_SVHN_AUGMENTATION=none
+export MR_SVHN_PREPROCESS_SCOPE="${MR_SVHN_PREPROCESS_SCOPE:-both}"
+CONFIG_DIR="${CONFIG_DIR:-configs/vision8_steer_concat}"
+echo "configs: ${CONFIG_DIR} | MR_SVHN_PREPROCESS_SCOPE=${MR_SVHN_PREPROCESS_SCOPE}"
 echo "code: ${CODE_ROOT} (base commit $(cat ${CODE_ROOT}/BASE_COMMIT.txt) + worktree.patch)"
 FAILED=0
 for SEED in "${SEEDS[@]}"; do
@@ -61,7 +66,7 @@ for SEED in "${SEEDS[@]}"; do
   fi
   echo "seed ${SEED}: running ($(date +%T)), log ${RUN_DIR}/seed${SEED}.log"
   if python -m merge_and_rebase.eval.vision_rebase \
-      --config "configs/vision8_steer_concat/concatridge_${FEATURES}_${PAIR}_fs${K}_seed${SEED}.json" \
+      --config "${CONFIG_DIR}/concatridge_${FEATURES}_${PAIR}_fs${K}_seed${SEED}.json" \
       --tasks "$TASK" --run-name "$NAME" --local-log-dir "$SUMMARIES" > "${RUN_DIR}/seed${SEED}.log" 2>&1; then
     echo "seed ${SEED}: done ($(date +%T))"
   else
