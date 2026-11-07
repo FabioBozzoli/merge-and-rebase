@@ -1204,3 +1204,22 @@ def test_steer_logit_space_end_to_end(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="correction_space"):
         _prepare_tiny_logit(tmp_path, strategy="global_ridge", regime="standard", correction_space="weights")
+
+
+def test_block_ridge_diagnostics_in_logit_space(tmp_path) -> None:
+    """correction_space='logit' + block_ridge_diagnostics: residuals are already [C] logits, so the profile
+    is computed without pinv(w_b) and without the extra head projection, and the correction is unchanged."""
+    common = dict(
+        strategy="block_ridge", regime="linear", correction_space="logit", block_granularity="residual",
+        block_ridge_mode="smoothed_residual", rho=0.9, ridge_lambda=0.1,
+    )
+    off, _, _ = _prepare_tiny_logit(tmp_path, **common, block_ridge_diagnostics=False)
+    on, _, _ = _prepare_tiny_logit(tmp_path, **common, block_ridge_diagnostics=True)
+    assert "block_error_profile" not in off["diagnostics"]
+    prof = on["diagnostics"]["block_error_profile"]
+    assert prof["correction_space"] == "logit"
+    for split_name in ("train", "test"):
+        assert set(prof[split_name]) == {"local", "cumulative", "target_cumulative"}
+        assert len(prof[split_name]["local"]) == 4  # 3 residual blocks + output
+        assert torch.isfinite(torch.tensor(prof[split_name]["cumulative"])).all()
+    assert off["diagnostics"]["stage2_test_acc"] == on["diagnostics"]["stage2_test_acc"]

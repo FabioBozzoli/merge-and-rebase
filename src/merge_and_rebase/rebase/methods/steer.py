@@ -2147,13 +2147,19 @@ class SteerRebase:
                 if block_granularity != "residual" or block_group_size != 1 or "delta_A_blocks" not in test_data:
                     print(f"{log_prefix} block_ridge_diagnostics skipped: needs residual granularity, 1:1 blocks, cached test deltas.")
                 else:
-                    test_targets = test_data["delta_A_blocks"].double() @ logit_map.T @ p_b.T
+                    # Same space as block_targets: in logit space the residuals are already [C] logits,
+                    # so there is no pinv(w_b) and no extra head projection.
+                    test_targets = test_data["delta_A_blocks"].double() @ logit_map.T
+                    if not logit_space:
+                        test_targets = test_targets @ p_b.T
+                    profile_head = None if logit_space else w_b
                     test_blocks = {b: v.double() for b, v in test_data["features_B_blocks"].items()}
                     block_error_profile = {
                         "mode": block_ridge_mode,
                         "rho": rho,
-                        "train": _block_ridge_error_profile(coefficients, local_blocks_train, block_targets, head=w_b),
-                        "test": _block_ridge_error_profile(coefficients, test_blocks, test_targets, head=w_b),
+                        "correction_space": correction_space,
+                        "train": _block_ridge_error_profile(coefficients, local_blocks_train, block_targets, head=profile_head),
+                        "test": _block_ridge_error_profile(coefficients, test_blocks, test_targets, head=profile_head),
                     }
                     if verbose:
                         for split_name in ("train", "test"):
