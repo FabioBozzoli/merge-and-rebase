@@ -318,10 +318,13 @@ def _fit_block_ridge(
     stage2.block_ridge (which fits and predicts in a single call).
 
     ``regularization_scaling="trace"`` fits block ``b`` with
-    ``regularization * tr(X_b X_bᵀ) / n``, i.e. relative to the mean
-    eigenvalue of that block's Gram matrix. This makes the scalar
-    ``regularization`` a dimensionless sweep parameter with comparable
-    effective shrinkage across blocks whose activation scales differ.
+    ``regularization * tr(X_b X_bᵀ) / n``, i.e. relative to the mean eigenvalue
+    of that block's Gram matrix. A single absolute ``regularization`` cannot suit
+    every block when their activation scales differ: t5's un-normalized residual
+    stream grows by orders of magnitude with depth, so ``regularization=1`` is
+    negligible on deep blocks (they interpolate the support) while still biting
+    on the final, layer-normed one. Trace scaling makes ``regularization`` a
+    dimensionless sweep parameter with comparable effective shrinkage across blocks.
     """
     if mode not in {"independent", "smoothed_residual"}:
         raise ValueError(f"Unknown steer block_ridge mode: {mode}")
@@ -504,9 +507,29 @@ def _group_blocks_sum_avg(blocks: Mapping[int, torch.Tensor], num_groups: int) -
     return grouped
 
 
+def _group_blocks_last(blocks: Mapping[int, torch.Tensor], num_groups: int) -> dict[int, torch.Tensor]:
+    """Group B blocks by keeping only the deepest member of each group (the others are discarded)."""
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive")
+    block_ids = sorted(blocks)
+    if not block_ids:
+        raise ValueError("blocks dict is empty")
+    if len(block_ids) < num_groups:
+        raise ValueError(f"Cannot group {len(block_ids)} blocks into {num_groups} groups")
+    if len(block_ids) == num_groups:
+        return dict(blocks)
+    boundaries = [round(i * len(block_ids) / num_groups) for i in range(num_groups + 1)]
+    grouped: dict[int, torch.Tensor] = {}
+    for g in range(num_groups):
+        members = block_ids[boundaries[g] : boundaries[g + 1]]
+        grouped[g] = blocks[members[-1]]
+    return grouped
+
+
 _BLOCK_GROUP_STRATEGIES: dict[str, Callable[[Mapping[int, torch.Tensor], int], dict[int, torch.Tensor]]] = {
     "concat": _group_blocks_concat,
     "sum_avg": _group_blocks_sum_avg,
+    "last": _group_blocks_last,
 }
 
 

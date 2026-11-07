@@ -1,0 +1,56 @@
+{
+  "scitail_attention_block_ridge_trace_carry_fs1000_seed33": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9,
+    "stage2_cached": 0.8861111111111111,
+    "stage2_live": 0.8861111111111111
+  },
+  "scitail_attention_block_ridge_trace_carry_fs1000_seed54": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9016666666666666,
+    "stage2_cached": 0.8872222222222222,
+    "stage2_live": 0.8872222222222222
+  },
+  "scitail_attention_block_ridge_trace_carry_fs1000_seed89": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9016666666666666,
+    "stage2_cached": 0.8855555555555555,
+    "stage2_live": 0.8855555555555555
+  },
+  "scitail_global_ridge_fs1000_seed33": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9,
+    "stage2_cached": 0.8661111111111112,
+    "stage2_live": 0.8661111111111112
+  },
+  "scitail_global_ridge_fs1000_seed54": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9016666666666666,
+    "stage2_cached": 0.8661111111111112,
+    "stage2_live": 0.8661111111111112
+  },
+  "scitail_global_ridge_fs1000_seed89": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9016666666666666,
+    "stage2_cached": 0.8633333333333333,
+    "stage2_live": 0.8633333333333333
+  },
+  "scitail_residual_block_ridge_trace_carry_fs1000_seed33": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9,
+    "stage2_cached": 0.8116666666666666,
+    "stage2_live": 0.8116666666666666
+  },
+  "scitail_residual_block_ridge_trace_carry_fs1000_seed54": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9016666666666666,
+    "stage2_cached": 0.8361111111111111,
+    "stage2_live": 0.8361111111111111
+  },
+  "scitail_residual_block_ridge_trace_carry_fs1000_seed89": {
+    "stage0": 0.7738888888888888,
+    "stage1": 0.9016666666666666,
+    "stage2_cached": 0.8094444444444444,
+    "stage2_live": 0.8094444444444444
+  }
+}

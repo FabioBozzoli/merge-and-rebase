@@ -12,16 +12,30 @@ except Exception:  # pragma: no cover - optional dependency fallback
     tqdm = None
 
 
+# Architectures whose encoder stack model_kind="encoder_classification" can build, as
+# config.model_type -> wrapper class name in rebase/text/encoder_classifier.py.
+# Checked against config.model_type so that an already-converted encoder-only
+# directory (which reports is_encoder_decoder=False) is still recognised.
+_T5_FAMILY_MODEL_TYPES = frozenset({"t5", "mt5", "umt5", "longt5"})
+_ENCODER_CLASSIFIER_BY_MODEL_TYPE: dict[str, str] = {
+    **{model_type: "T5EncoderForSequenceClassification" for model_type in _T5_FAMILY_MODEL_TYPES},
+    "roberta": "RobertaEncoderForSequenceClassification",
+}
+
+
 @dataclass(frozen=True)
 class TextBuildConfig:
     model_name_or_path: str
     model_arch: str = "auto"  # "llama" | "t5" | "auto"
     device: str = "cuda"
     dtype: str | None = None  # "fp16" | "bf16" | "fp32" | None
-    model_kind: str = "causal_lm"  # "causal_lm" | "sequence_classification"
+    model_kind: str = "causal_lm"  # "causal_lm" | "sequence_classification" | "encoder_classification"
     num_labels: int = 3
     trust_remote_code: bool = False
     use_fast_tokenizer: bool = True
+    # Head input of model_kind="encoder_classification": "global" (masked mean) or
+    # "segments" ([premise; hypothesis; global], 3x wider); see encoder_classifier.pool_features.
+    feature_pooling: str = "global"
 
 
 class TextLM(nn.Module):
@@ -90,6 +104,11 @@ class TextLM(nn.Module):
         is_encoder_decoder = bool(getattr(hf_cfg, "is_encoder_decoder", False))
 
         kind = str(cfg.model_kind).strip().lower()
+        if kind != "encoder_classification" and cfg.feature_pooling != "global":
+            raise ValueError(
+                f"feature_pooling={cfg.feature_pooling!r} is only supported with model_kind='encoder_classification' "
+                f"(got model_kind={kind!r})."
+            )
         common = {
             "pretrained_model_name_or_path": cfg.model_name_or_path,
             "trust_remote_code": bool(cfg.trust_remote_code),
@@ -106,8 +125,52 @@ class TextLM(nn.Module):
                 **common,
                 num_labels=int(cfg.num_labels),
             )
+        elif kind == "encoder_classification":
+            # Imported inside the branch on purpose. Importing `rebase.text`
+            # registers `steer_text` in the rebase registry as a side effect,
+            # and `rebase/methods/__init__.py` deliberately leaves that package
+            # out so only eval/text_rebase.py triggers it. A module-level import
+            # here would make every `models.text_lm` import register rebase
+            # methods -- including on the vision paths, which never want them.
+            from ..rebase.text import encoder_classifier
+
+            # Gate on the model family, not on config.is_encoder_decoder: a
+            # checkpoint already converted by scripts/convert_t5_encoder_ckpt.py
+            # is a T5 encoder with no decoder, so it reports is_encoder_decoder
+            # False and would fail that test despite being exactly what this
+            # kind is for.
+            model_type = str(getattr(hf_cfg, "model_type", "")).lower()
+            wrapper_name = _ENCODER_CLASSIFIER_BY_MODEL_TYPE.get(model_type)
+            if wrapper_name is None:
+                raise ValueError(
+                    f"model_kind='encoder_classification' builds an encoder stack with a linear head, but "
+                    f"'{cfg.model_name_or_path}' has model_type='{model_type}'. Supported: "
+                    f"{sorted(_ENCODER_CLASSIFIER_BY_MODEL_TYPE)}. Use model_kind='sequence_classification' "
+                    "for other architectures."
+                )
+            wrapper_cls = getattr(encoder_classifier, wrapper_name)
+            # A Hub id and a local converted directory are the same call here:
+            # from_pretrained accepts either, so converted checkpoints need no
+            # separate code path.
+            if cfg.feature_pooling == "global":
+                model = wrapper_cls.from_pretrained(
+                    **common,
+                    num_labels=int(cfg.num_labels),
+                )
+            else:
+                # from_pretrained only overrides config attributes that already exist and
+                # hands any other kwarg to __init__, so a new attribute goes in via config=.
+                model_cfg = AutoConfig.from_pretrained(
+                    cfg.model_name_or_path,
+                    trust_remote_code=bool(cfg.trust_remote_code),
+                    num_labels=int(cfg.num_labels),
+                )
+                model_cfg.feature_pooling = str(cfg.feature_pooling)
+                model = wrapper_cls.from_pretrained(**common, config=model_cfg)
         else:
-            raise ValueError("model_kind must be one of: causal_lm, sequence_classification")
+            raise ValueError(
+                "model_kind must be one of: causal_lm, sequence_classification, encoder_classification"
+            )
 
         # Sequence-classification forward with batch_size > 1 requires pad_token_id.
         if getattr(model.config, "pad_token_id", None) is None:

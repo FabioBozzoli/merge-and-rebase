@@ -29,8 +29,9 @@ activation hooks assume every parameterized submodule captures a
 from __future__ import annotations
 
 import random
+import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -43,6 +44,68 @@ _HEAD_ROOTS: tuple[str, ...] = ("score", "classifier", "classification_head")
 
 # Parameter-name fragments that never belong in a transported task vector.
 _NEVER_TRANSPORT: tuple[str, ...] = ("position_ids", "num_batches_tracked", "rotary_emb.inv_freq")
+
+
+class _RenamedModulesView(nn.Module):
+    """A model whose ``named_modules`` reports the names ``rename`` gives them.
+
+    ``theseus`` keys its activation registry by module name and pairs A's and B's entries by that name.
+    Across two families (T5 -> RoBERTa) no name is shared, so nothing would be paired and every layer
+    would be transported with a zero delta. Viewing A through this class renames the modules that have a
+    counterpart in B and hides the others (``rename`` returning ``None``); the forward is A's, unchanged.
+    """
+
+    def __init__(self, model: nn.Module, rename: Callable[[str], str | None]) -> None:
+        super().__init__()
+        self.inner = model
+        self._rename = rename
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.inner(*args, **kwargs)
+
+    def named_modules(self, memo: Any = None, prefix: str = "", remove_duplicate: bool = True) -> Iterator[tuple[str, nn.Module]]:  # noqa: ARG002
+        yield "", self
+        for name, module in self.inner.named_modules():
+            renamed = self._rename(name) if name else None
+            if renamed is not None:
+                yield renamed, module
+
+
+# T5 encoder block -> RoBERTa encoder layer, matrix by matrix. Both base models have d_model 768, d_ff 3072,
+# 12 heads of 64, so the shapes agree exactly. T5's norms, relative-position bias and embeddings have no
+# counterpart with the same role (RMS norm vs LayerNorm, relative vs absolute positions) and are left out.
+_T5_TO_ROBERTA_MODULES: dict[str, str] = {
+    "layer.0.SelfAttention.q": "attention.self.query",
+    "layer.0.SelfAttention.k": "attention.self.key",
+    "layer.0.SelfAttention.v": "attention.self.value",
+    "layer.0.SelfAttention.o": "attention.output.dense",
+    "layer.1.DenseReluDense.wi": "intermediate.dense",
+    "layer.1.DenseReluDense.wo": "output.dense",
+}
+_T5_BLOCK_MODULE = re.compile(r"^(?:transformer\.)?encoder\.block\.(\d+)\.(.+)$")
+
+
+def t5_to_roberta_module_name(name: str) -> str | None:
+    """RoBERTa name (``roberta.encoder.layer.i.<...>``) of the T5 encoder module ``name``, or ``None``."""
+    match = _T5_BLOCK_MODULE.match(name)
+    if match is None or match.group(2) not in _T5_TO_ROBERTA_MODULES:
+        return None
+    return f"roberta.encoder.layer.{match.group(1)}.{_T5_TO_ROBERTA_MODULES[match.group(2)]}"
+
+
+def remap_t5_delta_to_roberta(delta: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """A T5 encoder task vector under RoBERTa parameter names; keys without a counterpart are dropped.
+
+    Only the six weight matrices of :data:`_T5_TO_ROBERTA_MODULES` survive (T5 has no biases, so RoBERTa's
+    get no delta).
+    """
+    out: dict[str, torch.Tensor] = {}
+    for key, value in delta.items():
+        module, _, param = key.rpartition(".")
+        renamed = t5_to_roberta_module_name(module)
+        if renamed is not None and param == "weight":
+            out[f"{renamed}.weight"] = value
+    return out
 
 
 class TextEncoderShim(nn.Module):
@@ -69,9 +132,13 @@ class TextEncoderShim(nn.Module):
     through the injected recipe, which calls ``model(input_ids=..., labels=...)``.
     """
 
-    def __init__(self, model: nn.Module, pad_token_id: int) -> None:
+    def __init__(
+        self, model: nn.Module, pad_token_id: int, module_rename: Callable[[str], str | None] | None = None
+    ) -> None:
         super().__init__()
-        self.visual = model
+        # module_rename presents the model's submodules under another architecture's names,
+        # so theseus's name-keyed activation registry lines up across two families.
+        self.visual = model if module_rename is None else _RenamedModulesView(model, module_rename)
         self.pad_token_id = int(pad_token_id)
 
     def encode_image(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -315,6 +382,64 @@ def _probe_accuracy(
     return float(correct) / float(total) if total else float("nan")
 
 
+def cache_head_inputs(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: str,
+    mask: torch.Tensor | None,
+    remap: dict[int, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One forward pass over ``loader``, returning ``(head_inputs, labels)``.
+
+    The features are captured with a forward pre-hook on the head's final
+    ``nn.Linear`` rather than by swapping it for ``nn.Identity`` the way
+    ``steer_text._head_as_identity`` does. That difference is load-bearing:
+    ``steer_text`` applies its correction as its own pre-hook on that same
+    module, so an Identity swap would bypass it and cache *uncorrected*
+    features. A pre-hook registered here runs after the correction's and
+    therefore sees exactly what the head would have consumed.
+
+    Only valid while the backbone is frozen AND deterministic (``eval()``, no
+    dropout) -- which is the contract ``train_linear_probe_head(dropout=False)``
+    already enforces before calling this.
+    """
+    _, final_linear = head_linear(model)
+    captured: list[torch.Tensor] = []
+
+    def _capture(_module: nn.Module, args: tuple) -> None:
+        captured.append(args[0].detach())
+
+    was_training = model.training
+    model.eval()
+    handle = final_linear.register_forward_pre_hook(_capture)
+    features: list[torch.Tensor] = []
+    labels: list[torch.Tensor] = []
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                captured.clear()
+                _, batch_labels = _masked_logits_and_labels(model, batch, device=device, mask=mask, remap=remap)
+                if len(captured) != 1:
+                    raise RuntimeError(
+                        f"expected exactly one head call per batch, captured {len(captured)}; "
+                        "the model's head is invoked more than once per forward."
+                    )
+                features.append(captured[0])
+                labels.append(batch_labels)
+    finally:
+        handle.remove()
+        if was_training:
+            model.train()
+    return torch.cat(features, dim=0), torch.cat(labels, dim=0)
+
+
+def _head_logits(final_linear: nn.Module, features: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """The head applied to cached features, masked exactly as a full forward is."""
+    logits = final_linear(features)
+    return logits if mask is None else logits.index_select(dim=1, index=mask.to(logits.device))
+
+
 def train_linear_probe_head(
     model: nn.Module,
     loader: DataLoader,
@@ -326,6 +451,8 @@ def train_linear_probe_head(
     eval_loaders: Mapping[str, DataLoader] | None = None,
     log_every: int | None = None,
     log_prefix: str = "[probe]",
+    dropout: bool = True,
+    cache_features: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Fit *only* the final classification ``nn.Linear`` on a tiny (few-shot)
     ``loader``, starting from whatever weights it currently holds.
@@ -371,6 +498,21 @@ def train_linear_probe_head(
     on every log line, so a large ``test`` loader at a small ``log_every`` is
     the expensive part.
 
+    With ``dropout=False`` the head's inputs are computed once and reused for every
+    epoch (see :func:`cache_head_inputs`), since a frozen backbone in ``eval()``
+    returns the same features each time; this is the difference between one pass
+    over the support set and ``steps`` of them. The gradients are unchanged;
+    ``cache_features=False`` forces the recomputing path, which is what the
+    equivalence test compares against.
+
+    ``dropout=False`` keeps the whole model in ``eval()`` while the head trains,
+    so the probe is fit on the same deterministic features it is scored on --
+    what ``eval/linear_probe.py`` (the vision twin) always does. The default
+    ``True`` puts the model in ``train()``, which turns the frozen backbone's
+    dropout on during training; it is kept only so that configs written before
+    this switch reproduce. The trained ``nn.Linear`` has no mode-dependent
+    behaviour, so this changes the features it sees and nothing else.
+
     Returns a ``{qualified_param_name: tensor}`` dict in the same shape
     ``scripts/build_nearest_mean_head.py`` writes to disk, so callers can drop
     it straight into ``target_task_heads[task]`` -- note it only contains the
@@ -394,14 +536,40 @@ def train_linear_probe_head(
     mask = None if mask_class is None else torch.as_tensor([int(x) for x in mask_class], dtype=torch.long)
     remap = None if mask is None else {int(c): i for i, c in enumerate(mask.tolist())}
 
+    # Exact offsets rather than step*batch_size: a loader's last batch is short, and
+    # a caller could hand over uneven batches. Wrong offsets here would silently pair
+    # features with other examples' labels.
+    batch_bounds: list[tuple[int, int]] = []
+    _offset = 0
+    for _b in batches:
+        _n = len(_b["labels"])
+        batch_bounds.append((_offset, _offset + _n))
+        _offset += _n
     total_epochs = int(steps)
     # ~10 log lines whatever the epoch count, unless the caller says otherwise.
     every = int(log_every) if log_every else max(1, total_epochs // 10)
 
+    # With the backbone frozen and in eval(), every epoch would recompute the exact
+    # same head inputs -- 200 epochs x the support set of full forward passes through
+    # the target model, which is essentially the whole cost of this function. Cache
+    # them once instead and train the final linear on tensors. Not available under
+    # `dropout`, where train() makes each epoch's features genuinely different.
+    cached: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    if not dropout and cache_features:
+        cached["__train__"] = cache_head_inputs(model, loader, device=device, mask=mask, remap=remap)
+        for split_name, split_loader in (eval_loaders or {}).items():
+            cached[split_name] = cache_head_inputs(model, split_loader, device=device, mask=mask, remap=remap)
+
     def _eval_line(header: str) -> str:
         parts = [header]
         for split_name, split_loader in (eval_loaders or {}).items():
-            acc = _probe_accuracy(model, split_loader, device=device, mask=mask, remap=remap)
+            if cached:
+                feats, split_labels = cached[split_name]
+                with torch.no_grad():
+                    predicted = _head_logits(final_linear, feats, mask).argmax(dim=-1)
+                acc = float((predicted == split_labels).sum()) / float(split_labels.numel())
+            else:
+                acc = _probe_accuracy(model, split_loader, device=device, mask=mask, remap=remap)
             parts.append(f"{split_name}={acc:.4f}")
         return "  ".join(parts)
 
@@ -412,13 +580,22 @@ def train_linear_probe_head(
     if eval_loaders:
         print(_eval_line(f"{log_prefix} epoch 0/{total_epochs}  (no update yet)"))
 
-    model.train()
+    if dropout:
+        model.train()
     optimizer = torch.optim.Adam(head_params, lr=float(lr))
     try:
         for epoch in range(1, total_epochs + 1):
             epoch_loss = 0.0
-            for batch in batches:
-                logits, labels = _masked_logits_and_labels(model, batch, device=device, mask=mask, remap=remap)
+            for step, batch in enumerate(batches):
+                if cached:
+                    # Same batch boundaries as the uncached path, so the optimizer sees
+                    # an identical sequence of gradients.
+                    start, stop = batch_bounds[step]
+                    feats, labels = cached["__train__"]
+                    logits = _head_logits(final_linear, feats[start:stop], mask)
+                    labels = labels[start:stop]
+                else:
+                    logits, labels = _masked_logits_and_labels(model, batch, device=device, mask=mask, remap=remap)
                 loss = torch.nn.functional.cross_entropy(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()

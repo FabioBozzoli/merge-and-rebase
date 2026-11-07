@@ -31,6 +31,37 @@ _ACTIVATION_COVARIANCE_MODES = {"activation", "activations"}
 _DATA_FREE_COVARIANCE_MODES = {"data_free", "data-free", "weight", "weights", "weight_space", "weight-space"}
 
 
+_COMPUTE_DTYPES = {
+    "float64": torch.float64, "fp64": torch.float64, "double": torch.float64,
+    "float32": torch.float32, "fp32": torch.float32, "float": torch.float32,
+}
+
+
+def _resolve_compute(device: str | torch.device, dtype: str | torch.dtype) -> tuple[torch.device, torch.dtype]:
+    """Where the covariance/Gram accumulation and the decompositions run.
+
+    Defaults (cpu/float64) reproduce this file's original behaviour exactly, which
+    is what lets ``eval/vision_rebase.py`` keep its numerics while
+    ``eval/text_rebase.py`` opts into cuda/float32. Cross-model covariances here are
+    up to [3072, 4096] and the accumulation runs once per calibration batch, so on a
+    t5-base -> t5-large pair the difference is ~26 min a run versus a few.
+
+    float32 is a real accuracy choice, not just a speed one: it accumulates
+    ``a.T @ b`` over ~100 batches in half the mantissa. Verify against the float64
+    path on one cell before trusting a grid to it.
+    """
+    if isinstance(dtype, torch.dtype):
+        resolved_dtype = dtype
+    else:
+        key = str(dtype).strip().lower()
+        if key not in _COMPUTE_DTYPES:
+            raise ValueError(
+                f"Theseus compute_dtype must be one of: {sorted(set(_COMPUTE_DTYPES))}; got {dtype!r}."
+            )
+        resolved_dtype = _COMPUTE_DTYPES[key]
+    return _resolve_device(device), resolved_dtype
+
+
 def _resolve_device(device: str | torch.device) -> torch.device:
     dev = torch.device(device)
     if dev.type == "cuda" and not torch.cuda.is_available():
@@ -282,10 +313,20 @@ def _align_features(
 class ActivationStore:
     """Streaming activation statistics with optional Gram and raw storage."""
 
-    def __init__(self, *, store_raw: bool = False, store_a_gram: bool = False, store_b_gram: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        store_raw: bool = False,
+        store_a_gram: bool = False,
+        store_b_gram: bool = False,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float64,
+    ) -> None:
         self.store_raw = bool(store_raw)
         self.store_a_gram = bool(store_a_gram)
         self.store_b_gram = bool(store_b_gram)
+        self.device = torch.device("cpu") if device is None else torch.device(device)
+        self.dtype = dtype
 
         self.at_b: torch.Tensor | None = None
         self.at_a: torch.Tensor | None = None
@@ -298,8 +339,8 @@ class ActivationStore:
         self.h_b_list: list[torch.Tensor] = []
 
     def update(self, batch_a: torch.Tensor, batch_b: torch.Tensor) -> None:
-        a = batch_a.detach().cpu().to(torch.float64)
-        b = batch_b.detach().cpu().to(torch.float64)
+        a = batch_a.detach().to(device=self.device, dtype=self.dtype)
+        b = batch_b.detach().to(device=self.device, dtype=self.dtype)
 
         if self.store_raw:
             self.h_a_list.append(a.float())
@@ -373,7 +414,12 @@ class ActivationStore:
 
 
 class _ActivationHook:
-    def __init__(self, model: torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, *, device: torch.device | None = None):
+        # None keeps the original behaviour: pull every capture back to the CPU. A
+        # device here leaves them where the forward produced them, which is the point
+        # when the covariance that consumes them accumulates on the same device --
+        # otherwise every batch pays a round trip to host memory and back.
+        self.store_device = None if device is None else torch.device(device)
         self.model = _visual_module(model)
         self.inputs: dict[str, torch.Tensor] = {}
         self.outputs: dict[str, torch.Tensor] = {}
@@ -388,17 +434,21 @@ class _ActivationHook:
             if list(module.parameters(recurse=False)):
                 self.handles.append(module.register_forward_hook(self._make_hook(name)))
 
+    def _keep(self, tensor: torch.Tensor) -> torch.Tensor:
+        detached = tensor.detach()
+        return detached.cpu() if self.store_device is None else detached.to(self.store_device)
+
     def _make_hook(self, name: str):
         def hook_fn(_module: torch.nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
             inp = inputs[0] if isinstance(inputs, (tuple, list)) and inputs else inputs
             if torch.is_tensor(inp):
-                self.inputs[name] = inp.detach().cpu()
+                self.inputs[name] = self._keep(inp)
             try:
                 out = _extract_output_tensor(output)
             except TypeError:
                 out = None
             if out is not None and torch.is_tensor(out):
-                self.outputs[name] = out.detach().cpu()
+                self.outputs[name] = self._keep(out)
 
         return hook_fn
 
@@ -427,10 +477,14 @@ def collect_activations(
     store_raw: bool = False,
     store_a_gram: bool = False,
     store_b_gram: bool = False,
+    compute_device: str | torch.device = "cpu",
+    compute_dtype: str | torch.dtype = torch.float64,
 ) -> dict[str, ActivationStore]:
     registry: dict[str, ActivationStore] = {}
-    source_hook = _ActivationHook(source_model)
-    target_hook = _ActivationHook(target_model)
+    acc_device, acc_dtype = _resolve_compute(compute_device, compute_dtype)
+    hook_device = None if acc_device.type == "cpu" else acc_device
+    source_hook = _ActivationHook(source_model, device=hook_device)
+    target_hook = _ActivationHook(target_model, device=hook_device)
     dev = _resolve_device(device)
 
     try:
@@ -481,6 +535,8 @@ def collect_activations(
                         store_raw=store_raw,
                         store_a_gram=store_a_gram,
                         store_b_gram=store_b_gram,
+                        device=acc_device,
+                        dtype=acc_dtype,
                     ),
                 ).update(src_rows, tgt_rows)
 
@@ -493,6 +549,8 @@ def collect_activations(
                         store_raw=store_raw,
                         store_a_gram=store_a_gram,
                         store_b_gram=store_b_gram,
+                        device=acc_device,
+                        dtype=acc_dtype,
                     ),
                 ).update(src_rows, tgt_rows)
 
@@ -505,14 +563,20 @@ def collect_activations(
     return registry
 
 
-def _compute_procrustes_map_from_cov(cov: torch.Tensor) -> torch.Tensor:
-    u, _, v_h = torch.linalg.svd(cov.double(), full_matrices=False)
-    return (u @ v_h).float()
+def _compute_procrustes_map_from_cov(cov: torch.Tensor, *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    u, _, v_h = torch.linalg.svd(cov.to(dtype), full_matrices=False)
+    # .cpu() is load-bearing, not tidiness: _apply_transforms_to_visual_delta computes
+    # `delta_source.float().cpu() @ t_in`, so a CUDA transform raises RuntimeError there
+    # -- which that function catches, logs as a warning, and replaces with a ZERO delta.
+    # The run then completes, reports a transported delta, and means nothing.
+    return (u @ v_h).float().cpu()
 
 
-def _matrix_power_psd(matrix: torch.Tensor, *, power: float, eps: float) -> torch.Tensor:
+def _matrix_power_psd(
+    matrix: torch.Tensor, *, power: float, eps: float, dtype: torch.dtype = torch.float64
+) -> torch.Tensor:
     sym = 0.5 * (matrix + matrix.T)
-    evals, evecs = torch.linalg.eigh(sym)
+    evals, evecs = torch.linalg.eigh(sym.to(dtype))
     powered = evals.clamp_min(float(eps)).pow(float(power))
     return (evecs * powered.unsqueeze(0)) @ evecs.T
 
@@ -524,12 +588,13 @@ def _partially_whiten_covariance(
     b_gram: torch.Tensor,
     power: float,
     eps: float,
+    dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
     if power <= 0.0:
         return cov
-    left = _matrix_power_psd(a_gram, power=-power, eps=eps)
-    right = _matrix_power_psd(b_gram, power=-power, eps=eps)
-    return left @ cov @ right
+    left = _matrix_power_psd(a_gram, power=-power, eps=eps, dtype=dtype)
+    right = _matrix_power_psd(b_gram, power=-power, eps=eps, dtype=dtype)
+    return left @ cov.to(dtype) @ right
 
 
 def _compute_alignment_map(
@@ -538,6 +603,7 @@ def _compute_alignment_map(
     center: bool,
     whiten_power: float,
     whiten_eps: float,
+    dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor | None:
     cov = store.get_covariance(center=center)
     if cov is None:
@@ -552,12 +618,13 @@ def _compute_alignment_map(
                 b_gram=b_gram,
                 power=whiten_power,
                 eps=whiten_eps,
+                dtype=dtype,
             )
         else:
             logger.warning(
                 "Theseus whitening requested but Gram statistics were unavailable; falling back to raw Procrustes."
             )
-    return _compute_procrustes_map_from_cov(cov)
+    return _compute_procrustes_map_from_cov(cov, dtype=dtype)
 
 
 def _resolve_covariance_mode(mode: str) -> str:
@@ -578,9 +645,12 @@ def _compute_alignment_map_from_matrix_proxies(
     side: str,
     whiten_power: float,
     whiten_eps: float,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    source = source_proxy.detach().cpu().to(torch.float64)
-    target = target_proxy.detach().cpu().to(torch.float64)
+    dev = torch.device("cpu") if device is None else torch.device(device)
+    source = source_proxy.detach().to(device=dev, dtype=dtype)
+    target = target_proxy.detach().to(device=dev, dtype=dtype)
 
     if side == "input":
         a_gram = source.T @ source
@@ -601,7 +671,7 @@ def _compute_alignment_map_from_matrix_proxies(
     target_basis = u_b[:, :rank] * scale_b.unsqueeze(0)
     cov = source_basis @ target_basis.T
 
-    return _compute_procrustes_map_from_cov(cov)
+    return _compute_procrustes_map_from_cov(cov, dtype=dtype)
 
 
 def _transport_weight(delta_weight: torch.Tensor, t_in: torch.Tensor, t_out: torch.Tensor, *, key: str) -> torch.Tensor:
@@ -767,6 +837,7 @@ def _precompute_transforms(
     whiten_eps: float,
     show_progress: bool,
     method_name: str,
+    compute_dtype: torch.dtype = torch.float64,
 ) -> dict[str, _LayerTransform]:
     transforms_by_key: dict[str, _LayerTransform] = {}
     t_out_cache: dict[str, torch.Tensor] = {}
@@ -805,12 +876,14 @@ def _precompute_transforms(
                     center=center_acts,
                     whiten_power=whiten_power,
                     whiten_eps=whiten_eps,
+                    dtype=compute_dtype,
                 )
                 t_out = _compute_alignment_map(
                     out_store,
                     center=center_acts,
                     whiten_power=whiten_power,
                     whiten_eps=whiten_eps,
+                    dtype=compute_dtype,
                 )
                 if t_in is not None and t_out is not None:
                     transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
@@ -840,6 +913,7 @@ def _precompute_transforms(
                     center=center_acts,
                     whiten_power=whiten_power,
                     whiten_eps=whiten_eps,
+                    dtype=compute_dtype,
                 )
                 if t_out is not None:
                     t_out_cache[out_key] = t_out
@@ -862,6 +936,8 @@ def _precompute_transforms_data_free(
     whiten_eps: float,
     show_progress: bool,
     method_name: str,
+    compute_device: torch.device | None = None,
+    compute_dtype: torch.dtype = torch.float64,
 ) -> dict[str, _LayerTransform]:
     transforms_by_key: dict[str, _LayerTransform] = {}
 
@@ -895,6 +971,8 @@ def _precompute_transforms_data_free(
                 side="output" if key == "proj" else "input",
                 whiten_power=whiten_power,
                 whiten_eps=whiten_eps,
+                device=compute_device,
+                dtype=compute_dtype,
             )
             t_out = _compute_alignment_map_from_matrix_proxies(
                 source_ref,
@@ -902,6 +980,8 @@ def _precompute_transforms_data_free(
                 side="input" if key == "proj" else "output",
                 whiten_power=whiten_power,
                 whiten_eps=whiten_eps,
+                device=compute_device,
+                dtype=compute_dtype,
             )
             transforms_by_key[key] = _LayerTransform(kind="weight", t_in=t_in, t_out=t_out)
             continue
@@ -920,6 +1000,8 @@ def _precompute_transforms_data_free(
                 side="input",
                 whiten_power=whiten_power,
                 whiten_eps=whiten_eps,
+                device=compute_device,
+                dtype=compute_dtype,
             )
             transforms_by_key[key] = _LayerTransform(kind="bias", t_out=t_out)
             continue
@@ -1019,6 +1101,8 @@ class TheseusRebase:
         batch_size: int | None = None,
         shots_per_class: int | None = None,
         patch_qkv: bool = True,
+        compute_device: str | torch.device = "cpu",
+        compute_dtype: str | torch.dtype = "float64",
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1034,6 +1118,7 @@ class TheseusRebase:
             raise ValueError("Theseus shots_per_class must be a positive integer.")
         log_prefix = f"[{self.name}]"
         covariance_mode = _resolve_covariance_mode(covariance_mode)
+        acc_device, acc_dtype = _resolve_compute(compute_device, compute_dtype)
         whiten_power = float(whiten_power)
         whiten_eps = float(whiten_eps)
         if not (0.0 <= whiten_power <= 0.5):
@@ -1046,7 +1131,8 @@ class TheseusRebase:
                 f"{log_prefix} prepare: start "
                 f"(seq_align={seq_align}, center_acts={bool(center_acts)}, "
                 f"whiten_power={whiten_power}, covariance_mode={covariance_mode}, "
-                f"n_batches={n_batches}, shots_per_class={shots_per_class}, seed={int(seed)})"
+                f"n_batches={n_batches}, shots_per_class={shots_per_class}, seed={int(seed)}, "
+                f"compute={acc_device.type}/{str(acc_dtype).replace('torch.', '')})"
             )
 
         patched_source = 0
@@ -1093,6 +1179,8 @@ class TheseusRebase:
                     shots_per_class=shots_per_class,
                     store_a_gram=whiten_power > 0.0,
                     store_b_gram=whiten_power > 0.0,
+                    compute_device=acc_device,
+                    compute_dtype=acc_dtype,
                 )
                 if verbose:
                     print(f"{log_prefix} prepare: collected activation entries = {len(activation_registry)}")
@@ -1128,6 +1216,7 @@ class TheseusRebase:
                         whiten_eps=whiten_eps,
                         show_progress=bool(show_progress),
                         method_name=self.name,
+                        compute_dtype=acc_dtype,
                     )
                 else:
                     transforms_by_key = _precompute_transforms_data_free(
@@ -1138,6 +1227,8 @@ class TheseusRebase:
                         whiten_eps=whiten_eps,
                         show_progress=bool(show_progress),
                         method_name=self.name,
+                        compute_device=acc_device,
+                        compute_dtype=acc_dtype,
                     )
                 if verbose:
                     print(f"{log_prefix} prepare: computed transforms = {len(transforms_by_key)}")
@@ -1163,6 +1254,8 @@ class TheseusRebase:
             "activation_registry": activation_registry,
             "transforms_by_key": transforms_by_key,
             "covariance_mode": covariance_mode,
+            "compute_device": acc_device.type,
+            "compute_dtype": str(acc_dtype).replace("torch.", ""),
             "split_fused_qkv": split_fused_qkv,
             "n_batches": n_batches,
             "shots_per_class": shots_per_class,
@@ -1277,6 +1370,8 @@ class TheseusRebase:
         seed: int = 0,
         batch_size: int | None = None,
         patch_qkv: bool = True,
+        compute_device: str | torch.device = "cpu",
+        compute_dtype: str | torch.dtype = "float64",
         verbose: bool = True,
         show_progress: bool = True,
         **kwargs,
@@ -1313,6 +1408,8 @@ class TheseusRebase:
                 seed=int(seed),
                 batch_size=batch_size,
                 patch_qkv=patch_qkv,
+                compute_device=compute_device,
+                compute_dtype=compute_dtype,
                 verbose=bool(verbose),
                 show_progress=bool(show_progress),
                 **kwargs,

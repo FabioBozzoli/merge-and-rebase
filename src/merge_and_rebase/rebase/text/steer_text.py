@@ -40,15 +40,47 @@ Limits, enforced at runtime:
   rule as vision), and the linear regime runs one ``torch.func.jvp`` per block
   per batch through the whole LM. That is affordable for a small T5 and
   punishing for a multi-billion-parameter model; a warning is printed above a
-  parameter threshold.
+  parameter threshold. ``joint_ridge`` has the same requirement: it needs no
+  per-block deltas, but B's per-block activations are only collected there.
+
+Stage-2 options over B's blocks (``block_ridge`` and ``joint_ridge`` only; any
+other strategy rejects them rather than ignoring them):
+
+- ``stage_2_strategy="joint_ridge"``: one ridge on all grouped blocks, each divided
+  by the root of its support mean squared norm and concatenated, fit to the *total*
+  Stage-1 target. ``ridge_lambda`` is then a trace-relative penalty per block. It
+  contains ``global_ridge`` on f_B as the special case of zero coefficients on the
+  residual blocks.
+- ``block_pooling`` (``"mean"`` | ``"unitnorm"`` | ``"rmsnorm"``): how each block's
+  tokens are pooled; see ``_TextBlockCapture``. Non-mean poolings are recollected
+  from B alone and cached as ``features_B_blocks_pool-<name>.pt`` next to the
+  split's other files; the live correction hook pools the same way.
+- ``block_source`` (``"residual"`` | ``"attention"``): which tensor each block
+  contributes -- its output (the residual stream) or the input of its self-attention
+  output projection (the heads' attention outputs before W_O); see
+  ``_TextBlockCapture``. The attention source is recollected like a non-mean pooling
+  and cached as ``features_B_blocks_src-attention_pool-<name>.pt``.
+- ``block_feature_preprocessing`` (``"none"`` | ``"zscore"``): standardize every
+  block with support-set statistics and fit an unpenalized intercept; folded into
+  the coefficients and a bias vector, so evaluation needs no extra state.
+
+Stage-2 input of ``global_ridge`` / ``global_mlp`` (rejected by the block strategies):
+
+- ``global_input_pooling`` (``"global"`` | ``"segments"``): the regressor reads f_B, or
+  B's last hidden state pooled as ``[premise; hypothesis; global]`` (3D, see
+  ``_OutputSegmentCapture``). The prediction is still a D-dim correction added to f_B,
+  so the head and Stage 1 are unchanged. Collected from B alone and cached as
+  ``features_B_output_segpool.pt`` next to the split's other files.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -58,6 +90,7 @@ from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
 from ..methods.steer import (
     _BLOCK_GROUP_STRATEGIES,
+    _cache_split_dir,
     _few_shot,
     _fit_block_ridge,
     _fit_global_mlp,
@@ -69,6 +102,7 @@ from ..methods.steer import (
 )
 from ..registry import register
 from .adapters import head_linear
+from .encoder_classifier import masked_mean, pool_features, segment_layout, segment_pooled
 
 # Matched with ``search`` against ``name + "."`` and anchored on a preceding dot
 # or the string start, so a task-head wrapper's prefix does not hide the stack:
@@ -181,6 +215,33 @@ def num_residual_blocks(model: nn.Module) -> int:
     return len(_ordered_block_keys(model))
 
 
+# Where each stack keeps the norm applied to its last block's output before anything
+# reads it: T5Stack.final_layer_norm, Llama/Qwen's model.norm, GPT-2's transformer.ln_f.
+_FINAL_NORM_ATTRS: tuple[str, ...] = ("final_layer_norm", "norm", "ln_f")
+
+
+def block_final_norms(model: nn.Module) -> list[nn.Module]:
+    """Each block's own stack's final norm, in the same order as ``block_modules``.
+
+    Resolved per block rather than once per model because T5ForSequenceClassification
+    has two stacks with two different final norms: an encoder block must be normalized
+    by the encoder's, a decoder block by the decoder's.
+    """
+    found: dict[tuple[str, int], nn.Module] = {}
+    for name, _module in model.named_modules():
+        key = _block_module_name(name)
+        if key is None or key in found:
+            continue
+        # "transformer.encoder.block.3" -> "transformer.encoder"; "model.layers.3" -> "model".
+        parent_path = name.rsplit(".", 2)[0] if name.count(".") >= 2 else ""
+        parent = model.get_submodule(parent_path) if parent_path else model
+        norm = next((getattr(parent, a) for a in _FINAL_NORM_ATTRS if isinstance(getattr(parent, a, None), nn.Module)), None)
+        if norm is None:
+            raise ValueError(f"No final norm ({'/'.join(_FINAL_NORM_ATTRS)}) found on '{parent_path}' for block '{name}'.")
+        found[key] = norm
+    return [found[key] for key in _ordered_block_keys(model)]
+
+
 # --------------------------------------------------------------------------
 # Pooled-feature extraction
 # --------------------------------------------------------------------------
@@ -214,36 +275,131 @@ def _pooled_features(model: nn.Module, batch: Mapping[str, torch.Tensor], device
     return out.logits
 
 
-def _masked_mean(hidden: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
-    """Mean-pool ``[B, T, D]`` over real tokens. Text twin of ``steer._pool_block_output``."""
-    if hidden.ndim != 3:
-        return hidden
-    if attention_mask is None:
-        return hidden.mean(dim=1)
-    mask = attention_mask.to(dtype=hidden.dtype, device=hidden.device).unsqueeze(-1)
-    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+# Mean-pool ``[B, T, D]`` over real tokens; text twin of ``steer._pool_block_output``.
+# Defined in encoder_classifier.py rather than here so that T5EncoderForSequenceClassification's
+# pooled "CLS" feature and the per-block activations captured below are pooled by the *same*
+# function, not by two copies that could drift apart.
+_masked_mean = masked_mean
+
+
+BLOCK_POOLINGS: tuple[str, ...] = ("mean", "unitnorm", "rmsnorm")
+BLOCK_SOURCES: tuple[str, ...] = ("residual", "attention")
+
+# Path, inside one block, of the self-attention output projection whose *input* is the
+# attention output: T5Block, then Llama/Qwen decoder layers, then BERT/RoBERTa's RobertaSelfOutput.dense.
+_ATTENTION_OUT_PATHS: tuple[str, ...] = ("layer.0.SelfAttention.o", "self_attn.o_proj", "attention.output.dense")
+
+
+def block_attention_out_projections(model: nn.Module) -> list[nn.Module]:
+    """Each block's self-attention output projection, in the same order as ``block_modules``."""
+    found = []
+    for block in block_modules(model):
+        for path in _ATTENTION_OUT_PATHS:
+            try:
+                found.append(block.get_submodule(path))
+                break
+            except AttributeError:
+                continue
+        else:
+            raise ValueError(
+                f"No self-attention output projection ({', '.join(_ATTENTION_OUT_PATHS)}) in block "
+                f"{type(block).__name__}; block_source='attention' does not support this architecture yet."
+            )
+    return found
+
 
 
 class _TextBlockCapture:
-    """Capture masked-mean-pooled per-block activations during a forward pass."""
+    """Capture pooled per-block activations during a forward pass.
 
-    def __init__(self, model: nn.Module) -> None:
-        self.modules = block_modules(model)
+    ``source`` decides which tensor each block contributes:
+
+    - ``"residual"``: the block's output, i.e. the residual stream after the block;
+    - ``"attention"``: the *input* of the block's self-attention output projection
+      (T5 ``SelfAttention.o``), i.e. the heads' attention outputs before W_O. Each
+      token there is a mix ``sum_j a_tj v_j`` of value vectors, so its mean over tokens
+      weights the values by how much attention each token receives -- information a
+      per-token linear map of the residual stream cannot supply, and unlike the
+      cumulative residual stream it is not near-identical from block to block.
+
+    ``pooling`` decides what each token becomes before the masked mean over real tokens:
+
+    - ``"mean"``: nothing (for the residual source, what the feature cache holds);
+    - ``"unitnorm"``: every token divided by its own L2 norm;
+    - ``"rmsnorm"``: every token through its stack's final norm (``block_final_norms``),
+      i.e. pooled the way the model pools its own output feature. Residual source only.
+
+    T5's unnormalized residual stream gives a few tokens very large norms, and a
+    plain mean is dominated by them; normalizing each token first gives every token
+    the same weight in the average. Attention outputs have no such tokens.
+
+    ``segment_pooling=True`` replaces the single masked mean with
+    :func:`~merge_and_rebase.rebase.text.encoder_classifier.segment_pooled`
+    (premise mean, hypothesis mean, global mean concatenated), for a pair-encoded
+    row split at its two EOS tokens -- mutually exclusive with ``pooling != "mean"``
+    (there is no unitnorm/rmsnorm-before-segment-split yet). Callers set
+    ``capture.input_ids`` per batch, next to ``capture.attention_mask``.
+    """
+
+    def __init__(
+        self, model: nn.Module, pooling: str = "mean", source: str = "residual", segment_pooling: bool = False
+    ) -> None:
+        if pooling not in BLOCK_POOLINGS:
+            raise ValueError(f"block pooling must be one of {BLOCK_POOLINGS}, got {pooling!r}")
+        if source not in BLOCK_SOURCES:
+            raise ValueError(f"block source must be one of {BLOCK_SOURCES}, got {source!r}")
+        if source == "attention" and pooling == "rmsnorm":
+            raise ValueError("rmsnorm pooling applies the residual stream's final norm; it is undefined for attention outputs")
+        if segment_pooling and pooling != "mean":
+            raise ValueError("segment_pooling is defined for pooling='mean' only (no unitnorm/rmsnorm composition yet)")
+        self.source = source
+        self.modules = block_modules(model) if source == "residual" else block_attention_out_projections(model)
+        self.pooling = pooling
+        self.norms = block_final_norms(model) if pooling == "rmsnorm" else None
+        self.segment_pooling = segment_pooling
+        self.eos_token_id: int | None = None
+        self.separator_eos = 1
+        self.bos_token_id: int | None = None
+        if segment_pooling:
+            self.eos_token_id, self.separator_eos, self.bos_token_id = segment_layout(model.config)
         self.activations: dict[int, torch.Tensor] = {}
         self.attention_mask: torch.Tensor | None = None
+        self.input_ids: torch.Tensor | None = None
         self._handles: list[Any] = []
+
+    def _pool(self, block_id: int, out: torch.Tensor) -> torch.Tensor:
+        if out.ndim == 3 and self.segment_pooling:
+            return segment_pooled(
+                out, self.attention_mask, self.input_ids, self.eos_token_id,
+                separator_eos=self.separator_eos, bos_token_id=self.bos_token_id,
+            )
+        if out.ndim == 3 and self.pooling == "unitnorm":
+            out = out / out.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        elif out.ndim == 3 and self.pooling == "rmsnorm":
+            out = self.norms[block_id](out)
+        return _masked_mean(out, self.attention_mask)
 
     def _make_hook(self, block_id: int) -> Callable[..., None]:
         def hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
             out = output[0] if isinstance(output, (tuple, list)) else output
             if torch.is_tensor(out):
-                self.activations[block_id] = _masked_mean(out, self.attention_mask).detach()
+                self.activations[block_id] = self._pool(block_id, out).detach()
+
+        return hook
+
+    def _make_pre_hook(self, block_id: int) -> Callable[..., None]:
+        def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+            if inputs and torch.is_tensor(inputs[0]):
+                self.activations[block_id] = self._pool(block_id, inputs[0]).detach()
 
         return hook
 
     def __enter__(self) -> _TextBlockCapture:
         for block_id, module in enumerate(self.modules):
-            self._handles.append(module.register_forward_hook(self._make_hook(block_id)))
+            if self.source == "attention":
+                self._handles.append(module.register_forward_pre_hook(self._make_pre_hook(block_id)))
+            else:
+                self._handles.append(module.register_forward_hook(self._make_hook(block_id)))
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -301,6 +457,69 @@ def _collect_standard_split(
     }
 
 
+def _target_batch_features(
+    target: nn.Module, batch_b: Mapping[str, torch.Tensor], device: torch.device, target_block_pooling: str,
+    num_target_residual: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """B's pooled output feature and per-residual-block features for one batch (on the CPU).
+
+    Assumes the target's head is already ``nn.Identity`` (see :func:`_head_as_identity`). The blocks are
+    segment-pooled iff ``target_block_pooling == "segments"``; the output feature never is.
+    """
+    segments = target_block_pooling == "segments"
+    with _TextBlockCapture(target, segment_pooling=segments) as capture:
+        capture.attention_mask = batch_b.get("attention_mask")
+        if segments:
+            capture.input_ids = batch_b["input_ids"]
+        with torch.no_grad():
+            out_b = _pooled_features(target, batch_b, device)
+    return out_b.detach().cpu(), [capture.activations[b].cpu() for b in range(num_target_residual)]
+
+
+@torch.no_grad()
+def _collect_target_side(
+    *, target: nn.Module, target_loader: Any, device: torch.device, target_block_pooling: str = "global",
+    need_blocks: bool = True,
+) -> dict[str, Any]:
+    """Only B's half of a split (``features_B``, ``features_B_blocks``) plus its labels ``y_B``.
+
+    Same per-batch code as ``_collect_linear_split``'s B side, so the tensors are identical to the ones
+    that function would have cached; it exists so a new target can reuse the (target-independent, and
+    expensive: one jvp per source block per batch) A side of an existing cache.
+    """
+    num_target_residual = num_residual_blocks(target)
+    features_b: list[torch.Tensor] = []
+    labels: list[torch.Tensor] = []
+    blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_residual + 1)}
+    with _head_as_identity(target):
+        for batch_b in target_loader:
+            if need_blocks:
+                out_b, block_feats = _target_batch_features(target, batch_b, device, target_block_pooling, num_target_residual)
+                for b in range(num_target_residual):
+                    blocks[b].append(block_feats[b])
+                blocks[num_target_residual].append(out_b)
+            else:
+                out_b = _pooled_features(target, batch_b, device).detach().cpu()
+            features_b.append(out_b)
+            labels.append(batch_b["labels"].cpu())
+    out: dict[str, Any] = {"features_B": torch.cat(features_b, dim=0), "y_B": torch.cat(labels, dim=0)}
+    if need_blocks:
+        out["features_B_blocks"] = {b: torch.cat(chunks, dim=0) for b, chunks in blocks.items()}
+    return out
+
+
+def _load_source_side(cache_dir: Path, *, need_blocks: bool) -> dict[str, torch.Tensor]:
+    """A's half of a cached split (``features_A``, ``delta_A``, ``y_A``, and ``delta_A_blocks`` if needed)."""
+    names = ["features_A", "delta_A", "y_A"] + (["delta_A_blocks"] if need_blocks else [])
+    missing = [n for n in names if not (cache_dir / f"{n}.pt").exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"steer_text reuse_source_features_from: {missing} not found in {cache_dir}. The source-side "
+            "features must already be cached for that target (same source, task, regime, split)."
+        )
+    return {n: torch.load(cache_dir / f"{n}.pt", map_location="cpu", weights_only=True) for n in names}
+
+
 def _collect_linear_split(
     *,
     source_pretrained: nn.Module,
@@ -309,6 +528,7 @@ def _collect_linear_split(
     source_loader: Any,
     target_loader: Any,
     device: torch.device,
+    target_block_pooling: str = "global",
 ) -> dict[str, Any]:
     """Linear regime: Taylor-linearized ``delta_A`` via ``LinearizedModule``, split per block.
 
@@ -316,6 +536,12 @@ def _collect_linear_split(
     per-block residuals sum to the full linearized delta by construction; a
     mismatch is reported rather than silently accepted, exactly as in
     ``steer._collect_linear_split``.
+
+    ``target_block_pooling="segments"`` pools B's *residual* blocks with
+    :func:`_TextBlockCapture`'s segment-split pooling instead of a single
+    global mean (see ``SteerTextRebase.prepare``'s validation for the
+    restrictions this requires); the output block (``out_b`` below) is always
+    the model's own pooled feature, unaffected either way.
     """
     num_target_residual = num_residual_blocks(target)
 
@@ -378,14 +604,11 @@ def _collect_linear_split(
             delta_a_blocks.append(block_residuals)
             labels.append(batch_a["labels"].cpu())
 
-            with _TextBlockCapture(target) as capture:
-                capture.attention_mask = batch_b.get("attention_mask")
-                with torch.no_grad():
-                    out_b = _pooled_features(target, batch_b, device)
+            out_b, block_feats = _target_batch_features(target, batch_b, device, target_block_pooling, num_target_residual)
             for b in range(num_target_residual):
-                features_b_blocks[b].append(capture.activations[b].cpu())
-            features_b_blocks[num_target_residual].append(out_b.detach().cpu())
-            features_b.append(out_b.detach().cpu())
+                features_b_blocks[b].append(block_feats[b])
+            features_b_blocks[num_target_residual].append(out_b)
+            features_b.append(out_b)
 
     return {
         "features_A": torch.cat(features_a, dim=0),
@@ -395,6 +618,222 @@ def _collect_linear_split(
         "features_B_blocks": {b: torch.cat(chunks, dim=0) for b, chunks in features_b_blocks.items()},
         "y_A": torch.cat(labels, dim=0),
     }
+
+
+@torch.no_grad()
+def _collect_target_blocks(
+    *,
+    target: nn.Module,
+    target_loader: Any,
+    device: torch.device,
+    pooling: str,
+    source: str = "residual",
+    segment_pooling: bool = False,
+) -> dict[int, torch.Tensor]:
+    """B's per-block features for ``source``/``pooling``, from a plain forward of B alone.
+
+    Only B's side changes with the source or pooling rule, so this never re-runs A's
+    jvps: the rows line up with the cached split because ``target_loader`` is the same
+    ``shuffle=False`` loader ``_collect_linear_split`` walked. ``segment_pooling=True``
+    (only meaningful for ``source="attention"`` here -- the ``source="residual"`` case is
+    handled directly in ``_collect_linear_split`` instead, see ``prepare()``) additionally
+    sets ``capture.input_ids`` per batch.
+    """
+    with _head_as_identity(target), _TextBlockCapture(
+        target, pooling=pooling, source=source, segment_pooling=segment_pooling
+    ) as capture:
+        num_blocks = len(capture.modules)
+        chunks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_blocks)}
+        for batch in target_loader:
+            capture.attention_mask = batch["attention_mask"].to(device) if "attention_mask" in batch else None
+            if segment_pooling:
+                capture.input_ids = batch["input_ids"].to(device)
+            capture.activations.clear()
+            _pooled_features(target, batch, device)
+            for b in range(num_blocks):
+                chunks[b].append(capture.activations[b].cpu())
+    return {b: torch.cat(v, dim=0) for b, v in chunks.items()}
+
+
+def _block_cache_name(source: str, pooling: str, segment_pooling: bool = False) -> str:
+    # The residual name predates block_source and is kept so existing caches stay valid.
+    suffix = "_segpool" if segment_pooling else ""
+    if source == "residual":
+        return f"features_B_blocks_pool-{pooling}{suffix}.pt"
+    return f"features_B_blocks_src-{source}_pool-{pooling}{suffix}.pt"
+
+
+def _load_or_compute_pooled_blocks(
+    *,
+    cache_dir: Path,
+    pooling: str,
+    force_recompute: bool,
+    compute_fn: Callable[[], dict[int, torch.Tensor]],
+    verbose: bool,
+    source: str = "residual",
+    segment_pooling: bool = False,
+) -> dict[int, torch.Tensor]:
+    """B's block features under a non-default source/pooling, cached beside the split's other files.
+
+    A separate file rather than a separate regime directory: the A-side tensors in the
+    split do not depend on B's block features, and recomputing them costs one jvp per
+    source block per batch. Jobs are expected to have their own ``feature_cache_dir``;
+    the write is atomic only so that a killed job never leaves a partial file behind.
+    """
+    path = cache_dir / _block_cache_name(source, pooling, segment_pooling)
+    label = f"'{source}/{pooling}'{' segment-pooled' if segment_pooling else ''} block features"
+    if path.exists() and not force_recompute:
+        if verbose:
+            print(f"[steer_text] using cached {label} at {path}")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    if verbose:
+        print(f"[steer_text] computing {label} for {path}")
+    blocks = compute_fn()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    torch.save(blocks, tmp)
+    os.replace(tmp, path)
+    return blocks
+
+
+GLOBAL_INPUT_POOLINGS: tuple[str, ...] = ("global", "segments")
+_OUTPUT_SEGMENTS_CACHE_NAME = "features_B_output_segpool.pt"
+
+
+class _OutputSegmentCapture:
+    """Segment-pool B's last hidden state ``[premise; hypothesis; global]`` during a forward pass.
+
+    A forward hook on ``model.base_model`` (the encoder stack the classifier wrappers call
+    with ``input_ids=``/``attention_mask=`` keyword arguments) reads the tokens and the
+    ``last_hidden_state`` together, and pools them with
+    :func:`~merge_and_rebase.rebase.text.encoder_classifier.pool_features` -- the function
+    the wrappers themselves use, so the global third equals the head's pooled feature.
+    ``global_input_pooling="segments"`` feeds this ``[B, 3D]`` vector to the global
+    Stage-2 regressors; the head still reads the plain ``[B, D]`` feature.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        self.backbone = model.base_model
+        if self.backbone is model:
+            raise ValueError(
+                "global_input_pooling='segments' needs a classifier wrapping a separate encoder "
+                f"(model.base_model), but {type(model).__name__}.base_model is the model itself."
+            )
+        self.config = model.config
+        segment_layout(self.config)  # fail before the first forward
+        self.pooled: torch.Tensor | None = None
+        self._handle: Any = None
+
+    def _hook(self, _module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any], output: Any) -> None:
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        if input_ids is None:
+            raise RuntimeError(
+                "steer_text: global_input_pooling='segments' needs input_ids to locate the "
+                "premise/hypothesis boundary, but the encoder was called without them."
+            )
+        hidden = output[0] if isinstance(output, (tuple, list)) else output.last_hidden_state
+        self.pooled = pool_features(hidden, kwargs.get("attention_mask"), input_ids, self.config, "segments")
+
+    def __enter__(self) -> _OutputSegmentCapture:
+        self._handle = self.backbone.register_forward_hook(self._hook, with_kwargs=True)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+
+@torch.no_grad()
+def _collect_target_output_segments(*, target: nn.Module, target_loader: Any, device: torch.device) -> torch.Tensor:
+    """B's segment-pooled last hidden state ``[N, 3D]``, from a plain forward of B alone.
+
+    Rows line up with the cached split because ``target_loader`` is the same
+    ``shuffle=False`` loader the split was collected from; ``prepare`` checks it.
+    """
+    chunks: list[torch.Tensor] = []
+    with _head_as_identity(target), _OutputSegmentCapture(target) as capture:
+        for batch in target_loader:
+            capture.pooled = None
+            _pooled_features(target, batch, device)
+            if capture.pooled is None:
+                raise RuntimeError("steer_text: the encoder hook did not fire during B's forward pass.")
+            chunks.append(capture.pooled.detach().cpu())
+    return torch.cat(chunks, dim=0)
+
+
+def _load_or_compute_output_segments(
+    *, cache_dir: Path, force_recompute: bool, compute_fn: Callable[[], torch.Tensor], verbose: bool
+) -> torch.Tensor:
+    """B's segment-pooled output feature, cached beside the split's other files (same reasoning and
+    atomic write as :func:`_load_or_compute_pooled_blocks`: only B's side changes, A's is reused)."""
+    path = cache_dir / _OUTPUT_SEGMENTS_CACHE_NAME
+    if path.exists() and not force_recompute:
+        if verbose:
+            print(f"[steer_text] using cached segment-pooled output features at {path}")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    if verbose:
+        print(f"[steer_text] computing segment-pooled output features for {path}")
+    features = compute_fn()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    torch.save(features, tmp)
+    os.replace(tmp, path)
+    return features
+
+
+# Per-row relative tolerance between the recomputed global third and the cached features_B, and the
+# share of rows allowed above it. A few rows of an older cache can disagree with today's forward (seen
+# on the 2026-09-24 t5-large linear-regime caches: <=6/4000 rows, up to 27% relative); anything beyond
+# that share means the caches do not describe the same rows or model, and the run stops.
+_GLOBAL_THIRD_ROW_RTOL = 1e-3
+_GLOBAL_THIRD_MAX_BAD_FRACTION = 0.005
+
+
+def _reconcile_global_third(
+    segments: torch.Tensor, features_b: torch.Tensor, split: str, *, verbose: bool = True
+) -> torch.Tensor:
+    """Check the global third of ``[p; h; g]`` against the cached pooled feature, row by row.
+
+    Rows whose relative difference exceeds ``_GLOBAL_THIRD_ROW_RTOL`` get their global third replaced
+    by the cached ``features_B`` row, so the regressor's input agrees with the f_B that Stage 1 and the
+    head use; they are reported. More than ``_GLOBAL_THIRD_MAX_BAD_FRACTION`` such rows raises.
+    """
+    d = features_b.shape[1]
+    if segments.shape != (features_b.shape[0], 3 * d):
+        raise ValueError(
+            f"steer_text: segment-pooled '{split}' features have shape {tuple(segments.shape)}, expected "
+            f"{(features_b.shape[0], 3 * d)} from the cached split; rerun with force_recompute_features=true."
+        )
+    g, f = segments[:, 2 * d :].double(), features_b.double()
+    rel = (g - f).norm(dim=1) / f.norm(dim=1).clamp_min(1e-12)
+    bad = (rel > _GLOBAL_THIRD_ROW_RTOL).nonzero().flatten()
+    n = int(f.shape[0])
+    if bad.numel() > _GLOBAL_THIRD_MAX_BAD_FRACTION * n:
+        raise ValueError(
+            f"steer_text: the global third of the segment-pooled '{split}' features differs from the cached "
+            f"features_B on {bad.numel()}/{n} rows (max relative {float(rel.max()):.3g}): the two caches do not "
+            "describe the same rows or the same model. Rerun with force_recompute_features=true."
+        )
+    if bad.numel() == 0:
+        return segments
+    if verbose:
+        print(
+            f"[steer_text] WARNING: '{split}': {bad.numel()}/{n} rows of the cached features_B differ from "
+            f"today's forward (max relative {float(rel[bad].max()):.3g}, rows {bad.tolist()}); their global "
+            "third is taken from the cache so the Stage-2 input agrees with f_B."
+        )
+    out = segments.clone()
+    out[bad, 2 * d :] = features_b[bad].to(dtype=out.dtype)
+    return out
+
+
+def _standardize_stats(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Support-set mean and std per channel; the std is floored at 1% of its median so a
+    near-constant channel is not blown up into noise."""
+    mean = x.mean(dim=0)
+    std = x.std(dim=0)
+    return mean, std.clamp_min(1e-2 * float(std.median()))
 
 
 def _accuracy(
@@ -472,6 +911,16 @@ class SteerTextRebase:
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
         rho: float = 0.9,
+        block_ridge_lambda_scaling: str = "none",
+        block_ridge_target_strategy: str = "reuse_logitmap",
+        block_residuals_weighting_strategy: str = "identity",
+        block_ridge_blockwise_stage1_lambda: float = 1.0,
+        block_pooling: str = "mean",
+        block_source: str = "residual",
+        block_feature_preprocessing: str = "none",
+        target_block_pooling: str = "global",
+        global_input_pooling: str = "global",
+        reuse_source_features_from: str | None = None,
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         seed: int = 42,
@@ -481,14 +930,74 @@ class SteerTextRebase:
         del kwargs
         if feature_regime not in {"standard", "linear"}:
             raise ValueError("steer_text feature_regime must be 'standard' or 'linear'")
-        if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge"}:
-            raise ValueError("steer_text stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge")
+        if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge", "joint_ridge"}:
+            raise ValueError(
+                "steer_text stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge, joint_ridge"
+            )
         if stage_2_strategy == "block_ridge" and feature_regime != "linear":
             raise ValueError("steer_text block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
+        if stage_2_strategy == "joint_ridge" and feature_regime != "linear":
+            # joint_ridge needs no per-block deltas, only B's per-block activations -- but
+            # those are only collected by the linear-regime pass.
+            raise ValueError("steer_text joint_ridge requires feature_regime='linear' (B's blocks are collected there).")
+        uses_blocks = stage_2_strategy in {"block_ridge", "joint_ridge"}
+        if block_pooling not in BLOCK_POOLINGS:
+            raise ValueError(f"steer_text block_pooling must be one of: {', '.join(BLOCK_POOLINGS)}")
+        if block_source not in BLOCK_SOURCES:
+            raise ValueError(f"steer_text block_source must be one of: {', '.join(BLOCK_SOURCES)}")
+        if block_source == "attention" and block_pooling == "rmsnorm":
+            raise ValueError("steer_text block_pooling='rmsnorm' is defined for the residual source only")
+        if block_feature_preprocessing not in {"none", "zscore"}:
+            raise ValueError("steer_text block_feature_preprocessing must be 'none' or 'zscore'")
+        if not uses_blocks and (
+            block_pooling != "mean" or block_source != "residual" or block_feature_preprocessing != "none"
+        ):
+            raise ValueError(
+                "steer_text block_pooling / block_source / block_feature_preprocessing only apply to block_ridge "
+                "and joint_ridge; "
+                f"stage_2_strategy={stage_2_strategy!r} would silently ignore them."
+            )
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer_text block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
+        if block_ridge_lambda_scaling not in {"none", "trace"}:
+            raise ValueError("steer_text block_ridge_lambda_scaling must be 'none' or 'trace'")
+        if block_ridge_target_strategy not in {"reuse_logitmap", "blockwise_logitmap", "last_only"}:
+            raise ValueError(
+                "steer_text block_ridge_target_strategy must be one of: reuse_logitmap, blockwise_logitmap, last_only"
+            )
+        if block_residuals_weighting_strategy not in {"identity", "mean"}:
+            raise ValueError("steer_text block_residuals_weighting_strategy must be 'identity' or 'mean'")
+        if target_block_pooling not in {"global", "segments"}:
+            raise ValueError("steer_text target_block_pooling must be 'global' or 'segments'")
+        if target_block_pooling == "segments":
+            if stage_2_strategy != "block_ridge":
+                raise ValueError(
+                    "steer_text target_block_pooling='segments' requires stage_2_strategy='block_ridge' "
+                    f"(got {stage_2_strategy!r}); joint_ridge support is a separate, later change."
+                )
+            if block_pooling != "mean":
+                raise ValueError(
+                    "steer_text target_block_pooling='segments' requires block_pooling='mean' "
+                    "(no unitnorm/rmsnorm composition with segment pooling yet)."
+                )
+        if global_input_pooling not in GLOBAL_INPUT_POOLINGS:
+            raise ValueError(f"steer_text global_input_pooling must be one of: {', '.join(GLOBAL_INPUT_POOLINGS)}")
+        if global_input_pooling != "global" and stage_2_strategy not in {"global_ridge", "global_mlp"}:
+            raise ValueError(
+                "steer_text global_input_pooling only applies to global_ridge and global_mlp; "
+                f"stage_2_strategy={stage_2_strategy!r} would silently ignore it (block_ridge uses "
+                "target_block_pooling)."
+            )
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
+        if reuse_source_features_from is not None:
+            if not str(reuse_source_features_from).strip():
+                raise ValueError("steer_text reuse_source_features_from must be a non-empty target tag")
+            if str(reuse_source_features_from) == str(target_tag):
+                raise ValueError(
+                    "steer_text reuse_source_features_from names this run's own target tag; it must point at "
+                    "a different, already-cached target with the same source."
+                )
 
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         log_prefix = "[steer_text]"
@@ -496,6 +1005,37 @@ class SteerTextRebase:
         source_model = llm_source.model
         source_pretrained_model = llm_source_pretrained.model
         target_model = llm_target.model
+
+        if getattr(target_model.config, "feature_pooling", "global") != "global":
+            # Stage 1 inverts W_B and the correction is added to the head's input, both on
+            # the D-dim pooled feature; a 3D segment-pooled head is a different feature space.
+            raise ValueError(
+                "steer_text needs a target whose head reads the global pooled feature, got "
+                f"feature_pooling={target_model.config.feature_pooling!r}. Use global_input_pooling='segments' "
+                "to give the Stage-2 regressor the segment-pooled feature instead."
+            )
+        if global_input_pooling == "segments":
+            target_stacks = {stack for stack, _ in _ordered_block_keys(target_model)}
+            if "decoder" in target_stacks:
+                raise ValueError(
+                    "steer_text global_input_pooling='segments' requires an encoder-only target "
+                    "(e.g. T5EncoderForSequenceClassification): the target has a 'decoder' stack "
+                    f"({sorted(target_stacks)}), whose output never sees the premise/hypothesis sequence."
+                )
+
+        if target_block_pooling == "segments":
+            # A decoder block sees only the decoder's own (typically single-token) input,
+            # never the encoder's premise/hypothesis sequence, so a segment split by the
+            # encoder's EOS positions has no meaning on it. This rejects e.g.
+            # T5ForSequenceClassification (encoder+decoder); only an encoder-only target
+            # (T5EncoderForSequenceClassification) is valid here.
+            target_stacks = {stack for stack, _ in _ordered_block_keys(target_model)}
+            if "decoder" in target_stacks:
+                raise ValueError(
+                    "steer_text target_block_pooling='segments' requires an encoder-only target "
+                    "(e.g. T5EncoderForSequenceClassification): the target has a 'decoder' stack "
+                    f"({sorted(target_stacks)}), whose blocks never see the premise/hypothesis sequence."
+                )
 
         w_a, _ = _head_tensors(source_model)
         w_b, b_b = _head_tensors(target_model)
@@ -523,11 +1063,36 @@ class SteerTextRebase:
                 "source model, so delta_A is zero. The tuned checkpoint did not load."
             )
 
-        need_blocks = stage_2_strategy == "block_ridge"
+        need_blocks = uses_blocks
 
         def _compute(split: str) -> dict[str, Any]:
             source_loader = getattr(source_loaders, split)
             target_loader = getattr(target_loaders, split)
+            if reuse_source_features_from is not None:
+                # A's half (features_A, delta_A[_blocks], y_A) does not depend on the target, and is the
+                # expensive part; take it from an existing cache and compute only B's half.
+                reuse_dir = _cache_split_dir(
+                    feature_cache_dir, source_tag, str(reuse_source_features_from), task, feature_regime, split
+                )
+                source_side = _load_source_side(reuse_dir, need_blocks=need_blocks and feature_regime == "linear")
+                target_side = _collect_target_side(
+                    target=target_model, target_loader=target_loader, device=dev,
+                    target_block_pooling=(target_block_pooling if block_source == "residual" else "global"),
+                    need_blocks=need_blocks and feature_regime == "linear",
+                )
+                if source_side["y_A"].shape != target_side["y_B"].shape or not torch.equal(
+                    source_side["y_A"].long(), target_side["y_B"].long()
+                ):
+                    raise ValueError(
+                        f"steer_text reuse_source_features_from: the labels of the cached source side in {reuse_dir} "
+                        f"do not line up with this run's '{split}' loader ({tuple(source_side['y_A'].shape)} vs "
+                        f"{tuple(target_side['y_B'].shape)} rows, or different labels). The two runs must use the same "
+                        "examples, order, max_train_samples/max_samples_per_task and head_class_ids."
+                    )
+                target_side.pop("y_B")
+                if verbose:
+                    print(f"{log_prefix} reusing source-side features of '{split}' from {reuse_dir}")
+                return {**source_side, **target_side}
             if feature_regime == "standard":
                 return _collect_standard_split(
                     source_finetuned=source_model,
@@ -544,14 +1109,32 @@ class SteerTextRebase:
                 source_loader=source_loader,
                 target_loader=target_loader,
                 device=dev,
+                # Segment-pool the primary split's *residual* blocks only when block_source
+                # itself is "residual" -- otherwise those residual blocks are discarded
+                # below in favor of the recomputed block_source="attention" ones anyway, so
+                # segment-pooling them here would be pure waste (and would wrongly force
+                # this expensive A-side jvp pass to recompute under a decorated cache key,
+                # see cache_feature_regime below).
+                target_block_pooling=(target_block_pooling if block_source == "residual" else "global"),
             )
 
+        # features_B_blocks' residual entries change width (D -> 3D) under segment pooling
+        # of the *residual* source, and the pooling scheme is not otherwise part of the
+        # cache key -- decorate the regime segment of the cache path so a "segments" run
+        # never reads or clobbers a "global" run's cache (_cache_split_dir only ever uses
+        # this string as a literal path component; _compute() above closes over the real
+        # feature_regime, so the branch logic is unaffected). block_source="attention"
+        # needs no decoration here: its segment-pooled blocks live in their own cache file
+        # below, and everything else in this split cache is identical either way.
+        cache_feature_regime = (
+            f"{feature_regime}__segpool" if target_block_pooling == "segments" and block_source == "residual" else feature_regime
+        )
         cache_args = {
             "feature_cache_dir": feature_cache_dir,
             "source_tag": source_tag,
             "target_tag": target_tag,
             "task": task,
-            "feature_regime": feature_regime,
+            "feature_regime": cache_feature_regime,
             "force_recompute_features": force_recompute_features,
             "need_source_blocks": need_blocks,
             "need_target_blocks": need_blocks,
@@ -560,11 +1143,66 @@ class SteerTextRebase:
         train_data = _load_or_compute_split(split="train", compute_fn=lambda: _compute("train"), **cache_args)
         test_data = _load_or_compute_split(split="test", compute_fn=lambda: _compute("test"), **cache_args)
 
+        recompute_segment_pooling = target_block_pooling == "segments" and block_source != "residual"
+        if need_blocks and (block_pooling != "mean" or block_source != "residual"):
+            # Swap B's per-block features for the recollected ones; f_B (the output block)
+            # and everything on A's side stay as cached.
+            for split, data in (("train", train_data), ("test", test_data)):
+                pooled = _load_or_compute_pooled_blocks(
+                    cache_dir=_cache_split_dir(feature_cache_dir, source_tag, target_tag, task, feature_regime, split),
+                    pooling=block_pooling,
+                    source=block_source,
+                    segment_pooling=recompute_segment_pooling,
+                    force_recompute=force_recompute_features,
+                    compute_fn=lambda split=split: _collect_target_blocks(
+                        target=target_model, target_loader=getattr(target_loaders, split), device=dev,
+                        pooling=block_pooling, source=block_source, segment_pooling=recompute_segment_pooling,
+                    ),
+                    verbose=verbose,
+                )
+                blocks = dict(data["features_B_blocks"])
+                keys = {int(k): k for k in blocks}
+                if len(pooled) != len(blocks) - 1:
+                    raise ValueError(
+                        f"steer_text: {len(pooled)} '{block_source}' blocks but the cached split has "
+                        f"{len(blocks) - 1} residual blocks."
+                    )
+                for b, value in pooled.items():
+                    old = blocks[keys[int(b)]]
+                    # Rows must line up with the cache; the width may differ for the attention
+                    # source (heads * d_head need not equal d_model).
+                    bad_rows = value.shape[0] != old.shape[0]
+                    bad_width = block_source == "residual" and tuple(value.shape) != tuple(old.shape)
+                    if bad_rows or bad_width:
+                        raise ValueError(
+                            f"steer_text: '{block_source}/{block_pooling}' block {b} has shape {tuple(value.shape)} "
+                            f"but the cached split has {tuple(old.shape)}; rerun with force_recompute_features=true."
+                        )
+                    blocks[keys[int(b)]] = value
+                data["features_B_blocks"] = blocks
+
         f_a = train_data["features_A"].double()
         delta_a = train_data["delta_A"].double()
         f_b = train_data["features_B"].double()
         delta_a_test = test_data["delta_A"].double()
         f_b_test = test_data["features_B"].double()
+
+        # Stage-2 input of the global strategies: f_B itself, or B's [premise; hypothesis; global]
+        # last hidden state. Only B's side, so it is collected once and cached beside the split.
+        x_b, x_b_test = f_b, f_b_test
+        if global_input_pooling == "segments":
+            segs: dict[str, torch.Tensor] = {}
+            for split, data in (("train", train_data), ("test", test_data)):
+                segs[split] = _load_or_compute_output_segments(
+                    cache_dir=_cache_split_dir(feature_cache_dir, source_tag, target_tag, task, cache_feature_regime, split),
+                    force_recompute=force_recompute_features,
+                    compute_fn=lambda split=split: _collect_target_output_segments(
+                        target=target_model, target_loader=getattr(target_loaders, split), device=dev
+                    ),
+                    verbose=verbose,
+                )
+                segs[split] = _reconcile_global_third(segs[split], data["features_B"], split, verbose=verbose)
+            x_b, x_b_test = segs["train"].double(), segs["test"].double()
         test_labels = test_data["y_A"].long()
 
         # Support-set selection runs on *local* 0..K-1 labels, not the head-space
@@ -611,39 +1249,49 @@ class SteerTextRebase:
         block_group_size: float | None = None
 
         if stage_2_strategy == "global_ridge":
-            coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
+            coefficient = _ridge(x_b[selected], train_target, ridge_lambda).to(dev)
+            stage2_state = {"kind": "global_ridge", "coefficient": coefficient, "input_pooling": global_input_pooling}
 
             def correction_fn(activations: Mapping[str, Any], *, _coef=coefficient) -> torch.Tensor:
                 global_act = activations["global"]
-                out = global_act.double().to(_coef.device) @ _coef
+                x = activations["global_segments"] if global_input_pooling == "segments" else global_act
+                out = x.double().to(_coef.device) @ _coef
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
         elif stage_2_strategy == "global_mlp":
             model = _fit_global_mlp(
-                f_b[selected],
+                x_b[selected],
                 train_target,
                 seed=10_000 + int(seed) * 100 + int(selected.numel()),
                 epochs=int(mlp_epochs),
                 hidden_dim=int(mlp_hidden_dim),
             ).to(dev)
+            stage2_state = {
+                "kind": "global_mlp",
+                "state_dict": model.state_dict(),
+                "input_dim": int(x_b.shape[1]),
+                "input_pooling": global_input_pooling,
+                "hidden_dim": int(mlp_hidden_dim),
+                "output_dim": int(train_target.shape[1]),
+                "epochs": int(mlp_epochs),
+            }
 
             def correction_fn(activations: Mapping[str, Any], *, _model=model) -> torch.Tensor:
                 global_act = activations["global"]
+                x = activations["global_segments"] if global_input_pooling == "segments" else global_act
                 model_device = next(_model.parameters()).device
                 with torch.no_grad():
-                    out = _model(global_act.double().to(model_device))
+                    out = _model(x.double().to(model_device))
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
-        else:  # block_ridge
+        else:  # block_ridge / joint_ridge: both read B's grouped per-block activations
             delta_a_blocks_train = train_data["delta_A_blocks"].double()
-            block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T
-
             features_b_full_train = {int(b): v.double() for b, v in train_data["features_B_blocks"].items()}
             num_target_residual = len(features_b_full_train) - 1
-            num_source_blocks = int(block_targets.shape[1])
+            num_source_blocks = int(delta_a_blocks_train.shape[1])
             num_source_residual_blocks = num_source_blocks - 1
             if num_source_residual_blocks < 1 or num_target_residual < 1:
-                raise ValueError("steer_text block_ridge: source or target has no residual blocks to target.")
+                raise ValueError(f"steer_text {stage_2_strategy}: source or target has no residual blocks to target.")
 
             residual_train = {b: features_b_full_train[b] for b in range(num_target_residual)}
             output_train = features_b_full_train[num_target_residual]
@@ -658,7 +1306,7 @@ class SteerTextRebase:
                 block_group_size = num_target_residual / num_source_residual_blocks
             else:
                 raise ValueError(
-                    f"steer_text block_ridge: target has fewer residual blocks ({num_target_residual}) "
+                    f"steer_text {stage_2_strategy}: target has fewer residual blocks ({num_target_residual}) "
                     f"than source ({num_source_residual_blocks}); cannot group."
                 )
 
@@ -667,22 +1315,126 @@ class SteerTextRebase:
 
             local_selected = torch.arange(int(selected.numel()))
             local_blocks_train = {b: v[selected] for b, v in grouped_train.items()}
-            coefficients = [
-                c.to(dev)
-                for c in _fit_block_ridge(
-                    local_blocks_train,
-                    block_targets,
+            num_blocks = len(local_blocks_train)
+
+            # Optional per-block standardization, with support-set statistics only. It is
+            # folded into the coefficients and one bias vector below, so the live path
+            # never needs the statistics: ((x - mu) / sd) @ C == x @ (C / sd) - (mu / sd) @ C.
+            if block_feature_preprocessing == "zscore":
+                block_stats = {b: _standardize_stats(x) for b, x in local_blocks_train.items()}
+                fit_blocks = {b: (x - block_stats[b][0]) / block_stats[b][1] for b, x in local_blocks_train.items()}
+            else:
+                block_stats = None
+                fit_blocks = local_blocks_train
+            # Centered features get an unpenalized intercept: fit centered targets, add the mean back.
+            fit_intercept = block_stats is not None
+
+            if stage_2_strategy == "block_ridge":
+                if block_ridge_target_strategy == "blockwise_logitmap":
+                    # A separate Stage-1 map per block, fitted on that block's delta alone.
+                    # Named apart from ``logit_map``: that one is the full-delta map the
+                    # artifacts report, and must not end up holding the last block's.
+                    block_targets_list = []
+                    for delta_a_block in delta_a_blocks_train.unbind(dim=1):
+                        block_logit_map = _stage1_projection(
+                            f_a=f_a,
+                            delta_a=delta_a_block,
+                            w_a=w_a,
+                            f_b=f_b,
+                            w_b=w_b,
+                            selected=selected,
+                            regularization=block_ridge_blockwise_stage1_lambda,
+                        )
+                        block_targets_list.append(delta_a_block[selected] @ block_logit_map.T @ p_b.T)
+                    block_targets = torch.stack(block_targets_list, dim=1)
+                elif block_ridge_target_strategy == "reuse_logitmap":
+                    # The full-delta Stage-1 map applied to each block's delta.
+                    block_targets = delta_a_blocks_train[selected] @ logit_map.T @ p_b.T
+                else:  # last_only
+                    # Every block regresses the full Stage-1 train target.
+                    block_targets = train_target.unsqueeze(1).expand(-1, delta_a_blocks_train.shape[1], -1)
+
+                block_weight = 1.0 / num_blocks if block_residuals_weighting_strategy == "mean" else 1.0
+                weights = [block_weight] * num_blocks
+                # With centered features every block's support prediction has zero mean, so
+                # the smoothed-residual carry stays zero-mean too and each block's intercept
+                # is just the mean of its own target slice.
+                intercepts = block_targets.mean(dim=0) if fit_intercept else None  # [num_blocks, d]
+                raw = _fit_block_ridge(
+                    fit_blocks,
+                    block_targets - intercepts.unsqueeze(0) if fit_intercept else block_targets,
                     selected=local_selected,
                     regularization=ridge_lambda,
                     mode=block_ridge_mode,
                     rho=rho,
+                    regularization_scaling=block_ridge_lambda_scaling,
                 )
-            ]
+                joint_scales = None
+            else:  # joint_ridge
+                # One ridge on all blocks against the *total* Stage-1 target. Each block is
+                # divided by the root of its mean squared row norm, tr(X_b X_b^T)/n on the
+                # support -- so ridge_lambda is a per-block trace-relative penalty, the same
+                # units as block_ridge_lambda_scaling="trace" -- then concatenated. It uses no
+                # per-block targets, so block_ridge_target_strategy, the weighting strategy,
+                # block_ridge_mode, rho and block_ridge_lambda_scaling do not apply.
+                weights = [1.0] * num_blocks
+                joint_scales = [float(fit_blocks[b].square().sum(dim=1).mean().sqrt()) for b in range(num_blocks)]
+                z = torch.cat([fit_blocks[b] / joint_scales[b] for b in range(num_blocks)], dim=1)
+                target_mean = train_target.mean(dim=0) if fit_intercept else None
+                joint = _ridge(z, train_target - target_mean if fit_intercept else train_target, ridge_lambda)
+                del z
+                sizes = [int(fit_blocks[b].shape[1]) for b in range(num_blocks)]
+                raw = [c / joint_scales[b] for b, c in enumerate(torch.split(joint, sizes, dim=0))]
+                intercepts = None
+
+            # Fold weights, standardization and intercepts into (coefficients, bias).
+            coefficients = []
+            bias: torch.Tensor | None = None
+            if fit_intercept:
+                bias = target_mean.clone() if stage_2_strategy == "joint_ridge" else torch.zeros_like(raw[0][0])
+            for b, (c, w) in enumerate(zip(raw, weights, strict=True)):
+                if block_stats is not None:
+                    mu, sd = block_stats[b]
+                    bias = bias - w * ((mu / sd) @ c)
+                    c = c / sd.unsqueeze(1)
+                    if intercepts is not None:
+                        bias = bias + w * intercepts[b]
+                coefficients.append((c * w).to(dev))
+            if bias is not None:
+                bias = bias.to(dev)
+
+            stage2_state = {
+                "kind": stage_2_strategy,
+                "coefficients": coefficients,
+                "bias": bias,
+                "num_target_residual": int(num_target_residual),
+                "num_source_residual_blocks": int(num_source_residual_blocks),
+                "block_group_strategy": str(block_group_strategy),
+                "block_pooling": str(block_pooling),
+                "block_source": str(block_source),
+                "block_feature_preprocessing": str(block_feature_preprocessing),
+                "target_block_pooling": str(target_block_pooling),
+                "weights": weights,
+            }
+            if stage_2_strategy == "block_ridge":
+                stage2_state.update(
+                    {
+                        "block_ridge_mode": str(block_ridge_mode),
+                        "rho": float(rho),
+                        "lambda_scaling": str(block_ridge_lambda_scaling),
+                        "target_strategy": str(block_ridge_target_strategy),
+                        "blockwise_stage1_lambda": float(block_ridge_blockwise_stage1_lambda),
+                        "weighting_strategy": str(block_residuals_weighting_strategy),
+                    }
+                )
+            else:
+                stage2_state["joint_block_scales"] = joint_scales
 
             def correction_fn(
                 activations: Mapping[str, Any],
                 *,
                 _coefficients=coefficients,
+                _bias=bias,
                 _num_target_residual=num_target_residual,
                 _num_source_residual_blocks=num_source_residual_blocks,
                 _strategy=block_group_strategy,
@@ -699,6 +1451,8 @@ class SteerTextRebase:
                     activations["blocks"][_num_target_residual].double().to(coef_device)
                 )
                 out = _predict_block_ridge(_coefficients, blocks)
+                if _bias is not None:
+                    out = out + _bias
                 return out.to(dtype=global_act.dtype, device=global_act.device)
 
         # Stage 2 accuracy in cached-tensor space, the number directly comparable
@@ -707,6 +1461,8 @@ class SteerTextRebase:
         # goes through the live eval path instead, so a gap between the two
         # isolates a Stage 1/2 problem from a live-integration problem.
         cached_test_activations: dict[str, Any] = {"global": f_b_test}
+        if global_input_pooling == "segments":
+            cached_test_activations["global_segments"] = x_b_test
         if need_blocks:
             cached_test_activations["blocks"] = {int(b): v.double() for b, v in test_data["features_B_blocks"].items()}
         stage2_test_acc = _accuracy(
@@ -727,8 +1483,28 @@ class SteerTextRebase:
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
+            "block_pooling": block_pooling,
+            "block_source": block_source,
+            "target_block_pooling": target_block_pooling,
+            "global_input_pooling": global_input_pooling,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
+            # The fitted transforms themselves, so a run can be inspected or
+            # replayed without refitting. ``correction_fn`` closes over the same
+            # Stage 2 object, so these are references, not copies -- consumers
+            # must not mutate them. Everything here is small except
+            # ``stage2_state``: global_ridge's coefficient is ``[d_b, d_b]``.
+            "artifacts": {
+                "stage1_logit_map": logit_map,
+                "stage1_pinv_w_b": p_b,
+                "stage1_lambda": float(stage1_lambda),
+                "ridge_lambda": float(ridge_lambda),
+                "w_a": w_a,
+                "w_b": w_b,
+                "b_b": b_b,
+                "selected": selected,
+                "stage2_state": stage2_state,
+            },
             "diagnostics": {
                 "stage0_test_acc": stage0_test_acc,
                 "stage1_test_acc": stage1_test_acc,
@@ -770,19 +1546,47 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     model = getattr(llm, "model", llm)
     _, head = head_linear(model)
     correction_fn = prepared["correction_fn"]
-    need_blocks = prepared.get("stage_2_strategy") == "block_ridge"
+    need_blocks = prepared.get("stage_2_strategy") in {"block_ridge", "joint_ridge"}
 
-    capture = _TextBlockCapture(model) if need_blocks else None
+    # Pool the live blocks exactly as the fit's features were pooled.
+    segment_pooling = prepared.get("target_block_pooling", "global") == "segments"
+    capture = (
+        _TextBlockCapture(
+            model,
+            pooling=prepared.get("block_pooling", "mean"),
+            source=prepared.get("block_source", "residual"),
+            segment_pooling=segment_pooling,
+        )
+        if need_blocks
+        else None
+    )
+    output_segments = (
+        _OutputSegmentCapture(model) if prepared.get("global_input_pooling", "global") == "segments" else None
+    )
     handles: list[Any] = []
 
     def _mask_hook(_module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         if capture is not None:
             capture.attention_mask = kwargs.get("attention_mask")
             capture.activations.clear()
+            if capture.segment_pooling:
+                input_ids = kwargs.get("input_ids")
+                if input_ids is None:
+                    raise RuntimeError(
+                        "steer_text: target_block_pooling='segments' needs 'input_ids' as a forward "
+                        "keyword argument to locate the premise/hypothesis boundary, but the model was "
+                        "called without it (positional call, or a caller that omits it)."
+                    )
+                capture.input_ids = input_ids
 
     def _head_pre_hook(_module: nn.Module, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
         feature = inputs[0]
         activations: dict[str, Any] = {"global": feature}
+        if output_segments is not None:
+            if output_segments.pooled is None:
+                raise RuntimeError("steer_text: the segment-pooled output was not captured before the head ran.")
+            activations["global_segments"] = output_segments.pooled
+            output_segments.pooled = None  # one capture per forward; a stale one must never be reused
         if capture is not None:
             num_residual = len(capture.modules)
             missing = [b for b in range(num_residual) if b not in capture.activations]
@@ -798,6 +1602,8 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
     if capture is not None:
         capture.__enter__()
         handles.append(model.register_forward_pre_hook(_mask_hook, with_kwargs=True))
+    if output_segments is not None:
+        output_segments.__enter__()
     handles.append(head.register_forward_pre_hook(_head_pre_hook))
     try:
         yield
@@ -806,6 +1612,8 @@ def steer_text_correction_context(llm: Any, prepared: Mapping[str, Any], *, alph
             handle.remove()
         if capture is not None:
             capture.__exit__(None, None, None)
+        if output_segments is not None:
+            output_segments.__exit__(None, None, None)
 
 
 register(SteerTextRebase())
