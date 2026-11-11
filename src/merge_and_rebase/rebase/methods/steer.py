@@ -38,10 +38,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call, jvp
 from torch.utils.data import DataLoader, Subset
 
 from ...models.openclip_classifier import zero_shot_logits_from_features
-from ...utils.linearization import LinearizedModule
+from ...utils.linearization import LinearizedModule, forward_ad_safe_attention_context
 from ..base import TensorDict
 from ..registry import register
 
@@ -269,6 +270,44 @@ def _ridge(features: torch.Tensor, targets: torch.Tensor, regularization: float)
     return torch.linalg.solve(features.T @ features + regularization * eye, features.T @ targets)
 
 
+# ``stage1_mode`` (opt-in, default "delta_projection" = the original two-stage steer).
+# "logit_distill" is linear probe distillation, a baseline/ablation and NOT steer: it skips
+# Stage 1 and fits, with one ridge on B's final feature, the support-set logit residual
+#   min_L ||H_A^ft T_A - (H_B T_B + H_B L)||^2 + lambda ||L||^2,
+# i.e. a new head T_B + L shrunk towards B's zero-shot head T_B.
+_STAGE1_MODES = frozenset({"delta_projection", "logit_distill"})
+
+
+def _logit_distill_residual(
+    *, f_a: torch.Tensor, delta_a: torch.Tensor, w_a: torch.Tensor, f_b: torch.Tensor, w_b: torch.Tensor
+) -> torch.Tensor:
+    """Logit residual ``E = (f_A + delta_A) W_A^T - f_B W_B^T`` (A fine-tuned minus B zero-shot, no head biases).
+
+    Same expression as the ``residual`` of ``_stage1_projection``; it is the regression target of
+    ``stage1_mode="logit_distill"``.
+    """
+    return (f_a + delta_a) @ w_a.T - f_b @ w_b.T
+
+
+def _ridge_or_pinv(features: torch.Tensor, targets: torch.Tensor, regularization: float, scaling: str = "none") -> tuple[torch.Tensor, float]:
+    """Ridge ``argmin_L ||targets - features L||^2 + lambda_eff ||L||^2`` for ``stage1_mode="logit_distill"``.
+
+    ``scaling="trace"`` uses ``lambda_eff = regularization * tr(X X^T) / n`` (dimensionless lambda; it is 1 x lambda
+    for L2-normalized features). ``lambda_eff == 0`` returns the minimum-norm least-squares solution ``pinv(X) Y``.
+    Returns the coefficient and ``lambda_eff``.
+    """
+    if regularization < 0:
+        raise ValueError("steer logit_distill ridge_lambda must be non-negative")
+    if scaling not in {"none", "trace"}:
+        raise ValueError("steer global_ridge_lambda_scaling must be 'none' or 'trace'")
+    effective = float(regularization)
+    if scaling == "trace":
+        effective *= float(features.square().sum() / features.shape[0])
+    if effective == 0.0:
+        return torch.linalg.pinv(features) @ targets, 0.0
+    return _ridge(features, targets, effective), effective
+
+
 class _ResidualMLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -412,6 +451,30 @@ def _predict_block_ridge(coefficients: Sequence[torch.Tensor], block_activations
     if prediction is None:
         raise ValueError("steer block_ridge has no fitted blocks.")
     return prediction
+
+
+_BLOCK_PAIRINGS = frozenset({"identity", "reversed", "random"})
+
+
+def _block_pairing_permutation(num_blocks: int, pairing: str, seed: int | None = None) -> torch.Tensor:
+    """
+    Permutation ``perm`` re-pairing block ridge inputs with targets: input block ``b`` regresses target ``perm[b]``.
+
+    ``identity`` keeps the natural pairing, ``reversed`` pairs block ``b`` with ``num_blocks - 1 - b`` and
+    ``random`` draws a uniform permutation from a private generator seeded with ``seed`` (so it does not
+    depend on, nor perturb, the global RNG state). The fit itself (carry order, residual state, rho) is
+    unchanged: it still runs over input blocks in order, only the target assigned to each block changes.
+    """
+    if pairing not in _BLOCK_PAIRINGS:
+        raise ValueError(f"steer block_pairing must be one of: {sorted(_BLOCK_PAIRINGS)}")
+    if pairing == "identity":
+        return torch.arange(num_blocks)
+    if pairing == "reversed":
+        return torch.arange(num_blocks).flip(0)
+    if seed is None:
+        raise ValueError("steer block_pairing='random' requires an explicit block_pairing_seed")
+    generator = torch.Generator().manual_seed(int(seed))
+    return torch.randperm(num_blocks, generator=generator)
 
 
 def _fit_concat_ridge(
@@ -1481,6 +1544,142 @@ def _collect_linear_split(
     }
 
 
+def _collect_integrated_split(
+    *,
+    source_finetuned_visual: nn.Module,
+    source_pretrained_visual: nn.Module,
+    target_visual: nn.Module,
+    source_loader: Any,
+    target_loader: Any,
+    device: torch.device,
+    integration_points: int,
+    block_granularity: str = "residual",
+    token_pooling: str = "mean",
+    compute_blocks: bool = True,
+    integration_batch_size: int | None = None,
+) -> dict[str, Any]:
+    """
+    Integrated regime (opt-in, nonlinear fine-tuning): per-block residuals of A as path integrals.
+
+    With theta(t) = theta0 + t * dtheta and F(theta) = l2_normalize(visual(x; theta)), block l's
+    contribution to the exact residual D(x) = F(theta1) - F(theta0) is
+
+        D_l(x) = int_0^1 J F(theta(t)) (M_l dtheta) dt,        sum_l D_l(x) = D(x),
+
+    estimated by the midpoint rule on ``integration_points`` = K nodes t_k = (k + 1/2) / K:
+    D_l ~= (1/K) sum_k JVP(F, primals=theta(t_k), tangents=M_l dtheta). The primals interpolate
+    *all* parameters (same model for every block at a given t_k); only the tangent is masked, and it
+    is not scaled by t_k. ``delta_A`` is the exact two-forward residual (computed exactly as the
+    standard regime does), so Stage 1 is fit on it; ``delta_A_blocks`` holds the integrated
+    contributions, the per-block Stage 2 targets. ``integration_rel_error`` is the per-example
+    ||sum_l D_l - D|| / ||D||: quadrature + numerical error of the sum only (errors of different
+    blocks can cancel in it). Cost: K * num_blocks JVPs per batch.
+
+    Memory: block l's JVP differentiates only with respect to block l's own parameters (the other
+    interpolated parameters are plain constants of the call), which is the same directional derivative
+    as a full-size tangent that is zero outside the block but carries no dual tensors for the rest of
+    the network; a block whose update is exactly zero is skipped (its integral is exactly zero).
+    ``integration_batch_size`` splits each loader batch into chunks for the JVPs only (lower peak
+    activation memory, same per-example result up to floating point).
+
+    ``compute_blocks=False`` skips the integration (no ``delta_A_blocks``): two forwards only.
+    Buffers are taken from the pretrained visual and assumed common to both endpoints.
+    """
+    num_points = int(integration_points)
+    block_ids, num_a_blocks = _parameter_blocks_for_visual(source_pretrained_visual, block_granularity)
+    param_names = [name for name, _ in source_pretrained_visual.named_parameters()]
+    theta0 = {name: p.detach() for name, p in source_pretrained_visual.named_parameters()}
+    finetuned = {name: p.detach() for name, p in source_finetuned_visual.named_parameters()}
+    missing = [name for name in param_names if name not in finetuned]
+    if missing:
+        raise ValueError(f"steer integrated regime: finetuned source lacks parameters {missing[:10]}")
+    buffers = {name: b.detach() for name, b in source_pretrained_visual.named_buffers()}
+    delta = {name: finetuned[name].to(theta0[name].device) - theta0[name] for name in param_names}
+    # TANGENTS: dtheta on the selected block (never scaled by t); implicitly zero elsewhere, because
+    # the JVP of block l is taken with respect to that block's parameters only.
+    block_param_names = [
+        [name for name, bid in zip(param_names, block_ids, strict=True) if bid == block_id] for block_id in range(num_a_blocks)
+    ]
+    block_tangents = [{name: delta[name] for name in names} for names in block_param_names]
+    active_blocks = [
+        block_id for block_id in range(num_a_blocks) if any(bool(delta[name].any()) for name in block_param_names[block_id])
+    ]
+    chunk_size = int(integration_batch_size) if integration_batch_size is not None else None
+
+    target_capture, target_final_ids, num_target_blocks = _activation_capture_for_visual(
+        target_visual, block_granularity, token_pooling
+    )
+
+    features_a: list[torch.Tensor] = []
+    delta_a: list[torch.Tensor] = []
+    delta_a_blocks: list[torch.Tensor] = []
+    rel_errors: list[torch.Tensor] = []
+    features_b: list[torch.Tensor] = []
+    features_b_blocks: dict[int, list[torch.Tensor]] = {b: [] for b in range(num_target_blocks)}
+    labels: list[torch.Tensor] = []
+
+    for (x_a, y_a), (x_b, _y_b) in zip(_iter_batches(source_loader, device=device), _iter_batches(target_loader, device=device), strict=True):
+        # Exact global residual, same two forwards as _collect_standard_split.
+        with torch.no_grad():
+            f_a_ft = _l2_normalize(source_finetuned_visual(x_a))
+            f_a_pre = _l2_normalize(source_pretrained_visual(x_a))
+        delta_full = (f_a_ft - f_a_pre).detach()
+
+        if compute_blocks:
+            accumulated = torch.zeros(x_a.shape[0], num_a_blocks, delta_full.shape[-1], dtype=torch.float64, device=device)
+            chunks = [slice(0, x_a.shape[0])] if chunk_size is None else [
+                slice(start, start + chunk_size) for start in range(0, x_a.shape[0], chunk_size)
+            ]
+            with forward_ad_safe_attention_context(x_a.device):
+                for k in range(num_points):
+                    t = (k + 0.5) / num_points
+                    # PRIMALS: every parameter interpolated, no mask.
+                    theta_t = {name: theta0[name] + t * delta[name] for name in param_names}
+                    for block_id in active_blocks:
+                        block_primals = {name: theta_t[name] for name in block_param_names[block_id]}
+                        for rows in chunks:
+
+                            def _f(
+                                params: Mapping[str, torch.Tensor],
+                                _x: torch.Tensor = x_a[rows],
+                                _theta: Mapping[str, torch.Tensor] = theta_t,
+                            ) -> torch.Tensor:
+                                merged = {**_theta, **params}
+                                out = functional_call(source_pretrained_visual, (merged, buffers), args=(_x,), strict=False)
+                                return _l2_normalize(out)
+
+                            _, tangent_out = jvp(_f, (block_primals,), (block_tangents[block_id],))
+                            accumulated[rows, block_id, :] += tangent_out.detach().double() / num_points
+                            del tangent_out
+                    del theta_t
+            error = (accumulated.sum(dim=1) - delta_full.double()).norm(dim=-1)
+            rel_errors.append((error / (delta_full.double().norm(dim=-1) + 1e-12)).cpu())
+            delta_a_blocks.append(accumulated.to(dtype=delta_full.dtype).cpu())
+
+        features_a.append(f_a_pre.cpu())
+        delta_a.append(delta_full.cpu())
+        labels.append(y_a.cpu())
+
+        out_b, captured_blocks = _target_batch_activations(
+            target_visual, x_b, target_capture, target_final_ids, num_target_blocks
+        )
+        for block_id in range(num_target_blocks):
+            features_b_blocks[block_id].append(captured_blocks[block_id].cpu())
+        features_b.append(out_b.detach().cpu())
+
+    data: dict[str, Any] = {
+        "features_A": torch.cat(features_a, dim=0),
+        "delta_A": torch.cat(delta_a, dim=0),
+        "features_B": torch.cat(features_b, dim=0),
+        "features_B_blocks": {b: torch.cat(chunks, dim=0) for b, chunks in features_b_blocks.items()},
+        "y_A": torch.cat(labels, dim=0),
+    }
+    if compute_blocks:
+        data["delta_A_blocks"] = torch.cat(delta_a_blocks, dim=0)
+        data["integration_rel_error"] = torch.cat(rel_errors, dim=0)
+    return data
+
+
 def _cache_split_dir(
     feature_cache_dir: str,
     source_tag: str,
@@ -1642,28 +1841,52 @@ class SteerRebase:
         block_ridge_lambda_scaling: str = "none",
         block_ridge_diagnostics: bool = False,
         block_ridge_input: str = "per_block",
+        block_pairing: str = "identity",
+        block_pairing_seed: int | None = None,
+        cached_eval_batch_size: int | None = None,
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
         target_blocks_cache_dir: str | None = None,
         target_blocks_regime: str = "linear",
         train_features_per_class: int | None = None,
         correction_space: str = "feature",
+        stage1_mode: str = "delta_projection",
+        global_ridge_lambda_scaling: str = "none",
+        integration_points: int | None = None,
+        integration_batch_size: int | None = None,
         seed: int = 42,
         verbose: bool = True,
         **kwargs: Any,
     ) -> dict[str, Any]:
         del kwargs
+        if stage1_mode not in _STAGE1_MODES:
+            raise ValueError(f"steer stage1_mode must be one of: {sorted(_STAGE1_MODES)}")
+        logit_distill = stage1_mode == "logit_distill"
+        if logit_distill and stage_2_strategy not in {"global_ridge", "concat_ridge"}:
+            raise ValueError(
+                "steer stage1_mode='logit_distill' (linear probe distillation) requires stage_2_strategy='global_ridge' "
+                "(input: B's final feature) or 'concat_ridge' (input: all of B's blocks, concatenated)"
+            )
+        if logit_distill and stage_2_strategy == "concat_ridge" and ridge_lambda <= 0:
+            raise ValueError("steer stage1_mode='logit_distill' with concat_ridge requires ridge_lambda > 0")
+        if global_ridge_lambda_scaling != "none" and not (logit_distill and stage_2_strategy == "global_ridge"):
+            raise ValueError(
+                "steer global_ridge_lambda_scaling is only supported with stage1_mode='logit_distill' and stage_2_strategy='global_ridge' "
+                "(concat_ridge scales every block to unit mean squared norm; use block_ridge_lambda_scaling)"
+            )
         if correction_space not in _CORRECTION_SPACES:
             raise ValueError(f"steer correction_space must be one of: {sorted(_CORRECTION_SPACES)}")
         # "logit": Stage 1's target stays in logit space (no pinv(w_b)), every Stage 2 predictor
         # regresses a [C] logit offset, and eval adds it to the logits without passing through the head.
         logit_space = correction_space == "logit"
-        if feature_regime not in {"standard", "linear"}:
-            raise ValueError("steer feature_regime must be 'standard' or 'linear'")
+        if feature_regime not in {"standard", "linear", "integrated"}:
+            raise ValueError("steer feature_regime must be 'standard', 'linear' or 'integrated'")
         if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge", "concat_ridge"}:
             raise ValueError("steer stage_2_strategy must be one of: global_ridge, global_mlp, block_ridge, concat_ridge")
-        if stage_2_strategy == "block_ridge" and feature_regime != "linear":
-            raise ValueError("steer block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
+        if stage_2_strategy == "block_ridge" and feature_regime not in {"linear", "integrated"}:
+            raise ValueError(
+                "steer block_ridge requires feature_regime='linear' or 'integrated' (the standard regime has no per-block deltas)."
+            )
         if block_granularity not in _BLOCK_GRANULARITIES:
             raise ValueError(f"steer block_granularity must be one of: {sorted(_BLOCK_GRANULARITIES)}")
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
@@ -1678,10 +1901,34 @@ class SteerRebase:
             raise ValueError("steer block_ridge_input must be 'per_block' or 'final'")
         if block_ridge_input == "final" and stage_2_strategy != "block_ridge":
             raise ValueError("steer block_ridge_input='final' requires stage_2_strategy='block_ridge'")
+        if block_pairing not in _BLOCK_PAIRINGS:
+            raise ValueError(f"steer block_pairing must be one of: {sorted(_BLOCK_PAIRINGS)}")
+        if block_pairing != "identity" and (stage_2_strategy != "block_ridge" or block_ridge_input != "per_block"):
+            raise ValueError("steer block_pairing != 'identity' requires stage_2_strategy='block_ridge' and block_ridge_input='per_block'")
+        if block_pairing == "random" and block_pairing_seed is None:
+            raise ValueError("steer block_pairing='random' requires an explicit block_pairing_seed")
+        if cached_eval_batch_size is not None and int(cached_eval_batch_size) <= 0:
+            raise ValueError("steer cached_eval_batch_size must be a positive integer or None")
         if train_features_per_class is not None and int(train_features_per_class) <= 0:
             raise ValueError("steer train_features_per_class must be a positive integer")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer requires exactly one of few_shot or total_support_examples")
+        # Integrated regime (opt-in): per-block residuals of a nonlinearly fine-tuned A as midpoint-rule
+        # path integrals of masked JVPs (see _collect_integrated_split). The number of quadrature
+        # nodes is part of the cache key, so from here on feature_regime names the cache
+        # ("integrated_k<K>") and every existing cache call site below is left untouched.
+        integrated = feature_regime == "integrated"
+        if integrated:
+            if integration_points is None or isinstance(integration_points, bool) or int(integration_points) != integration_points:
+                raise ValueError("steer feature_regime='integrated' requires an integer integration_points >= 1")
+            integration_points = int(integration_points)
+            if integration_points < 1:
+                raise ValueError("steer feature_regime='integrated' requires an integer integration_points >= 1")
+            feature_regime = f"integrated_k{integration_points}"
+            if integration_batch_size is not None and (isinstance(integration_batch_size, bool) or int(integration_batch_size) < 1):
+                raise ValueError("steer integration_batch_size must be a positive integer")
+        elif integration_points is not None or integration_batch_size is not None:
+            raise ValueError("steer integration_points/integration_batch_size are only supported with feature_regime='integrated'")
 
         dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
         log_prefix = "[steer]"
@@ -1833,6 +2080,20 @@ class SteerRebase:
                 getattr(target_loaders, split),
                 per_class=train_per_class if split == "train" else None,
             )
+            if integrated:
+                return _collect_integrated_split(
+                    source_finetuned_visual=source_finetuned_visual,
+                    source_pretrained_visual=source_pretrained_visual,
+                    target_visual=target_visual,
+                    source_loader=source_loader,
+                    target_loader=target_loader,
+                    device=dev,
+                    integration_points=integration_points,
+                    block_granularity=block_granularity,
+                    token_pooling=token_pooling,
+                    compute_blocks=need_source_blocks if split == "train" else test_need_source_blocks,
+                    integration_batch_size=integration_batch_size,
+                )
             if feature_regime == "standard":
                 if load_target_blocks and not force_recompute_features:
                     # Add B's blocks to an existing standard cache (mean-pooled
@@ -1913,6 +2174,9 @@ class SteerRebase:
             block_granularity=block_granularity,
             token_pooling=cache_pooling,
         )
+        # A's per-block deltas on the test split feed only block_ridge_diagnostics; in the integrated
+        # regime they cost K * num_blocks JVPs per batch, so they are skipped unless that is requested.
+        test_need_source_blocks = need_source_blocks and (block_ridge_diagnostics or not integrated)
         test_data = _load_or_compute_split(
             feature_cache_dir=feature_cache_dir,
             source_tag=source_tag,
@@ -1921,7 +2185,7 @@ class SteerRebase:
             feature_regime=feature_regime,
             split="test",
             force_recompute_features=force_recompute_features,
-            need_source_blocks=need_source_blocks,
+            need_source_blocks=test_need_source_blocks,
             need_target_blocks=load_target_blocks,
             compute_fn=lambda: _compute("test", "test"),
             verbose=verbose,
@@ -1946,6 +2210,39 @@ class SteerRebase:
                     verbose=verbose,
                 )
 
+        integration_info: dict[str, Any] = {}
+        if integrated:
+            integration_info["integration_points"] = integration_points
+            rel_error = train_data.pop("integration_rel_error", None)
+            if rel_error is None:
+                rel_error_path = (
+                    _cache_split_dir(
+                        feature_cache_dir, source_tag, target_tag, task, feature_regime, train_split, block_granularity, cache_pooling
+                    )
+                    / "integration_rel_error.pt"
+                )
+                if rel_error_path.exists():
+                    rel_error = torch.load(rel_error_path, map_location="cpu", weights_only=True)
+            if rel_error is not None:
+                integration_info["integration_rel_error_mean"] = float(rel_error.double().mean())
+                integration_info["integration_rel_error_max"] = float(rel_error.double().max())
+            if verbose:
+                shown = (
+                    f"mean={integration_info['integration_rel_error_mean']:.3e} max={integration_info['integration_rel_error_max']:.3e}"
+                    if rel_error is not None
+                    else "not available"
+                )
+                print(
+                    f"{log_prefix} prepare: integrated per-block residuals, K={integration_points} midpoint nodes; "
+                    f"relative error of the block sum vs the exact residual on {train_split}: {shown}"
+                )
+                if dev.type == "cuda":
+                    print(
+                        f"{log_prefix} prepare: peak GPU memory after feature loading/extraction: "
+                        f"allocated {torch.cuda.max_memory_allocated(dev) / 2**30:.2f} GiB, "
+                        f"reserved {torch.cuda.max_memory_reserved(dev) / 2**30:.2f} GiB"
+                    )
+
         f_a = train_data["features_A"].double()
         delta_a = train_data["delta_A"].double()
         f_b = train_data["features_B"].double()
@@ -1959,46 +2256,82 @@ class SteerRebase:
         else:
             selected = _random_sample(train_labels, int(total_support_examples), seed)
 
-        logit_map, stage1_kept_rank, stage1_rank = _stage1_projection(
-            f_a=f_a,
-            delta_a=delta_a,
-            w_a=w_a,
-            f_b=f_b,
-            w_b=w_b,
-            selected=selected,
-            regularization=stage1_lambda,
-            regularization_mode=stage1_regularization_mode,
-            energy_threshold=stage1_energy_threshold,
-        )
-        if logit_space:
-            train_target = delta_a[selected] @ logit_map.T
-            test_target = delta_a_test @ logit_map.T
-            stage1_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, test_target)
-        else:
-            p_b = torch.linalg.pinv(w_b)
-            train_target = delta_a[selected] @ logit_map.T @ p_b.T
-            test_target = delta_a_test @ logit_map.T @ p_b.T
-            stage1_test_acc = _accuracy(f_b_test + test_target, w_b, test_labels)
-        if verbose:
-            if stage1_regularization_mode == "transported":
-                print(
-                    f"{log_prefix} prepare: stage1 transported regularization; pinv kept "
-                    f"{stage1_kept_rank}/{stage1_rank} singular values "
-                    f"(energy threshold {stage1_energy_threshold})"
-                )
+        teacher_test_acc = None
+        if logit_distill:
+            # Linear probe distillation (opt-in baseline, not steer): no Stage 1 projection through
+            # delta_A -- the regression target is the support-set logit residual itself. In feature
+            # space it is mapped through pinv(w_b); since pinv(w_b)^T w_b^T = I_C (w_b full row rank)
+            # and ridge is linear in its targets, both spaces yield the same corrected logits.
+            residual_train = _logit_distill_residual(f_a=f_a[selected], delta_a=delta_a[selected], w_a=w_a, f_b=f_b[selected], w_b=w_b)
+            residual_test = _logit_distill_residual(
+                f_a=test_data["features_A"].double(), delta_a=delta_a_test, w_a=w_a, f_b=f_b_test, w_b=w_b
+            )
+            logit_map, stage1_kept_rank, stage1_rank = None, None, None
+            if logit_space:
+                train_target = residual_train
+                stage1_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, residual_test)
             else:
+                p_b = torch.linalg.pinv(w_b)
+                train_target = residual_train @ p_b.T
+                stage1_test_acc = _accuracy(f_b_test + residual_test @ p_b.T, w_b, test_labels)
+            # With the full residual as "oracle" target, f_B W_B^T + E = A's own logits.
+            teacher_test_acc = stage1_test_acc
+            if verbose:
                 print(
-                    f"{log_prefix} prepare: stage1 standard ridge regularization; "
-                    f"numerical rank {stage1_rank}"
+                    f"{log_prefix} prepare: stage1_mode=logit_distill (linear probe distillation, NOT steer; input: "
+                    f"{'concatenated blocks of B' if stage_2_strategy == 'concat_ridge' else 'final feature of B'}): "
+                    "Stage 1 skipped; stage1_lambda/stage1_energy_threshold/stage1_regularization_mode ignored"
                 )
-            print(f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} (uses A's delta at test time; diagnostic only)")
+                print(f"{log_prefix} prepare: teacher (A fine-tuned) cached test acc = {teacher_test_acc:.4f}")
+        else:
+            logit_map, stage1_kept_rank, stage1_rank = _stage1_projection(
+                f_a=f_a,
+                delta_a=delta_a,
+                w_a=w_a,
+                f_b=f_b,
+                w_b=w_b,
+                selected=selected,
+                regularization=stage1_lambda,
+                regularization_mode=stage1_regularization_mode,
+                energy_threshold=stage1_energy_threshold,
+            )
+            if logit_space:
+                train_target = delta_a[selected] @ logit_map.T
+                test_target = delta_a_test @ logit_map.T
+                stage1_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, test_target)
+            else:
+                p_b = torch.linalg.pinv(w_b)
+                train_target = delta_a[selected] @ logit_map.T @ p_b.T
+                test_target = delta_a_test @ logit_map.T @ p_b.T
+                stage1_test_acc = _accuracy(f_b_test + test_target, w_b, test_labels)
+            if verbose:
+                if stage1_regularization_mode == "transported":
+                    print(
+                        f"{log_prefix} prepare: stage1 transported regularization; pinv kept "
+                        f"{stage1_kept_rank}/{stage1_rank} singular values "
+                        f"(energy threshold {stage1_energy_threshold})"
+                    )
+                else:
+                    print(
+                        f"{log_prefix} prepare: stage1 standard ridge regularization; "
+                        f"numerical rank {stage1_rank}"
+                    )
+                print(f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} (uses A's delta at test time; diagnostic only)")
 
         num_source_blocks = None
         block_group_size = None
         block_error_profile: dict[str, Any] | None = None
         stage2_global_equiv_test_acc = None
+        block_pairing_info: dict[str, Any] = {}
+        global_ridge_lambda_effective = None
         if stage_2_strategy == "global_ridge":
-            coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
+            if logit_distill:
+                coefficient, global_ridge_lambda_effective = _ridge_or_pinv(
+                    f_b[selected], train_target, ridge_lambda, global_ridge_lambda_scaling
+                )
+                coefficient = coefficient.to(dev)
+            else:
+                coefficient = _ridge(f_b[selected], train_target, ridge_lambda).to(dev)
 
             def correction_fn(activations: Mapping[str, torch.Tensor], *, _coef=coefficient) -> torch.Tensor:
                 global_act = activations["global"].double().to(_coef.device)
@@ -2151,6 +2484,19 @@ class SteerRebase:
                 grouped_train = features_b_full_train
                 block_group_size = 1
 
+            pairing_perm = None
+            if block_pairing != "identity":
+                pairing_perm = _block_pairing_permutation(num_source_blocks, block_pairing, block_pairing_seed)
+                # Input block b now regresses target perm[b]; everything downstream is unchanged.
+                block_targets = block_targets[:, pairing_perm.to(block_targets.device)]
+                block_pairing_info = {
+                    "block_pairing": block_pairing,
+                    "block_pairing_seed": None if block_pairing == "reversed" else block_pairing_seed,
+                    "block_pairing_perm": pairing_perm.tolist(),
+                }
+                if verbose:
+                    print(f"{log_prefix} prepare: block_pairing={block_pairing} perm={pairing_perm.tolist()}")
+
             local_selected = torch.arange(int(selected.numel()))
             local_blocks_train = {b: v[selected] for b, v in grouped_train.items()}
             coefficients = [
@@ -2175,6 +2521,8 @@ class SteerRebase:
                     test_targets = test_data["delta_A_blocks"].double() @ logit_map.T
                     if not logit_space:
                         test_targets = test_targets @ p_b.T
+                    if pairing_perm is not None:
+                        test_targets = test_targets[:, pairing_perm.to(test_targets.device)]
                     profile_head = None if logit_space else w_b
                     test_blocks = {b: v.double() for b, v in test_data["features_B_blocks"].items()}
                     block_error_profile = {
@@ -2240,7 +2588,24 @@ class SteerRebase:
         if need_target_blocks:
             # Left in the cached dtype: every correction_fn upcasts per block itself.
             cached_test_activations["blocks"] = dict(test_data["features_B_blocks"])
-        if logit_space:
+        if cached_eval_batch_size is not None:
+            # Opt-in (default None leaves the branch below untouched): evaluate the cached-space check in row
+            # chunks so the float64 copy of every test block never sits on the device at once (peak VRAM
+            # ~ chunk x blocks instead of n_test x blocks). Rows are independent, so the result is the same.
+            _chunk = int(cached_eval_batch_size)
+            _n_test = f_b_test.shape[0]
+            _pieces = []
+            for _i in range(0, _n_test, _chunk):
+                _acts: dict[str, Any] = {"global": f_b_test[_i : _i + _chunk]}
+                if need_target_blocks:
+                    _acts["blocks"] = {b: v[_i : _i + _chunk] for b, v in test_data["features_B_blocks"].items()}
+                _pieces.append(correction_fn(_acts))
+            _cached_correction = torch.cat(_pieces, dim=0)
+            if logit_space:
+                stage2_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, _cached_correction)
+            else:
+                stage2_test_acc = _accuracy(f_b_test + _cached_correction, w_b, test_labels)
+        elif logit_space:
             stage2_test_acc = _logit_accuracy(f_b_test, w_b, test_labels, correction_fn(cached_test_activations))
         else:
             stage2_test_acc = _accuracy(f_b_test + correction_fn(cached_test_activations), w_b, test_labels)
@@ -2290,8 +2655,27 @@ class SteerRebase:
                 "stage1_regularization_mode": stage1_regularization_mode,
                 "stage1_energy_threshold": stage1_energy_threshold,
                 **({"block_error_profile": block_error_profile} if block_error_profile is not None else {}),
+                **block_pairing_info,
             },
         }
+        if integrated:
+            prepared["integration_points"] = integration_points
+            prepared["diagnostics"].update(integration_info)
+        if logit_distill:
+            prepared["stage1_mode"] = stage1_mode
+            prepared["diagnostics"].update(
+                {
+                    "stage1_mode": stage1_mode,
+                    "teacher_test_acc": teacher_test_acc,
+                    "global_ridge_lambda_scaling": global_ridge_lambda_scaling,
+                    "global_ridge_lambda_effective": global_ridge_lambda_effective,
+                    "lpd_input": "concat_blocks" if stage_2_strategy == "concat_ridge" else "final_feature",
+                }
+            )
+            if stage_2_strategy == "concat_ridge":
+                prepared["diagnostics"].update(
+                    {"concat_input_dim": concat_info["input_dim"], "concat_effective_lambda": concat_info["effective_lambda"]}
+                )
         if logit_space:
             # The correction is in units of the cached head's logits. Unlike the feature-space
             # correction (whose scale cancels through pinv(w_b)), a logit offset does not rescale

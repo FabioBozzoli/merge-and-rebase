@@ -276,6 +276,24 @@ generates the runs.
   computes only the target's half. The labels of the two runs must line up row by row (checked, it raises
   otherwise); afterwards the new pair is self-sufficient.
 
+## Linear probe distillation (`stage1_mode="logit_distill"`): opt-in baseline
+
+`steer_text` accepts the same opt-in mode as vision `steer` (see [Rebasin](rebasin.md#linear-probe-distillation-stage1_modelogit_distill-opt-in-baseline-not-steer)):
+Stage 1 is skipped and one `global_ridge` on B's pooled feature (or on the `[premise; hypothesis; global]`
+segments with `global_input_pooling="segments"`) regresses the support-set logit residual
+`E = (f_A + delta_A) W_A^T - f_B W_B^T`, mapped through `pinv(W_B)` (the corrected logits are exactly
+`f_B W_B^T + b_B + x_B L`). Disabled by default, it is not steer: use it only as a baseline.
+
+- As in Stage 1, head **biases are not part of `E`** (the formulation has none): if `b_A != b_B` the constant
+  logit shift `b_A - b_B` is only fitted insofar as `x_B` has a non-zero mean. The `stage1_test_acc` diagnostic
+  is therefore the "residual oracle" (A's bias-free logits plus `b_B`), not exactly A's accuracy.
+- Text features are not normalized: prefer `global_ridge_lambda_scaling="trace"` so `ridge_lambda` is dimensionless.
+- `ridge_lambda=0` gives the minimum-norm least-squares solution.
+- **Input = all of B's blocks**: `stage_2_strategy="joint_ridge"` with `stage1_mode="logit_distill"` regresses the same residual on the
+  concatenation of B's per-block activations (each block divided by the root of its support mean squared row norm) plus the pooled output.
+  Under LPD only, `joint_ridge` also accepts `target_block_pooling="segments"` (e.g. with `block_source="attention"`, the inputs of the
+  reference steer cell); without LPD that combination is still rejected. `ridge_lambda` must be > 0 and `global_ridge_lambda_scaling` does not apply.
+
 ## Limits
 
 - `steer_text` requires `eval_mode="head_logits"`.

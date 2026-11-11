@@ -1269,3 +1269,545 @@ def test_block_ridge_diagnostics_in_logit_space(tmp_path) -> None:
         assert len(prof[split_name]["local"]) == 4  # 3 residual blocks + output
         assert torch.isfinite(torch.tensor(prof[split_name]["cumulative"])).all()
     assert off["diagnostics"]["stage2_test_acc"] == on["diagnostics"]["stage2_test_acc"]
+
+
+def test_block_pairing_permutation() -> None:
+    import pytest
+
+    assert steer_mod._block_pairing_permutation(5, "identity").tolist() == [0, 1, 2, 3, 4]
+    assert steer_mod._block_pairing_permutation(5, "reversed").tolist() == [4, 3, 2, 1, 0]
+    a = steer_mod._block_pairing_permutation(13, "random", seed=7)
+    b = steer_mod._block_pairing_permutation(13, "random", seed=7)
+    c = steer_mod._block_pairing_permutation(13, "random", seed=8)
+    assert sorted(a.tolist()) == list(range(13))
+    assert torch.equal(a, b) and not torch.equal(a, c)
+    # The private generator must not consume or depend on the global RNG.
+    torch.manual_seed(0)
+    before = torch.rand(1)
+    torch.manual_seed(0)
+    steer_mod._block_pairing_permutation(13, "random", seed=7)
+    assert torch.equal(torch.rand(1), before)
+    with pytest.raises(ValueError, match="block_pairing_seed"):
+        steer_mod._block_pairing_permutation(4, "random")
+    with pytest.raises(ValueError, match="block_pairing"):
+        steer_mod._block_pairing_permutation(4, "shuffle")
+
+
+def test_steer_block_ridge_block_pairing_end_to_end(tmp_path) -> None:
+    """block_pairing only re-pairs targets with input blocks: identity is bit-exact with the default,
+    a non-identity pairing equals _fit_block_ridge on hand-permuted targets (carry in input order)."""
+    import pytest
+
+    torch.manual_seed(5)
+    loaders = _tiny_loaders()
+    clf_pre = _make_tiny_clf(depth=3)
+    clf_ft = _make_tiny_clf(depth=3)
+    clf_ft.load_state_dict(clf_pre.state_dict())
+    _finetune(clf_ft)
+    clf_target = _make_tiny_clf(depth=3)
+
+    def _prepare(**overrides):
+        params = dict(
+            clf_source=clf_ft, clf_source_pretrained=clf_pre, clf_target=clf_target,
+            source_loaders=loaders, target_loaders=loaders, classnames=_CLASSNAMES, task="tiny_pairing",
+            source_build_cfg_task=_BUILD_CFG, build_cfg_task=_BUILD_CFG, device="cpu",
+            feature_regime="linear", stage_2_strategy="block_ridge", block_granularity="residual",
+            block_ridge_mode="smoothed_residual", rho=0.9, ridge_lambda=0.1, block_ridge_lambda_scaling="trace",
+            block_ridge_diagnostics=True, few_shot=2, feature_cache_dir=str(tmp_path / "features"), verbose=False,
+        )
+        params.update(overrides)
+        return get_method("steer").prepare(**params)
+
+    default = _prepare()
+    identity = _prepare(block_pairing="identity")
+    assert "block_pairing" not in default["diagnostics"]
+    c_default = default["correction_fn"].__kwdefaults__["_coefficients"]
+    c_identity = identity["correction_fn"].__kwdefaults__["_coefficients"]
+    assert all(torch.equal(x, y) for x, y in zip(c_default, c_identity))
+
+    for pairing, seed in (("reversed", None), ("random", 3)):
+        shuffled = _prepare(block_pairing=pairing, block_pairing_seed=seed)
+        diag = shuffled["diagnostics"]
+        perm = torch.tensor(diag["block_pairing_perm"])
+        assert diag["block_pairing"] == pairing and sorted(perm.tolist()) == list(range(4))
+        # Profile targets are the re-paired ones: target_cumulative of the last block is a sum over
+        # all blocks, hence invariant to the pairing.
+        for split in ("train", "test"):
+            assert abs(
+                diag["block_error_profile"][split]["target_cumulative"][-1]
+                - default["diagnostics"]["block_error_profile"][split]["target_cumulative"][-1]
+            ) < 1e-8
+        c_shuffled = shuffled["correction_fn"].__kwdefaults__["_coefficients"]
+        assert not all(torch.allclose(x, y) for x, y in zip(c_default, c_shuffled))
+
+    # Pairing is a target re-indexing in front of an unchanged fit.
+    g = torch.Generator().manual_seed(1)
+    blocks = {b: torch.randn(8, 5, generator=g, dtype=torch.float64) for b in range(4)}
+    targets = torch.randn(8, 4, 3, generator=g, dtype=torch.float64)
+    perm = steer_mod._block_pairing_permutation(4, "random", seed=11)
+    manual = torch.stack([targets[:, int(p)] for p in perm], dim=1)
+    fit = lambda t: steer_mod._fit_block_ridge(
+        blocks, t, selected=torch.arange(8), regularization=0.1, mode="smoothed_residual", rho=0.9
+    )
+    assert all(torch.equal(x, y) for x, y in zip(fit(targets[:, perm]), fit(manual)))
+
+    with pytest.raises(ValueError, match="block_pairing_seed"):
+        _prepare(block_pairing="random")
+    with pytest.raises(ValueError, match="block_pairing"):
+        _prepare(block_pairing="reversed", block_ridge_input="final")
+    with pytest.raises(ValueError, match="block_pairing"):
+        _prepare(stage_2_strategy="global_ridge", block_pairing="reversed")
+
+
+def test_steer_cached_eval_batch_size_matches_full_eval(tmp_path) -> None:
+    """cached_eval_batch_size only chunks the cached-space stage-2 check: fit and accuracy are unchanged,
+    the correction on the cached test blocks agrees to float64 round-off, and bad values are rejected."""
+    import pytest
+
+    torch.manual_seed(7)
+    loaders = _tiny_loaders()
+    clf_pre = _make_tiny_clf(depth=3)
+    clf_ft = _make_tiny_clf(depth=3)
+    clf_ft.load_state_dict(clf_pre.state_dict())
+    _finetune(clf_ft)
+    clf_target = _make_tiny_clf(depth=3)
+
+    def _prepare(**overrides):
+        params = dict(
+            clf_source=clf_ft, clf_source_pretrained=clf_pre, clf_target=clf_target,
+            source_loaders=loaders, target_loaders=loaders, classnames=_CLASSNAMES, task="tiny_cached_eval",
+            source_build_cfg_task=_BUILD_CFG, build_cfg_task=_BUILD_CFG, device="cpu",
+            feature_regime="linear", stage_2_strategy="block_ridge", block_granularity="residual",
+            block_ridge_mode="independent", rho=0.0, ridge_lambda=0.1, block_ridge_lambda_scaling="trace",
+            few_shot=2, feature_cache_dir=str(tmp_path / "features"), verbose=False,
+        )
+        params.update(overrides)
+        return get_method("steer").prepare(**params)
+
+    for space in ("feature", "logit"):
+        full = _prepare(correction_space=space)
+        for chunk in (1, 3, 10_000):
+            chunked = _prepare(correction_space=space, cached_eval_batch_size=chunk)
+            c_full = full["correction_fn"].__kwdefaults__["_coefficients"]
+            c_chunk = chunked["correction_fn"].__kwdefaults__["_coefficients"]
+            assert all(torch.equal(x, y) for x, y in zip(c_full, c_chunk))
+            assert chunked["diagnostics"]["stage2_test_acc"] == full["diagnostics"]["stage2_test_acc"]
+            assert chunked["diagnostics"]["stage0_test_acc"] == full["diagnostics"]["stage0_test_acc"]
+
+    for bad in (0, -4):
+        with pytest.raises(ValueError, match="cached_eval_batch_size"):
+            _prepare(cached_eval_batch_size=bad)
+
+
+# --------------------------------------------------------------------------
+# stage1_mode="logit_distill": linear probe distillation (opt-in baseline, not steer)
+# --------------------------------------------------------------------------
+
+
+def test_ridge_or_pinv_closed_forms() -> None:
+    import pytest
+
+    torch.manual_seed(0)
+    x, y = torch.randn(20, 6, dtype=torch.float64), torch.randn(20, 3, dtype=torch.float64)
+    # lambda=0, n > d: ordinary least squares.
+    coef, lam = steer_mod._ridge_or_pinv(x, y, 0.0)
+    assert lam == 0.0
+    assert torch.allclose(coef, torch.linalg.lstsq(x, y).solution, atol=1e-10)
+    # lambda > 0: (X^T X + lambda I)^-1 X^T Y.
+    coef, lam = steer_mod._ridge_or_pinv(x, y, 0.5)
+    assert lam == 0.5
+    assert torch.allclose(coef, torch.linalg.solve(x.T @ x + 0.5 * torch.eye(6, dtype=x.dtype), x.T @ y), atol=1e-10)
+    # trace scaling: lambda * tr(X X^T) / n; a no-op for unit-norm rows.
+    _, lam = steer_mod._ridge_or_pinv(x, y, 0.5, "trace")
+    assert lam == pytest.approx(0.5 * float(x.square().sum()) / 20)
+    unit = torch.nn.functional.normalize(x, dim=-1)
+    a, lam_unit = steer_mod._ridge_or_pinv(unit, y, 0.5, "trace")
+    assert lam_unit == pytest.approx(0.5)
+    assert torch.allclose(a, steer_mod._ridge_or_pinv(unit, y, 0.5)[0], atol=1e-10)
+    # lambda=0, n <= d: minimum-norm interpolant (fits the support set exactly).
+    xs, ys = x[:4], y[:4]
+    coef, _ = steer_mod._ridge_or_pinv(xs, ys, 0.0)
+    assert torch.allclose(xs @ coef, ys, atol=1e-10)
+    with pytest.raises(ValueError, match="non-negative"):
+        steer_mod._ridge_or_pinv(x, y, -1.0)
+    with pytest.raises(ValueError, match="global_ridge_lambda_scaling"):
+        steer_mod._ridge_or_pinv(x, y, 1.0, "per_block")
+
+
+def _lpd_cached(tmp_path, task: str, regime: str):
+    train = steer_mod._cache_split_dir(str(tmp_path / "features"), "source", "target", task, regime, "train")
+    test = steer_mod._cache_split_dir(str(tmp_path / "features"), "source", "target", task, regime, "test")
+    load = lambda d, n: torch.load(d / f"{n}.pt").double()  # noqa: E731
+    w_a = steer_mod._load_cached_head(train / "head_A.pt").double()
+    w_b = steer_mod._load_cached_head(train / "head_B.pt").double()
+    return {s: {n: load(d, n) for n in ("features_A", "delta_A", "features_B")} | {"y": torch.load(d / "y_A.pt").long()}
+            for s, d in (("train", train), ("test", test))}, w_a, w_b
+
+
+def test_steer_logit_distill_matches_closed_form_end_to_end(tmp_path) -> None:
+    """LPD fits L = ridge(H_B, E) on the support set, E = H_A^ft T_A - H_B T_B; feature and logit spaces give
+    the same logit offset H_B L (argmax-identical live predictions); the live accuracy matches the cached one."""
+    import pytest
+
+    for regime in ("standard", "linear"):
+        task = f"tiny_logit_global_ridge_{regime}"
+        results = {}
+        for space in ("logit", "feature"):
+            prepared, clf_target, loaders = _prepare_tiny_logit(
+                tmp_path, strategy="global_ridge", regime=regime, correction_space=space,
+                stage1_mode="logit_distill", ridge_lambda=0.05,
+            )
+            results[space] = (prepared, clf_target, loaders)
+        data, w_a, w_b = _lpd_cached(tmp_path, task, regime)
+        tr, te = data["train"], data["test"]
+        selected = steer_mod._few_shot(tr["y"], 2, 42)
+        residual = (tr["features_A"] + tr["delta_A"])[selected] @ w_a.T - tr["features_B"][selected] @ w_b.T
+        h_b = tr["features_B"][selected]
+        want_l = torch.linalg.solve(h_b.T @ h_b + 0.05 * torch.eye(h_b.shape[1], dtype=h_b.dtype), h_b.T @ residual)
+
+        p_logit, clf_target, loaders = results["logit"]
+        p_feat = results["feature"][0]
+        coef_logit = p_logit["correction_fn"].__kwdefaults__["_coef"]
+        coef_feat = p_feat["correction_fn"].__kwdefaults__["_coef"]
+        assert torch.allclose(coef_logit, want_l, atol=1e-8)
+        # feature-space correction mapped through the head = the logit-space offset.
+        assert torch.allclose(coef_feat @ w_b.T, coef_logit, atol=1e-8)
+
+        for p in (p_logit, p_feat):
+            diag = p["diagnostics"]
+            assert diag["stage1_mode"] == "logit_distill" and p["stage1_mode"] == "logit_distill"
+            assert diag["stage1_rank"] is None and diag["global_ridge_lambda_effective"] == 0.05
+            # teacher = A's own cached accuracy (oracle target = full residual).
+            teacher = float(((te["features_A"] + te["delta_A"]) @ w_a.T).argmax(1).eq(te["y"]).double().mean())
+            assert diag["teacher_test_acc"] == pytest.approx(teacher)
+        assert p_logit["diagnostics"]["stage2_test_acc"] == pytest.approx(p_feat["diagnostics"]["stage2_test_acc"])
+
+        # Live forward through the wrapper reproduces the cached-space Stage 2 accuracy.
+        for p in (p_logit, p_feat):
+            correct = total = 0
+            with steer_correction_context(clf_target, p, alpha=1.0):
+                for images, labels in loaders.test:
+                    correct += int(clf_target(images).argmax(dim=-1).eq(labels).sum())
+                    total += int(labels.numel())
+            assert correct / total == pytest.approx(p["diagnostics"]["stage2_test_acc"])
+
+
+def test_logit_distill_target_equals_exact_stage1_target_iff_underdetermined() -> None:
+    """With n <= d_A and full-row-rank delta_A on the support, unregularized standard Stage 1 reproduces E on the
+    support (delta_A pinv(delta_A) E = E), so steer's logit-space global_ridge then coincides with LPD; with n > d_A
+    Stage 1 only keeps E's projection on span(delta_A) and the two differ."""
+    torch.manual_seed(0)
+    n_total, d_a, d_b, c = 40, 12, 9, 5
+    f_a, delta_a = torch.randn(n_total, d_a, dtype=torch.float64), torch.randn(n_total, d_a, dtype=torch.float64)
+    f_b = torch.randn(n_total, d_b, dtype=torch.float64)
+    w_a, w_b = torch.randn(c, d_a, dtype=torch.float64), torch.randn(c, d_b, dtype=torch.float64)
+    for n, equal in ((8, True), (30, False)):
+        selected = torch.arange(n)
+        stage1_train, _ = steer_mod._stage1_target_corrections(
+            f_a=f_a, delta_a=delta_a, w_a=w_a, f_b=f_b, w_b=w_b, delta_a_test=delta_a, selected=selected,
+            regularization=0.0, regularization_mode="standard", correction_space="logit",
+        )
+        residual = steer_mod._logit_distill_residual(
+            f_a=f_a[selected], delta_a=delta_a[selected], w_a=w_a, f_b=f_b[selected], w_b=w_b
+        )
+        assert torch.allclose(stage1_train, residual, atol=1e-8) is equal
+        coef_steer = steer_mod._ridge(f_b[selected], stage1_train, 0.1)
+        coef_lpd, _ = steer_mod._ridge_or_pinv(f_b[selected], residual, 0.1)
+        assert torch.allclose(coef_steer, coef_lpd, atol=1e-8) is equal
+
+
+def test_steer_logit_distill_is_opt_in_and_validated(tmp_path) -> None:
+    import pytest
+
+    default, _, _ = _prepare_tiny_logit(tmp_path, strategy="global_ridge", regime="standard")
+    assert "stage1_mode" not in default and "stage1_mode" not in default["diagnostics"]
+    for strategy in ("global_mlp", "block_ridge"):
+        with pytest.raises(ValueError, match="logit_distill"):
+            _prepare_tiny_logit(tmp_path, strategy=strategy, regime="linear", stage1_mode="logit_distill")
+    # concat_ridge is the other allowed input (all of B's blocks, concatenated), with a strictly positive lambda
+    # and without the global_ridge-only lambda scaling.
+    with pytest.raises(ValueError, match="ridge_lambda > 0"):
+        _prepare_tiny_logit(tmp_path, strategy="concat_ridge", regime="linear", stage1_mode="logit_distill", ridge_lambda=0.0)
+    with pytest.raises(ValueError, match="global_ridge_lambda_scaling"):
+        _prepare_tiny_logit(
+            tmp_path, strategy="concat_ridge", regime="linear", stage1_mode="logit_distill",
+            ridge_lambda=0.3, global_ridge_lambda_scaling="trace",
+        )
+    plain, _, _ = _prepare_tiny_logit(tmp_path, strategy="concat_ridge", regime="linear")  # default: untouched
+    assert "stage1_mode" not in plain and "lpd_input" not in plain["diagnostics"]
+    with pytest.raises(ValueError, match="stage1_mode"):
+        _prepare_tiny_logit(tmp_path, strategy="global_ridge", regime="standard", stage1_mode="direct")
+    with pytest.raises(ValueError, match="global_ridge_lambda_scaling"):
+        _prepare_tiny_logit(tmp_path, strategy="global_ridge", regime="standard", global_ridge_lambda_scaling="trace")
+    # lambda=0 is allowed in LPD (minimum-norm least squares), unlike steer's ridge.
+    zero, _, _ = _prepare_tiny_logit(
+        tmp_path, strategy="global_ridge", regime="standard", stage1_mode="logit_distill", ridge_lambda=0.0
+    )
+    assert zero["diagnostics"]["global_ridge_lambda_effective"] == 0.0
+
+
+def test_steer_logit_distill_concat_ridge_matches_closed_form_end_to_end(tmp_path) -> None:
+    """LPD with all of B's blocks as input: the correction is _fit_concat_ridge on the support-set logit residual
+    E = H_A^ft T_A - H_B T_B (Stage 1 skipped); feature and logit spaces give the same logit offset; the live
+    accuracy matches the cached-space one."""
+    import pytest
+
+    for regime in ("standard", "linear"):
+        task = f"tiny_logit_concat_ridge_{regime}"
+        res = {}
+        for space in ("logit", "feature"):
+            res[space] = _prepare_tiny_logit(
+                tmp_path, strategy="concat_ridge", regime=regime, correction_space=space,
+                stage1_mode="logit_distill", ridge_lambda=0.3,
+            )
+        data, w_a, w_b = _lpd_cached(tmp_path, task, regime)
+        tr, te = data["train"], data["test"]
+        base = steer_mod._cache_split_dir(str(tmp_path / "features"), "source", "target", task, regime, "train")
+        blocks_tr = {int(b): v.double() for b, v in torch.load(base / "features_B_blocks.pt").items()}
+        base_te = steer_mod._cache_split_dir(str(tmp_path / "features"), "source", "target", task, regime, "test")
+        blocks_te = {int(b): v.double() for b, v in torch.load(base_te / "features_B_blocks.pt").items()}
+        selected = steer_mod._few_shot(tr["y"], 2, 42)
+        residual = (tr["features_A"] + tr["delta_A"])[selected] @ w_a.T - tr["features_B"][selected] @ w_b.T
+        want, info = steer_mod._fit_concat_ridge({b: v[selected] for b, v in blocks_tr.items()}, residual, regularization=0.3)
+
+        p_logit, clf_target, loaders = res["logit"]
+        p_feat = res["feature"][0]
+        got = [c.double() for c in p_logit["correction_fn"].__kwdefaults__["_coefficients"]]
+        assert len(got) == len(want) and all(torch.allclose(g, w, atol=1e-8) for g, w in zip(got, want))
+        activations = {"global": te["features_B"].float(), "blocks": {b: v.float() for b, v in blocks_te.items()}}
+        c_logit = p_logit["correction_fn"](activations).double()
+        c_feat = p_feat["correction_fn"](activations).double()
+        assert torch.allclose(c_logit, sum(blocks_te[b] @ want[b] for b in sorted(blocks_te)), atol=1e-4)
+        assert torch.allclose(c_feat @ w_b.T, c_logit, atol=1e-4)  # same logit offset, W_B pinv(W_B) = I
+
+        for p in (p_logit, p_feat):
+            diag = p["diagnostics"]
+            assert diag["stage1_mode"] == "logit_distill" and diag["lpd_input"] == "concat_blocks"
+            assert diag["stage1_rank"] is None and diag["concat_input_dim"] == info["input_dim"]
+            assert diag["concat_effective_lambda"] == pytest.approx(0.3)
+        assert p_logit["diagnostics"]["stage2_test_acc"] == pytest.approx(p_feat["diagnostics"]["stage2_test_acc"])
+        for p in (p_logit, p_feat):
+            correct = total = 0
+            with steer_correction_context(clf_target, p, alpha=1.0):
+                for images, labels in loaders.test:
+                    correct += int(clf_target(images).argmax(dim=-1).eq(labels).sum())
+                    total += int(labels.numel())
+            assert correct / total == pytest.approx(p["diagnostics"]["stage2_test_acc"])
+
+
+# --------------------------------------------------------------------------
+# Integrated regime: per-block residuals as midpoint-rule path integrals of masked JVPs
+# --------------------------------------------------------------------------
+
+
+def _integrated_split(clfs, loaders, *, k: int, compute_blocks: bool = True):
+    source_finetuned, source_pretrained, target = clfs
+    return steer_mod._collect_integrated_split(
+        source_finetuned_visual=source_finetuned.model.visual.eval(),
+        source_pretrained_visual=source_pretrained.model.visual.eval(),
+        target_visual=target.model.visual.eval(),
+        source_loader=loaders.train,
+        target_loader=loaders.train,
+        device=torch.device("cpu"),
+        integration_points=k,
+        compute_blocks=compute_blocks,
+    )
+
+
+def _strongly_finetuned_models(scale: float = 0.5):
+    """A fine-tuning large enough that the path theta0 -> theta1 is visibly nonlinear.
+
+    The tiny visual's class/positional embeddings are zero-initialised, which makes the class token
+    an all-zero vector at theta0: ``ln_pre`` is then (numerically) discontinuous at t=0 and no
+    quadrature on a handful of nodes recovers the exact residual. A real CLIP has no such point, so
+    the pretrained embeddings are randomised here.
+    """
+    torch.manual_seed(0)
+    source_pretrained = _make_tiny_clf(depth=3)
+    with torch.no_grad():
+        source_pretrained.model.visual.class_embedding.normal_()
+        source_pretrained.model.visual.positional_embedding.normal_()
+    source_finetuned = _make_tiny_clf(depth=3)
+    source_finetuned.load_state_dict(source_pretrained.state_dict())
+    with torch.no_grad():
+        for p in source_finetuned.model.visual.parameters():
+            p.add_(scale * torch.randn_like(p))
+    return source_finetuned, source_pretrained, _make_tiny_clf(depth=3)
+
+
+def test_integrated_block_residuals_sum_converges_to_exact_residual() -> None:
+    clfs = _strongly_finetuned_models()
+    loaders = _tiny_loaders()
+    errors = {}
+    blocks = {}
+    for k in (2, 4, 8, 16):
+        data = _integrated_split(clfs, loaders, k=k)
+        assert data["delta_A_blocks"].shape == (16, 4, 5)  # 3 residual blocks + output block
+        total = data["delta_A_blocks"].double().sum(dim=1)
+        exact = data["delta_A"].double()
+        errors[k] = float((total - exact).norm() / exact.norm())
+        blocks[k] = data["delta_A_blocks"].double()
+        # The stored per-example diagnostic is the same quantity, row by row.
+        row_error = (total - exact).norm(dim=-1) / (exact.norm(dim=-1) + 1e-12)
+        assert torch.allclose(data["integration_rel_error"].double(), row_error, atol=1e-5)
+    # Midpoint rule: the error of the sum shrinks with K and is small at K=16.
+    assert errors[16] < errors[8] < errors[4] < errors[2]
+    assert errors[16] < 1e-2
+    assert errors[2] > 10 * errors[16]
+    # Each block's contribution stabilises when K doubles.
+    assert float((blocks[16] - blocks[8]).norm()) < float((blocks[4] - blocks[2]).norm())
+
+
+def test_integrated_block_residuals_match_reference_quadrature() -> None:
+    """The collector equals the note's pseudocode written out directly (torch.func.jvp)."""
+    from torch.func import functional_call, jvp
+
+    clfs = _strongly_finetuned_models()
+    loaders = _tiny_loaders()
+    k_points = 3
+    data = _integrated_split(clfs, loaders, k=k_points)
+    visual0 = clfs[1].model.visual.eval()
+    theta0 = {n: p.detach() for n, p in visual0.named_parameters()}
+    theta1 = {n: p.detach() for n, p in clfs[0].model.visual.named_parameters()}
+    delta = {n: theta1[n] - theta0[n] for n in theta0}
+    block_of, num_blocks = steer_mod._parameter_blocks_for_visual(visual0, "residual")
+    block_of = dict(zip(theta0, block_of, strict=True))
+    x = torch.cat([batch[0] for batch in loaders.train])
+
+    def f(params):
+        return steer_mod._l2_normalize(functional_call(visual0, params, (x,)))
+
+    expected = torch.zeros(x.shape[0], num_blocks, 5, dtype=torch.float64)
+    for k in range(k_points):
+        t = (k + 0.5) / k_points
+        theta_t = {n: theta0[n] + t * delta[n] for n in theta0}
+        for ell in range(num_blocks):
+            v = {n: delta[n] if block_of[n] == ell else torch.zeros_like(delta[n]) for n in theta0}
+            _, g = jvp(f, (theta_t,), (v,))
+            expected[:, ell] += g.detach().double() / k_points
+    assert torch.allclose(data["delta_A_blocks"].double(), expected, atol=1e-5)
+
+
+def test_integrated_residual_of_single_block_update_stays_in_that_block() -> None:
+    torch.manual_seed(0)
+    source_pretrained = _make_tiny_clf(depth=3)
+    source_finetuned = _make_tiny_clf(depth=3)
+    source_finetuned.load_state_dict(source_pretrained.state_dict())
+    with torch.no_grad():
+        for name, p in source_finetuned.model.visual.named_parameters():
+            if name.startswith("transformer.resblocks.1."):
+                p.add_(0.5 * torch.randn_like(p))
+    data = _integrated_split((source_finetuned, source_pretrained, _make_tiny_clf(depth=3)), _tiny_loaders(), k=4)
+    blocks = data["delta_A_blocks"]
+    assert float(blocks[:, 1].abs().max()) > 0
+    for other in (0, 2, 3):
+        assert float(blocks[:, other].abs().max()) == 0.0
+
+
+def test_integrated_exact_residual_and_target_features_equal_standard_regime() -> None:
+    clfs = _strongly_finetuned_models()
+    loaders = _tiny_loaders()
+    integrated = _integrated_split(clfs, loaders, k=2)
+    standard = steer_mod._collect_standard_split(
+        clf_source_finetuned_visual=clfs[0].model.visual.eval(),
+        clf_source_pretrained_visual=clfs[1].model.visual.eval(),
+        target_visual=clfs[2].model.visual.eval(),
+        source_loader=loaders.train,
+        target_loader=loaders.train,
+        device=torch.device("cpu"),
+        block_granularity="residual",
+    )
+    for name in ("features_A", "delta_A", "features_B", "y_A"):
+        assert torch.equal(integrated[name], standard[name]), name
+    for block_id, value in standard["features_B_blocks"].items():
+        assert torch.equal(integrated["features_B_blocks"][block_id], value)
+    # Chunking the JVPs (lower peak memory) gives the same per-example integrals.
+    source_finetuned, source_pretrained, target = clfs
+    chunked = steer_mod._collect_integrated_split(
+        source_finetuned_visual=source_finetuned.model.visual.eval(),
+        source_pretrained_visual=source_pretrained.model.visual.eval(),
+        target_visual=target.model.visual.eval(),
+        source_loader=loaders.train,
+        target_loader=loaders.train,
+        device=torch.device("cpu"),
+        integration_points=2,
+        integration_batch_size=3,
+    )
+    assert torch.allclose(chunked["delta_A_blocks"], integrated["delta_A_blocks"], atol=1e-6)
+    assert torch.equal(chunked["delta_A"], integrated["delta_A"])
+    # Without the integration only the two forwards run.
+    light = _integrated_split(clfs, loaders, k=2, compute_blocks=False)
+    assert "delta_A_blocks" not in light and "integration_rel_error" not in light
+    assert torch.equal(light["delta_A"], standard["delta_A"])
+
+
+def test_steer_integrated_regime_end_to_end_and_cache_per_k(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    clfs = _strongly_finetuned_models(scale=0.2)
+    loaders = _tiny_loaders()
+    common = dict(task="TaskI", loaders=loaders, stage_2_strategy="block_ridge", block_ridge_mode="smoothed_residual",
+                  rho=0.9, block_ridge_lambda_scaling="trace", ridge_lambda=0.1)
+    prepared = _prepare_tiny_steer(tmp_path, clfs, feature_regime="integrated", integration_points=4, **common)
+    assert prepared["integration_points"] == 4
+    assert prepared["feature_regime"] == "integrated_k4"
+    diagnostics = prepared["diagnostics"]
+    assert diagnostics["integration_points"] == 4
+    assert 0 <= diagnostics["integration_rel_error_mean"] <= diagnostics["integration_rel_error_max"]
+    with steer_correction_context(clfs[2], prepared, alpha=1.0):
+        logits = clfs[2](torch.randn(4, 3, 16, 16))
+    assert logits.shape == (4, len(_CLASSNAMES)) and torch.isfinite(logits).all()
+
+    pair_dir = tmp_path / "features" / "source_to_target" / "TaskI"
+    train_dir = pair_dir / "integrated_k4" / "train"
+    for name in ("features_A", "delta_A", "delta_A_blocks", "features_B", "features_B_blocks", "y_A", "integration_rel_error"):
+        assert (train_dir / f"{name}.pt").exists(), name
+    # Test-split block integrals are skipped (diagnostics only) ...
+    assert not (pair_dir / "integrated_k4" / "test" / "delta_A_blocks.pt").exists()
+    assert (pair_dir / "integrated_k4" / "test" / "delta_A.pt").exists()
+
+    # A second prepare only reads the cache, and reports the cached quadrature error.
+    def _no_extraction(**kwargs):
+        raise AssertionError("features must come from the cache")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(steer_mod, "_collect_integrated_split", _no_extraction)
+        again = _prepare_tiny_steer(tmp_path, clfs, feature_regime="integrated", integration_points=4, **common)
+    assert again["diagnostics"]["integration_rel_error_max"] == diagnostics["integration_rel_error_max"]
+    x = torch.randn(4, 3, 16, 16)
+    with steer_correction_context(clfs[2], prepared, alpha=1.0):
+        first = clfs[2](x)
+    with steer_correction_context(clfs[2], again, alpha=1.0):
+        second = clfs[2](x)
+    assert torch.equal(first, second)
+
+    # K is part of the cache key: another K extracts into its own directory.
+    other = _prepare_tiny_steer(tmp_path, clfs, feature_regime="integrated", integration_points=2, **common)
+    assert (pair_dir / "integrated_k2" / "train" / "delta_A_blocks.pt").exists()
+    assert other["diagnostics"]["integration_rel_error_mean"] > diagnostics["integration_rel_error_mean"]
+    k2 = torch.load(pair_dir / "integrated_k2" / "train" / "delta_A_blocks.pt")
+    k4 = torch.load(train_dir / "delta_A_blocks.pt")
+    assert not torch.equal(k2, k4)
+    assert torch.equal(torch.load(pair_dir / "integrated_k2" / "train" / "delta_A.pt"), torch.load(train_dir / "delta_A.pt"))
+
+    # ... unless the per-block diagnostics ask for them.
+    _prepare_tiny_steer(tmp_path, clfs, feature_regime="integrated", integration_points=2, block_ridge_diagnostics=True, **common)
+    assert (pair_dir / "integrated_k2" / "test" / "delta_A_blocks.pt").exists()
+
+    # Other Stage 2 strategies accept the regime too (they only use the exact residual).
+    _prepare_tiny_steer(tmp_path, clfs, task="TaskI", loaders=loaders, feature_regime="integrated", integration_points=2,
+                        stage_2_strategy="global_ridge")
+
+    for bad in (None, 0, -1, 2.5, True):
+        with pytest.raises(ValueError, match="integration_points"):
+            _prepare_tiny_steer(tmp_path, clfs, feature_regime="integrated", integration_points=bad, **common)
+    with pytest.raises(ValueError, match="integration_points"):
+        _prepare_tiny_steer(tmp_path, clfs, feature_regime="linear", integration_points=4, **common)
+    with pytest.raises(ValueError, match="integration_batch_size"):
+        _prepare_tiny_steer(tmp_path, clfs, feature_regime="linear", integration_batch_size=4, **common)
+    with pytest.raises(ValueError, match="integration_batch_size"):
+        _prepare_tiny_steer(tmp_path, clfs, feature_regime="integrated", integration_points=2, integration_batch_size=0, **common)
+    _prepare_tiny_steer(tmp_path, clfs, task="TaskChunk", loaders=loaders, feature_regime="integrated", integration_points=2,
+                        integration_batch_size=2, stage_2_strategy="block_ridge")
+    with pytest.raises(ValueError, match="block_ridge requires"):
+        _prepare_tiny_steer(tmp_path, clfs, task="TaskI", loaders=loaders, feature_regime="standard", stage_2_strategy="block_ridge")

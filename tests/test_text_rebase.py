@@ -1944,3 +1944,152 @@ def test_reconcile_global_third_patches_a_few_rows_and_rejects_many() -> None:
     drifted[:20, 2 * d :] += 0.5  # 20/1000 rows: the caches do not describe the same rows
     with pytest.raises(ValueError, match="differs from the cached features_B on"):
         _reconcile_global_third(drifted, f, "train", verbose=False)
+
+
+@pytest.mark.parametrize("pairing,seed", [("reversed", None), ("random", 3)])
+def test_steer_text_block_ridge_block_pairing_repairs_targets(tmp_path, pairing, seed) -> None:
+    from merge_and_rebase.rebase.methods.steer import _block_pairing_permutation, _fit_block_ridge
+
+    common = dict(feature_regime="linear", stage_2_strategy="block_ridge", block_ridge_mode="smoothed_residual", rho=0.9)
+    default, _ = _steer_prepare(tmp_path, **common)
+    identity, _ = _steer_prepare(tmp_path, block_pairing="identity", **common)
+    for x, y in zip(default["artifacts"]["stage2_state"]["coefficients"], identity["artifacts"]["stage2_state"]["coefficients"]):
+        assert torch.equal(x, y)
+    assert "block_pairing" not in default["diagnostics"]
+
+    prepared, _ = _steer_prepare(tmp_path, block_pairing=pairing, block_pairing_seed=seed, **common)
+    sel, _, per_block, blocks = _block_fit_inputs(tmp_path, prepared)
+    perm = _block_pairing_permutation(per_block.shape[1], pairing, seed)
+    assert prepared["diagnostics"]["block_pairing_perm"] == perm.tolist()
+    expected = _fit_block_ridge(
+        {b: v[sel] for b, v in blocks["train"].items()}, per_block[:, perm], selected=torch.arange(sel.numel()),
+        regularization=1.0, mode="smoothed_residual", rho=0.9,
+    )
+    for got, want in zip(prepared["artifacts"]["stage2_state"]["coefficients"], expected, strict=True):
+        assert torch.allclose(got, want)
+
+    with pytest.raises(ValueError, match="block_pairing"):
+        _steer_prepare(tmp_path, block_pairing="random", **common)
+    with pytest.raises(ValueError, match="block_pairing"):
+        _steer_prepare(tmp_path, block_pairing="reversed")
+
+
+def test_steer_text_logit_distill_fits_the_logit_residual(tmp_path) -> None:
+    """stage1_mode='logit_distill' (linear probe distillation, opt-in): L = ridge(H_B, E) with
+    E = H_A^ft W_A^T - H_B W_B^T on the support set; the live correction adds exactly x_B L to B's logits."""
+    for scaling in ("none", "trace"):
+        prepared, target = _steer_prepare(
+            tmp_path, stage1_mode="logit_distill", ridge_lambda=0.2, global_ridge_lambda_scaling=scaling
+        )
+        art = prepared["artifacts"]
+        assert art["stage1_logit_map"] is None and prepared["diagnostics"]["stage1_mode"] == "logit_distill"
+        cache = tmp_path / "cache" / "src_to_tgt" / "rte" / "standard" / "train"
+        f_a, delta_a, f_b = (torch.load(cache / f"{n}.pt").double() for n in ("features_A", "delta_A", "features_B"))
+        sel = art["selected"]
+        residual = (f_a + delta_a)[sel] @ art["w_a"].T - f_b[sel] @ art["w_b"].T
+        h_b = f_b[sel]
+        lam = 0.2 * (float(h_b.square().sum()) / h_b.shape[0] if scaling == "trace" else 1.0)
+        assert prepared["diagnostics"]["global_ridge_lambda_effective"] == pytest.approx(lam)
+        want_l = h_b.T @ torch.linalg.solve(h_b @ h_b.T + lam * torch.eye(h_b.shape[0], dtype=h_b.dtype), residual)
+        coef = art["stage2_state"]["coefficient"]
+        assert torch.allclose(coef @ art["w_b"].T, want_l, atol=1e-6)
+
+        dataset = _DictDataset(4)
+        batch = _collate([dataset[i] for i in range(4)])
+        kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+        with torch.no_grad():
+            with _head_as_identity(target):
+                pooled = target(**kwargs).logits
+            baseline = target(**kwargs).logits
+            with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+                corrected = target(**kwargs).logits
+        assert torch.allclose(corrected - baseline, (pooled.double() @ want_l).to(corrected.dtype), atol=1e-4)
+
+    default, _ = _steer_prepare(tmp_path)
+    assert "stage1_mode" not in default and default["artifacts"]["stage1_logit_map"] is not None
+    with pytest.raises(ValueError, match="logit_distill"):
+        _steer_prepare(tmp_path, stage1_mode="logit_distill", stage_2_strategy="global_mlp")
+    with pytest.raises(ValueError, match="global_ridge_lambda_scaling"):
+        _steer_prepare(tmp_path, global_ridge_lambda_scaling="trace")
+
+
+def _lpd_joint_expected(cache_split, art, blocks_train, blocks_test, lam):
+    """One ridge on B's blocks (each divided by the root of its support mean squared row norm, concatenated) against
+    the support-set logit residual E = (f_A + delta_A) W_A^T - f_B W_B^T mapped through pinv(W_B)."""
+    from merge_and_rebase.rebase.methods.steer import _ridge
+
+    f_a, delta_a, f_b = (torch.load(cache_split / "train" / f"{n}.pt").double() for n in ("features_A", "delta_A", "features_B"))
+    sel = art["selected"]
+    residual = (f_a + delta_a)[sel] @ art["w_a"].T - f_b[sel] @ art["w_b"].T
+    target = residual @ art["stage1_pinv_w_b"].T
+    xs = {b: v[sel] for b, v in blocks_train.items()}
+    scales = [float(xs[b].square().sum(1).mean().sqrt()) for b in range(len(xs))]
+    z_s = torch.cat([xs[b] / scales[b] for b in range(len(xs))], dim=1)
+    z_t = torch.cat([blocks_test[b] / scales[b] for b in range(len(xs))], dim=1)
+    return z_t @ _ridge(z_s, target, lam)
+
+
+def test_steer_text_logit_distill_joint_ridge_regresses_the_logit_residual_on_all_blocks(tmp_path) -> None:
+    """stage1_mode='logit_distill' + joint_ridge: same target as the global-feature LPD (Stage 1 skipped), but the
+    ridge input is the concatenation of all of B's blocks."""
+    prepared, _ = _steer_prepare(
+        tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge", stage1_mode="logit_distill", ridge_lambda=0.3
+    )
+    art = prepared["artifacts"]
+    assert art["stage1_logit_map"] is None and art["stage2_state"]["kind"] == "joint_ridge"
+    assert prepared["diagnostics"]["stage1_mode"] == "logit_distill" and prepared["diagnostics"]["lpd_input"] == "concat_blocks"
+    base = tmp_path / "cache" / "src_to_tgt" / "rte" / "linear"
+    blocks = {s: {int(b): v.double() for b, v in torch.load(base / s / "features_B_blocks.pt").items()} for s in ("train", "test")}
+    expected = _lpd_joint_expected(base, art, blocks["train"], blocks["test"], 0.3)
+    got = prepared["correction_fn"]({"global": blocks["test"][max(blocks["test"])], "blocks": blocks["test"]})
+    assert torch.allclose(got.double(), expected, atol=1e-5)
+
+    # The global-feature LPD stays available; the joint variant rejects the global_ridge-only lambda scaling.
+    plain, _ = _steer_prepare(tmp_path, feature_regime="linear", stage1_mode="logit_distill", ridge_lambda=0.3)
+    assert plain["diagnostics"]["lpd_input"] == "final_feature"
+    with pytest.raises(ValueError, match="global_ridge_lambda_scaling"):
+        _steer_prepare(
+            tmp_path, feature_regime="linear", stage_2_strategy="joint_ridge", stage1_mode="logit_distill",
+            global_ridge_lambda_scaling="trace",
+        )
+    with pytest.raises(ValueError, match="logit_distill"):
+        _steer_prepare(tmp_path, feature_regime="linear", stage_2_strategy="block_ridge", stage1_mode="logit_distill")
+
+
+def test_steer_text_logit_distill_joint_ridge_with_attention_segments_live_matches_the_fit(tmp_path) -> None:
+    """LPD + joint_ridge on B's segment-pooled attention blocks ([premise; hypothesis; global] per block): the fit
+    reads the segment-pooled cache, and the live hook pools the same way. Without LPD, joint_ridge + segments is
+    still rejected (test_target_block_pooling_rejects_joint_ridge)."""
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    prepared, target = _steer_prepare_encoder(
+        tmp_path, stage_2_strategy="joint_ridge", stage1_mode="logit_distill", ridge_lambda=0.3,
+        block_source="attention", target_block_pooling="segments",
+    )
+    assert prepared["target_block_pooling"] == "segments" and prepared["block_source"] == "attention"
+    art = prepared["artifacts"]
+    base = tmp_path / "cache" / "src_enc_to_tgt_enc" / "rte" / "linear"
+    blocks = {}
+    for split in ("train", "test"):
+        seg = {int(b): v.double() for b, v in torch.load(base / split / "features_B_blocks_src-attention_pool-mean_segpool.pt").items()}
+        seg[len(seg)] = torch.load(base / split / "features_B.pt").double()  # last block: B's pooled output feature
+        blocks[split] = seg
+    expected = _lpd_joint_expected(base, art, blocks["train"], blocks["test"], 0.3)
+    got = prepared["correction_fn"]({"global": blocks["test"][max(blocks["test"])], "blocks": blocks["test"]})
+    assert torch.allclose(got.double(), expected, atol=1e-5)
+
+    _, head = text_rebase_head(target)
+    batch = _collate([_PairDictDataset(4)[i] for i in range(4)])
+    kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(target, source="attention", segment_pooling=True) as capture:
+            capture.attention_mask = batch["attention_mask"]
+            capture.input_ids = batch["input_ids"]
+            pooled = target(**kwargs).logits
+        live_blocks = dict(capture.activations)
+        live_blocks[len(capture.modules)] = pooled
+        baseline = target(**kwargs).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kwargs).logits
+    want = baseline + prepared["correction_fn"]({"global": pooled, "blocks": live_blocks}) @ head.weight.T
+    assert torch.allclose(corrected, want, atol=1e-4)

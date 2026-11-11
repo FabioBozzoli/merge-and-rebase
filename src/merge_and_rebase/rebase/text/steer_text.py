@@ -90,14 +90,18 @@ from ...utils.linearization import LinearizedModule
 from ..base import TensorDict
 from ..methods.steer import (
     _BLOCK_GROUP_STRATEGIES,
+    _BLOCK_PAIRINGS,
+    _block_pairing_permutation,
     _cache_split_dir,
     _few_shot,
     _fit_block_ridge,
     _fit_global_mlp,
     _load_or_compute_split,
+    _logit_distill_residual,
     _predict_block_ridge,
     _random_sample,
     _ridge,
+    _ridge_or_pinv,
     _stage1_projection,
 )
 from ..registry import register
@@ -915,6 +919,8 @@ class SteerTextRebase:
         block_ridge_target_strategy: str = "reuse_logitmap",
         block_residuals_weighting_strategy: str = "identity",
         block_ridge_blockwise_stage1_lambda: float = 1.0,
+        block_pairing: str = "identity",
+        block_pairing_seed: int | None = None,
         block_pooling: str = "mean",
         block_source: str = "residual",
         block_feature_preprocessing: str = "none",
@@ -923,11 +929,27 @@ class SteerTextRebase:
         reuse_source_features_from: str | None = None,
         mlp_hidden_dim: int = 1024,
         mlp_epochs: int = 100,
+        stage1_mode: str = "delta_projection",
+        global_ridge_lambda_scaling: str = "none",
         seed: int = 42,
         verbose: bool = True,
         **kwargs: Any,
     ) -> dict[str, Any]:
         del kwargs
+        # stage1_mode="logit_distill" = linear probe distillation (opt-in baseline, NOT steer); see steer._STAGE1_MODES.
+        if stage1_mode not in {"delta_projection", "logit_distill"}:
+            raise ValueError("steer_text stage1_mode must be 'delta_projection' or 'logit_distill'")
+        logit_distill = stage1_mode == "logit_distill"
+        if logit_distill and stage_2_strategy not in {"global_ridge", "joint_ridge"}:
+            raise ValueError(
+                "steer_text stage1_mode='logit_distill' (linear probe distillation) requires stage_2_strategy='global_ridge' "
+                "(input: B's pooled feature) or 'joint_ridge' (input: all of B's blocks, concatenated)"
+            )
+        if global_ridge_lambda_scaling != "none" and not (logit_distill and stage_2_strategy == "global_ridge"):
+            raise ValueError(
+                "steer_text global_ridge_lambda_scaling is only supported with stage1_mode='logit_distill' and "
+                "stage_2_strategy='global_ridge' (joint_ridge already scales every block to unit mean squared norm)"
+            )
         if feature_regime not in {"standard", "linear"}:
             raise ValueError("steer_text feature_regime must be 'standard' or 'linear'")
         if stage_2_strategy not in {"global_ridge", "global_mlp", "block_ridge", "joint_ridge"}:
@@ -965,12 +987,20 @@ class SteerTextRebase:
             raise ValueError(
                 "steer_text block_ridge_target_strategy must be one of: reuse_logitmap, blockwise_logitmap, last_only"
             )
+        if block_pairing not in _BLOCK_PAIRINGS:
+            raise ValueError(f"steer_text block_pairing must be one of: {sorted(_BLOCK_PAIRINGS)}")
+        if block_pairing != "identity" and stage_2_strategy != "block_ridge":
+            raise ValueError("steer_text block_pairing != 'identity' requires stage_2_strategy='block_ridge'")
+        if block_pairing == "random" and block_pairing_seed is None:
+            raise ValueError("steer_text block_pairing='random' requires an explicit block_pairing_seed")
         if block_residuals_weighting_strategy not in {"identity", "mean"}:
             raise ValueError("steer_text block_residuals_weighting_strategy must be 'identity' or 'mean'")
         if target_block_pooling not in {"global", "segments"}:
             raise ValueError("steer_text target_block_pooling must be 'global' or 'segments'")
         if target_block_pooling == "segments":
-            if stage_2_strategy != "block_ridge":
+            # joint_ridge reads the same segment-pooled blocks as block_ridge (shared swap, fit input and live capture);
+            # it is enabled only for the opt-in linear probe distillation, so the non-LPD behaviour is unchanged.
+            if stage_2_strategy != "block_ridge" and not (logit_distill and stage_2_strategy == "joint_ridge"):
                 raise ValueError(
                     "steer_text target_block_pooling='segments' requires stage_2_strategy='block_ridge' "
                     f"(got {stage_2_strategy!r}); joint_ridge support is a separate, later change."
@@ -1221,35 +1251,65 @@ class SteerTextRebase:
         else:
             selected = _random_sample(local_labels, int(total_support_examples), int(seed))
 
-        logit_map, stage1_kept_rank, stage1_rank = _stage1_projection(
-            f_a=f_a,
-            delta_a=delta_a,
-            w_a=w_a,
-            f_b=f_b,
-            w_b=w_b,
-            selected=selected,
-            regularization=stage1_lambda,
-            energy_threshold=stage1_energy_threshold,
-        )
-        p_b = torch.linalg.pinv(w_b)
-        train_target = delta_a[selected] @ logit_map.T @ p_b.T
-        test_target = delta_a_test @ logit_map.T @ p_b.T
-        stage1_test_acc = _accuracy(f_b_test + test_target, w_b, b_b, test_labels, mask_class=mask_class)
-        if verbose:
-            print(
-                f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
-                f"(energy threshold {stage1_energy_threshold})"
+        if logit_distill:
+            # Linear probe distillation (opt-in baseline, not steer): Stage 1 skipped, the target is the
+            # support-set logit residual E = (f_A + delta_A) W_A^T - f_B W_B^T, mapped to B's feature
+            # space through pinv(w_b) (pinv(w_b)^T w_b^T = I_C, so the corrected logits equal
+            # f_B W_B^T + b_B + x_B L). As in Stage 1, head biases are not part of E, so the "oracle"
+            # below is A's bias-free logits plus b_B -- not exactly A's accuracy when b_A != b_B.
+            p_b = torch.linalg.pinv(w_b)
+            logit_map, stage1_kept_rank, stage1_rank = None, None, None
+            residual_train = _logit_distill_residual(f_a=f_a[selected], delta_a=delta_a[selected], w_a=w_a, f_b=f_b[selected], w_b=w_b)
+            residual_test = _logit_distill_residual(
+                f_a=test_data["features_A"].double(), delta_a=delta_a_test, w_a=w_a, f_b=f_b_test, w_b=w_b
             )
-            print(
-                f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} "
-                "(uses A's delta at test time; diagnostic only)"
+            train_target = residual_train @ p_b.T
+            test_target = residual_test @ p_b.T
+            stage1_test_acc = _accuracy(f_b_test + test_target, w_b, b_b, test_labels, mask_class=mask_class)
+            if verbose:
+                print(
+                    f"{log_prefix} prepare: stage1_mode=logit_distill (linear probe distillation, NOT steer): "
+                    "Stage 1 skipped; stage1_lambda/stage1_energy_threshold ignored"
+                )
+                print(f"{log_prefix} prepare: residual oracle test acc = {stage1_test_acc:.4f} (diagnostic only)")
+        else:
+            logit_map, stage1_kept_rank, stage1_rank = _stage1_projection(
+                f_a=f_a,
+                delta_a=delta_a,
+                w_a=w_a,
+                f_b=f_b,
+                w_b=w_b,
+                selected=selected,
+                regularization=stage1_lambda,
+                energy_threshold=stage1_energy_threshold,
             )
+            p_b = torch.linalg.pinv(w_b)
+            train_target = delta_a[selected] @ logit_map.T @ p_b.T
+            test_target = delta_a_test @ logit_map.T @ p_b.T
+            stage1_test_acc = _accuracy(f_b_test + test_target, w_b, b_b, test_labels, mask_class=mask_class)
+            if verbose:
+                print(
+                    f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
+                    f"(energy threshold {stage1_energy_threshold})"
+                )
+                print(
+                    f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} "
+                    "(uses A's delta at test time; diagnostic only)"
+                )
 
         num_source_blocks: int | None = None
         block_group_size: float | None = None
+        block_pairing_info: dict[str, Any] = {}
 
+        global_ridge_lambda_effective = None
         if stage_2_strategy == "global_ridge":
-            coefficient = _ridge(x_b[selected], train_target, ridge_lambda).to(dev)
+            if logit_distill:
+                coefficient, global_ridge_lambda_effective = _ridge_or_pinv(
+                    x_b[selected], train_target, ridge_lambda, global_ridge_lambda_scaling
+                )
+                coefficient = coefficient.to(dev)
+            else:
+                coefficient = _ridge(x_b[selected], train_target, ridge_lambda).to(dev)
             stage2_state = {"kind": "global_ridge", "coefficient": coefficient, "input_pooling": global_input_pooling}
 
             def correction_fn(activations: Mapping[str, Any], *, _coef=coefficient) -> torch.Tensor:
@@ -1353,6 +1413,18 @@ class SteerTextRebase:
                 else:  # last_only
                     # Every block regresses the full Stage-1 train target.
                     block_targets = train_target.unsqueeze(1).expand(-1, delta_a_blocks_train.shape[1], -1)
+
+                if block_pairing != "identity":
+                    # Input block b now regresses target perm[b]; the fit below is unchanged.
+                    pairing_perm = _block_pairing_permutation(num_blocks, block_pairing, block_pairing_seed)
+                    block_targets = block_targets[:, pairing_perm.to(block_targets.device)]
+                    block_pairing_info = {
+                        "block_pairing": block_pairing,
+                        "block_pairing_seed": None if block_pairing == "reversed" else block_pairing_seed,
+                        "block_pairing_perm": pairing_perm.tolist(),
+                    }
+                    if verbose:
+                        print(f"{log_prefix} prepare: block_pairing={block_pairing} perm={pairing_perm.tolist()}")
 
                 block_weight = 1.0 / num_blocks if block_residuals_weighting_strategy == "mean" else 1.0
                 weights = [block_weight] * num_blocks
@@ -1479,7 +1551,7 @@ class SteerTextRebase:
                 "(predicted from B's cached features, no alpha)"
             )
 
-        return {
+        prepared: dict[str, Any] = {
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
@@ -1512,8 +1584,20 @@ class SteerTextRebase:
                 "stage1_kept_rank": stage1_kept_rank,
                 "stage1_rank": stage1_rank,
                 "stage1_energy_threshold": stage1_energy_threshold,
+                **block_pairing_info,
             },
         }
+        if logit_distill:
+            prepared["stage1_mode"] = stage1_mode
+            prepared["diagnostics"].update(
+                {
+                    "stage1_mode": stage1_mode,
+                    "global_ridge_lambda_scaling": global_ridge_lambda_scaling,
+                    "global_ridge_lambda_effective": global_ridge_lambda_effective,
+                    "lpd_input": "concat_blocks" if stage_2_strategy == "joint_ridge" else "final_feature",
+                }
+            )
+        return prepared
 
     def apply_correction(
         self, prepared: Mapping[str, Any], *, activations: Mapping[str, Any], alpha: float = 1.0
