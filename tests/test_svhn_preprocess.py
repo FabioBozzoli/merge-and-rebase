@@ -11,6 +11,7 @@ from torchvision.transforms import InterpolationMode
 from merge_and_rebase.data.svhn_preprocess import (
     SVHN_HF_PATH,
     build_svhn_transforms,
+    is_vitb_to_vitb,
     maybe_svhn_transforms,
 )
 
@@ -65,6 +66,27 @@ def test_maybe_svhn_transforms_replaces_both_transforms(monkeypatch: pytest.Monk
     assert train_out is not preprocess
     assert eval_out is not preprocess
     assert eval_out(_sample_image()).shape == (3, INPUT_SIZE, INPUT_SIZE)
+
+
+def test_explicit_disable_overrides_enabled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable(monkeypatch)
+    preprocess = _fake_clip_preprocess()
+    train_out, eval_out = maybe_svhn_transforms(
+        SVHN_HF_PATH,
+        preprocess,
+        preprocess,
+        enabled=False,
+    )
+    assert train_out is preprocess
+    assert eval_out is preprocess
+
+
+def test_vitb_pair_detection() -> None:
+    assert is_vitb_to_vitb("ViT-B-16", "ViT-B-16")
+    assert is_vitb_to_vitb("ViT-B-16", "ViT-B-32")
+    assert not is_vitb_to_vitb("ViT-B-16", "ViT-L-14")
+    assert not is_vitb_to_vitb("ViT-L-14", "ViT-B-16")
+    assert not is_vitb_to_vitb("ViT-bigG-14", "ViT-B-16")
 
 
 def test_svhn_eval_transform_pads_to_input_size() -> None:

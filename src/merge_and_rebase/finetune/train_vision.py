@@ -8,6 +8,7 @@ import random
 import time
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml  # type: ignore
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from merge_and_rebase.cli_args import add_logging_args, build_logging_overrides
@@ -450,6 +452,32 @@ def _save_peft_visual_adapter(
 # ---------------------------
 
 
+def _few_shot_train_loaders(loaders, *, task: str, shots: int, seed: int):
+    """Use the same support indices as STEER, preserving validation/test loaders."""
+    from ..eval.kd_rebase import _vision_support_indices
+
+    if isinstance(shots, bool) or not isinstance(shots, int) or shots <= 0:
+        raise ValueError("data.shots_per_class must be a positive integer or null")
+    original = loaders.train
+    indices = _vision_support_indices(original.dataset, task, shots, seed)
+    train = DataLoader(
+        Subset(original.dataset, indices),
+        batch_size=original.batch_size,
+        shuffle=True,
+        num_workers=original.num_workers,
+        pin_memory=original.pin_memory,
+        drop_last=False,
+        collate_fn=original.collate_fn,
+    )
+    print(f"[{task}] Training support: {len(indices)} examples ({shots} per class), seed={seed}")
+    return replace(
+        loaders,
+        train=train,
+        sizes={**loaders.sizes, "train": len(indices)},
+        meta={**loaders.meta, "shots_per_class": shots, "support_seed": seed, "support_indices": indices},
+    )
+
+
 def train_task(
     *,
     task: str,
@@ -482,6 +510,8 @@ def train_task(
     save_checkpoints: bool = True,
     save_last_epoch: bool = False,
     train_preprocess: str = "eval",
+    shots_per_class: int | None = None,
+    val_split_seed: int | None = None,
     init_checkpoint: str | None = None,
     init_text_features_source: str = "zero_shot",
     peft_cfg: dict[str, Any] | None = None,
@@ -518,8 +548,11 @@ def train_task(
         num_workers=num_workers,
         pin_memory=True,
         val_fraction=val_fraction,
-        seed=seed,
+        seed=seed if val_split_seed is None else val_split_seed,
     )
+
+    if shots_per_class is not None:
+        loaders = _few_shot_train_loaders(loaders, task=task, shots=shots_per_class, seed=seed)
 
     num_classes = len(loaders.classnames)
 
@@ -1935,6 +1968,8 @@ def main() -> None:
                     "loader_profile": loader_profile,
                     "data_root": data_root,
                     "train_preprocess": train_preprocess,
+                    "shots_per_class": _get(task_cfg, "data.shots_per_class", None),
+                    "val_split_seed": _get(task_cfg, "data.val_split_seed", None),
                     "early_stopping": early_stopping,
                     "early_stopping_patience": early_stopping_patience,
                     "text_only": text_only,

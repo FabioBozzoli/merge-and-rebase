@@ -577,6 +577,17 @@ def test_steer_text_prepare_fits_and_caches(tmp_path) -> None:
     assert again["diagnostics"] == prepared["diagnostics"]
 
 
+def test_steer_text_prepare_supports_standard_stage1_ridge(tmp_path) -> None:
+    prepared, _ = _steer_prepare(
+        tmp_path,
+        stage1_regularization_mode="standard",
+        stage1_lambda=1.0,
+    )
+    assert prepared["stage1_regularization_mode"] == "standard"
+    assert prepared["diagnostics"]["stage1_regularization_mode"] == "standard"
+    assert prepared["diagnostics"]["stage1_kept_rank"] == prepared["diagnostics"]["stage1_rank"]
+
+
 def test_steer_text_never_produces_a_weight_delta(tmp_path) -> None:
     prepared, _ = _steer_prepare(tmp_path)
     assert get_method("steer_text").transport(
@@ -615,6 +626,97 @@ def test_steer_text_rejects_contradictory_params(tmp_path) -> None:
         _steer_prepare(tmp_path, stage_2_strategy="block_ridge")
     with pytest.raises(ValueError, match="exactly one of few_shot or total_support_examples"):
         _steer_prepare(tmp_path, few_shot=None)
+    with pytest.raises(ValueError, match="block_granularity only applies to block_ridge"):
+        _steer_prepare(tmp_path, block_granularity="attention")
+
+
+def test_attention_granularity_captures_before_attention_output_projection() -> None:
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture, block_attention_out_projections
+
+    model = _tiny_t5(seed=0)
+    batch = _collate([_DictDataset(4)[i] for i in range(4)])
+    batch["attention_mask"][:, :2] = 0
+    raw: dict[int, torch.Tensor] = {}
+    projections = block_attention_out_projections(model)
+    hooks = [
+        projection.register_forward_pre_hook(
+            lambda _module, inputs, block_id=block_id: raw.__setitem__(block_id, inputs[0])
+        )
+        for block_id, projection in enumerate(projections)
+    ]
+
+    with torch.no_grad(), _TextBlockCapture(model, block_granularity="attention") as capture:
+        capture.attention_mask = batch["attention_mask"]
+        model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    for hook in hooks:
+        hook.remove()
+
+    assert set(capture.activations) == set(raw) == set(range(len(projections)))
+    for block_id, hidden in raw.items():
+        assert torch.allclose(
+            capture.activations[block_id],
+            _masked_mean_for_test(hidden, batch["attention_mask"]),
+            atol=1e-6,
+        )
+
+
+def _masked_mean_for_test(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    mask = attention_mask.to(dtype=hidden.dtype, device=hidden.device).unsqueeze(-1)
+    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+
+def test_steer_text_attention_granularity_is_cached_and_used_live(tmp_path) -> None:
+    from merge_and_rebase.rebase.text.steer_text import _TextBlockCapture
+
+    # Seed the expensive linear/JVP split with shape-correct tensors. This test
+    # targets the alternate B-side capture and live integration; the linearizer
+    # itself is covered separately.
+    generator = torch.Generator().manual_seed(123)
+    cache = tmp_path / "cache" / "src_to_tgt" / "rte" / "linear"
+    labels = torch.tensor([0, 2] * 8)
+    for split in ("train", "test"):
+        split_dir = cache / split
+        split_dir.mkdir(parents=True)
+        tensors = {
+            "features_A": torch.randn(16, 32, generator=generator),
+            "delta_A": torch.randn(16, 32, generator=generator),
+            "delta_A_blocks": torch.randn(16, 5, 32, generator=generator),
+            "features_B": torch.randn(16, 48, generator=generator),
+            "features_B_blocks": {
+                block_id: torch.randn(16, 48, generator=generator) for block_id in range(5)
+            },
+            "y_A": labels,
+        }
+        for name, value in tensors.items():
+            torch.save(value, split_dir / f"{name}.pt")
+
+    prepared, target = _steer_prepare(
+        tmp_path,
+        feature_regime="linear",
+        stage_2_strategy="block_ridge",
+        block_granularity="attention",
+    )
+    for split in ("train", "test"):
+        assert (cache / split / "features_B_blocks_granularity-attention.pt").exists()
+    assert prepared["block_granularity"] == "attention"
+
+    _, head = text_rebase_head(target)
+    batch = _collate([_DictDataset(4)[i] for i in range(4)])
+    kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"]}
+    with torch.no_grad():
+        with _head_as_identity(target), _TextBlockCapture(
+            target, block_granularity="attention"
+        ) as capture:
+            capture.attention_mask = batch["attention_mask"]
+            pooled = target(**kwargs).logits
+        blocks = dict(capture.activations)
+        blocks[len(capture.modules)] = pooled
+        baseline = target(**kwargs).logits
+        with steer_text_correction_context(SimpleNamespace(model=target), prepared, alpha=1.0):
+            corrected = target(**kwargs).logits
+
+    expected = baseline + prepared["correction_fn"]({"global": pooled, "blocks": blocks}) @ head.weight.T
+    assert torch.allclose(corrected, expected, atol=1e-4)
 
 
 def test_steer_text_detects_an_unloaded_checkpoint(tmp_path) -> None:

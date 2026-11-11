@@ -24,6 +24,7 @@ from ..cli_args import (
     merge_non_none,
     parse_json_object_arg,
 )
+from ..data.svhn_preprocess import is_vitb_to_vitb, svhn_preprocess_enabled
 from ..data.templates import get_templates
 from ..data.vision_loaders import build_vision_loaders, load_hf_splits
 from ..eval.utils import (
@@ -51,8 +52,8 @@ from ..rebase.runtime import (
 from ..run_logging import default_summary_path, finish_with_error, merge_logging_config, start_run
 from ..utils.alpha_search import PerTaskAlphaTracker, average_scores
 from .block_extension import resolve_block_extension_config, run_block_extension, select_loader
-from .linear_probe import train_zeroshot_head_probe
 from .datasets.vision8_14_20 import SUITES
+from .linear_probe import train_zeroshot_head_probe
 from .print_utils import pretty_print_task_accuracies
 from .rebase_metrics import normalized_accuracy_ratio
 
@@ -430,8 +431,18 @@ def main() -> None:
             dtype=cfg.get("dtype", None),
         )
 
+        svhn_custom_requested = svhn_preprocess_enabled()
+        svhn_custom_preprocess = svhn_custom_requested and is_vitb_to_vitb(
+            source_cfg.model_name,
+            target_cfg.model_name,
+        )
+
         print(f"Source model (A): {source_cfg.model_name} / {source_cfg.pretrained}")
         print(f"Target model (B): {target_cfg.model_name} / {target_cfg.pretrained}")
+        if svhn_custom_requested:
+            pair = f"{source_cfg.model_name} -> {target_cfg.model_name}"
+            state = "enabled" if svhn_custom_preprocess else "disabled (requires ViT-B -> ViT-B)"
+            print(f"SVHN custom preprocess: {state} for {pair}")
 
         clf_source = OpenClipClassifier.build(source_cfg)
         clf_target = OpenClipClassifier.build(target_cfg)
@@ -547,6 +558,7 @@ def main() -> None:
                 # comparing different calibration samples against the same
                 # held-out data, not also reshuffling what's held out.
                 seed=_VAL_TEST_SPLIT_SEED,
+                svhn_custom_preprocess=svhn_custom_preprocess,
             )
 
             classnames = list(loaders.classnames)
@@ -594,6 +606,7 @@ def main() -> None:
                     pin_memory=True,
                     val_fraction=float(cfg.get("val_fraction", 0.1)),
                     seed=_VAL_TEST_SPLIT_SEED,
+                    svhn_custom_preprocess=svhn_custom_preprocess,
                 )
 
             task_source_base_sd = source_base_sd
@@ -959,6 +972,10 @@ def main() -> None:
             elif steer_mode:
                 steer_source_tag = f"{source_cfg.model_name}_{source_cfg.pretrained}"
                 steer_target_tag = f"{target_cfg.model_name}_{target_cfg.pretrained}"
+                if task == "SVHN":
+                    preprocess_tag = "custom" if svhn_custom_preprocess else "clip"
+                    steer_source_tag = f"{steer_source_tag}_svhn-{preprocess_tag}"
+                    steer_target_tag = f"{steer_target_tag}_svhn-{preprocess_tag}"
                 steer_method_params = dict(method_params)
                 steer_seed = int(steer_method_params.pop("seed", cfg.get("seed", 42)))
                 prepared = method.prepare(

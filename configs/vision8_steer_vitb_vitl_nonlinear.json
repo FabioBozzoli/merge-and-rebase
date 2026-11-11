@@ -15,7 +15,7 @@
     "mlp_hidden_dim": 1024,
     "mlp_epochs": 100,
     "few_shot": 2,
-    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase-new/features/nonlinear_feature/",
+    "feature_cache_dir": "/work/intesasanpaolo_phd/merge-and-rebase/features/nonlinear_feature/",
     "force_recompute_features": false,
     "seed": 42
   },

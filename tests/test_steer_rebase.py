@@ -106,6 +106,60 @@ def test_stage1_projection_energy_threshold_default_and_exact() -> None:
     assert torch.allclose(exact_map, expected, atol=1e-10)
 
 
+def test_stage1_standard_regularization_matches_closed_form() -> None:
+    generator = torch.Generator().manual_seed(11)
+    regularization = 0.7
+
+    # Exercise both the primal (n > d) and dual (n <= d) implementations.
+    for n, dimension in ((9, 4), (4, 9)):
+        classes, target_dimension = 3, 5
+        delta_a = torch.randn(n, dimension, generator=generator, dtype=torch.float64)
+        w_a = torch.randn(classes, dimension, generator=generator, dtype=torch.float64)
+        f_a = torch.zeros_like(delta_a)
+        f_b = torch.zeros(n, target_dimension, dtype=torch.float64)
+        w_b = torch.randn(classes, target_dimension, generator=generator, dtype=torch.float64)
+        selected = torch.arange(n)
+        residual = delta_a @ w_a.T
+
+        actual, kept_rank, rank = steer_mod._stage1_projection(
+            f_a=f_a,
+            delta_a=delta_a,
+            w_a=w_a,
+            f_b=f_b,
+            w_b=w_b,
+            selected=selected,
+            regularization=regularization,
+            regularization_mode="standard",
+        )
+
+        eye = torch.eye(dimension, dtype=delta_a.dtype)
+        expected = torch.linalg.solve(
+            delta_a.T @ delta_a + regularization * eye,
+            delta_a.T @ residual,
+        ).T
+        assert torch.allclose(actual, expected, atol=1e-10, rtol=1e-10)
+        assert kept_rank == rank == min(n, dimension)
+
+
+def test_stage1_transported_regularization_remains_the_default() -> None:
+    w_a, w_b, f_a, delta_a, f_b, _ = _synthetic_dataset()
+    selected = torch.arange(16)
+    kwargs = {
+        "f_a": f_a,
+        "delta_a": delta_a,
+        "w_a": w_a,
+        "f_b": f_b,
+        "w_b": w_b,
+        "selected": selected,
+        "regularization": 1.0,
+        "energy_threshold": 0.99,
+    }
+    default = steer_mod._stage1_projection(**kwargs)
+    explicit = steer_mod._stage1_projection(**kwargs, regularization_mode="transported")
+    assert torch.equal(default[0], explicit[0])
+    assert default[1:] == explicit[1:]
+
+
 def test_global_ridge_recovers_linear_map() -> None:
     g = torch.Generator().manual_seed(1)
     n, d, out_dim = 40, 6, 3

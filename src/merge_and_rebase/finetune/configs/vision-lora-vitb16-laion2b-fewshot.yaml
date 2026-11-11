@@ -1,0 +1,54 @@
+# K examples per class from exactly the STEER calibration support set.
+# Set data.shots_per_class to the desired K; keep seed=42 to match calibration.
+# Launch with MR_SVHN_PREPROCESS=1 MR_SVHN_TARGET_SIZE=96 MR_SVHN_AUGMENTATION=none
+# to match the previous sbatch preprocessing without any data augmentation.
+common:
+  seed: 42
+  device: cuda
+  dtype: fp32
+  backbone:
+    name: openclip
+    clip_model: ViT-B-16
+    clip_pretrained: laion2b_s34b_b88k
+  data:
+    shots_per_class: 1
+    batch_size: 32
+    num_workers: 4
+    val_fraction: 0.1
+    val_split_seed: 0  # Same validation/test partition as vision_rebase.
+    train_preprocess: eval
+  train:
+    epochs: 50
+    optimizer:
+      name: adamw
+    lr: 1.0e-5
+    weight_decay: 0.0
+    accumulate_grad_batches: 1
+    lr_scheduler:
+      name: cosine
+      warmup_steps: 0
+    grad_clip_norm: 1.0
+    early_stopping: false
+  strategy:
+    name: peft_lora
+    forward_mode: standard
+    params:
+      parameterization: weights
+      trainable_params: all_trainable
+    peft:
+      target_modules: [q_proj, k_proj, v_proj, out_proj, c_fc, c_proj]
+      r: 16
+      lora_alpha: 16
+      lora_dropout: 0.0
+      bias: none
+      train_logit_scale: false
+  output:
+    out_dir: /work/intesasanpaolo_phd/merge-and-rebase/checkpoints/lora_fewshot_vitb16_laion2b/K1/seed42
+    save_format: peft
+    save_last_epoch: true
+  logging:
+    use_wandb: false
+    log_every_n_steps: 10
+
+datasets_order: [Cars, DTD, EuroSAT, GTSRB, MNIST, RESISC45, SUN397, SVHN]
+datasets: {}

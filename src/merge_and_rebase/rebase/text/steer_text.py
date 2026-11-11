@@ -468,6 +468,7 @@ class SteerTextRebase:
         few_shot: int | None = None,
         total_support_examples: int | None = None,
         stage1_lambda: float = 1.0,
+        stage1_regularization_mode: str = "transported",
         stage1_energy_threshold: float = 0.99,
         ridge_lambda: float = 1.0,
         block_ridge_mode: str = "independent",
@@ -487,6 +488,8 @@ class SteerTextRebase:
             raise ValueError("steer_text block_ridge requires feature_regime='linear' (per-block deltas are linear-only).")
         if block_group_strategy not in _BLOCK_GROUP_STRATEGIES:
             raise ValueError(f"steer_text block_group_strategy must be one of: {sorted(_BLOCK_GROUP_STRATEGIES)}")
+        if stage1_regularization_mode not in {"transported", "standard"}:
+            raise ValueError("steer_text stage1_regularization_mode must be 'transported' or 'standard'")
         if (few_shot is None) == (total_support_examples is None):
             raise ValueError("steer_text requires exactly one of few_shot or total_support_examples")
 
@@ -591,6 +594,7 @@ class SteerTextRebase:
             w_b=w_b,
             selected=selected,
             regularization=stage1_lambda,
+            regularization_mode=stage1_regularization_mode,
             energy_threshold=stage1_energy_threshold,
         )
         p_b = torch.linalg.pinv(w_b)
@@ -598,10 +602,17 @@ class SteerTextRebase:
         test_target = delta_a_test @ logit_map.T @ p_b.T
         stage1_test_acc = _accuracy(f_b_test + test_target, w_b, b_b, test_labels, mask_class=mask_class)
         if verbose:
-            print(
-                f"{log_prefix} prepare: stage1 pinv kept {stage1_kept_rank}/{stage1_rank} singular values "
-                f"(energy threshold {stage1_energy_threshold})"
-            )
+            if stage1_regularization_mode == "transported":
+                print(
+                    f"{log_prefix} prepare: stage1 transported regularization; pinv kept "
+                    f"{stage1_kept_rank}/{stage1_rank} singular values "
+                    f"(energy threshold {stage1_energy_threshold})"
+                )
+            else:
+                print(
+                    f"{log_prefix} prepare: stage1 standard ridge regularization; "
+                    f"numerical rank {stage1_rank}"
+                )
             print(
                 f"{log_prefix} prepare: stage1 oracle test acc = {stage1_test_acc:.4f} "
                 "(uses A's delta at test time; diagnostic only)"
@@ -727,6 +738,7 @@ class SteerTextRebase:
             "correction_fn": correction_fn,
             "stage_2_strategy": stage_2_strategy,
             "feature_regime": feature_regime,
+            "stage1_regularization_mode": stage1_regularization_mode,
             "num_source_blocks": num_source_blocks,
             "block_group_size": block_group_size,
             "diagnostics": {
@@ -735,6 +747,7 @@ class SteerTextRebase:
                 "stage2_test_acc": stage2_test_acc,
                 "stage1_kept_rank": stage1_kept_rank,
                 "stage1_rank": stage1_rank,
+                "stage1_regularization_mode": stage1_regularization_mode,
                 "stage1_energy_threshold": stage1_energy_threshold,
             },
         }

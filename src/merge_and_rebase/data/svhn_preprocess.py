@@ -20,6 +20,7 @@ must also be evaluated with it on.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -176,6 +177,17 @@ def svhn_preprocess_enabled() -> bool:
     return _env_bool("MR_SVHN_PREPROCESS", SVHN_CUSTOM_PREPROCESS)
 
 
+def is_vitb_to_vitb(source_model_name: str, target_model_name: str) -> bool:
+    """Return whether both OpenCLIP model names identify a ViT-B backbone."""
+
+    def _is_vitb(model_name: str) -> bool:
+        # Accept the OpenCLIP spellings ViT-B-16 / ViT-B-32 (and underscore or
+        # slash variants) without confusing ViT-bigG with the ViT-B family.
+        return re.match(r"^vit[-_/]?b(?:[-_/]?\d|$)", str(model_name).strip().lower()) is not None
+
+    return _is_vitb(source_model_name) and _is_vitb(target_model_name)
+
+
 def svhn_target_size() -> int:
     size = _env_int("MR_SVHN_TARGET_SIZE", SVHN_TARGET_SIZE)
     if size <= 0:
@@ -280,14 +292,18 @@ def maybe_svhn_transforms(
     hf_path: str | None,
     train_transform: Transform | None,
     eval_preprocess: Transform | None,
+    *,
+    enabled: bool | None = None,
 ) -> tuple[Transform | None, Transform | None]:
     """
     Swap in the custom SVHN pipeline, or pass the arguments straight through.
 
     Returns ``(train_transform, eval_preprocess)`` unchanged for every dataset other than
-    SVHN, and for SVHN when the override is disabled.
+    SVHN, and for SVHN when the override is disabled.  ``enabled`` can impose a
+    caller-specific policy; ``None`` preserves the environment/config master switch.
     """
-    if hf_path != SVHN_HF_PATH or not svhn_preprocess_enabled():
+    use_custom_preprocess = svhn_preprocess_enabled() if enabled is None else bool(enabled)
+    if hf_path != SVHN_HF_PATH or not use_custom_preprocess:
         return train_transform, eval_preprocess
 
     target_size = svhn_target_size()
